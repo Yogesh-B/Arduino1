@@ -1,0 +1,51 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# ESP32-S3 USB WiFi Dongle — sdkconfig.defaults
+# ══════════════════════════════════════════════════════════════════════════════
+# Place this file alongside your .ino sketch.
+# Arduino-ESP32 v3.x reads sdkconfig.defaults at build time and merges
+# these settings into the final sdkconfig.
+#
+# CRITICAL: These flags enable NAPT (NAT routing) and USB-NCM networking.
+# Without them, the sketch will NOT compile or function correctly.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Enable lwIP NAPT (Network Address Port Translation) ───────────────────────
+# This is what makes the ESP32 act as a NAT router between USB ↔ WiFi
+CONFIG_LWIP_IPV4_NAPT=y
+CONFIG_LWIP_L2_TO_L3_COPY=y
+CONFIG_LWIP_IP_FORWARD=y
+
+# ── TinyUSB Network Class — NCM (Network Control Model) ──────────────────────
+# NCM is the modern, cross-platform USB networking standard.
+# Works natively on Windows 10+, Linux, and macOS — zero driver install.
+CONFIG_TINYUSB_NET_ENABLED=y
+CONFIG_TINYUSB_NET_MODE_NCM=y
+
+# Increase NCM buffers for better throughput
+CONFIG_TINYUSB_NCM_IN_NTB_MAX_SIZE=8192
+CONFIG_TINYUSB_NCM_OUT_NTB_MAX_SIZE=8192
+
+# ── TinyUSB Device Configuration ─────────────────────────────────────────────
+CONFIG_TINYUSB_ENABLED=y
+CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=y
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="ESP32-S3 WiFi Dongle"
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="ESP32-S3 USB WiFi Adapter"
+CONFIG_TINYUSB_DESC_SERIAL_STRING="ESP32S3-WIFI-001"
+CONFIG_TINYUSB_DESC_CDC_STRING="ESP32-S3 Debug Console"
+
+# ── lwIP tuning for NAT routing ───────────────────────────────────────────────
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
+CONFIG_LWIP_TCP_WND_DEFAULT=5744
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=12
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=12
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
+
+# ── WiFi ──────────────────────────────────────────────────────────────────────
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# ── Task stack sizes (USB networking needs more stack) ────────────────────────
+CONFIG_TINYUSB_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
