@@ -49,7 +49,7 @@
  *
  * ── Board setup (Arduino IDE) ────────────────────────────────
  *   Board:          "ESP32S3 Dev Module"
- *   USB Mode:       "USB-OTG (TinyUSB)"   ← CRITICAL!
+ *   USB Mode:       "Hardware CDC and JTAG" (Default)
  *   USB CDC On Boot:"Disabled"
  *   PSRAM:          "OPI PSRAM" if your board has it
  *   Partition:      "Default 4MB" or larger
@@ -76,11 +76,11 @@
 #include "esp_netif.h"
 #include "dhcpserver/dhcpserver.h"
 
-// ── TinyUSB / USB-NCM ───────────────────────────────────────────────────────
-// Arduino-ESP32 v3.x ships with esp_tinyusb component built-in.
-// These headers provide the USB-NCM (Network Control Model) device class.
-#include "tinyusb.h"
-#include "tinyusb_net.h"
+// ── USB-NCM (Network Control Model) via EspUsbDevice ────────────────────────
+#include "EspUsbDevice.h"
+
+static EspUsbDevice usbDevice;
+static EspUsbDeviceNet usbNet(usbDevice);
 
 // ── RGB LED (ESP32-S3-DevKitC onboard NeoPixel) ─────────────────────────────
 #define RGB_LED_PIN 48
@@ -145,46 +145,38 @@ static const uint8_t usb_mac_host[6]   = {0x02, 0x02, 0x84, 0x6A, 0x96, 0x02};
  * so the PC gets 192.168.7.x automatically.
  */
 static void setupUSBNetwork() {
-    Serial.println("[USB] Initializing USB-NCM network adapter...");
+    Serial.println("[USB] Initializing USB-NCM network adapter via EspUsbDevice...");
 
-    // ── Install TinyUSB driver ───────────────────────────────────────────────
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor        = NULL,   // Use Kconfig defaults
-        .string_descriptor        = NULL,   // Use Kconfig defaults
-        .string_descriptor_count  = 0,
-        .external_phy             = false,
-#if (TUD_OPT_HIGH_SPEED)
-        .configuration_descriptor = NULL,
-#endif
-    };
+    // ── Configure static IP and DHCP server on the USB interface ─────────────
+    // Device acts as gateway (192.168.7.1) with subnet 255.255.255.0
+    usbNet.ipConfig(IPAddress(192, 168, 7, 1), IPAddress(192, 168, 7, 1), IPAddress(255, 255, 255, 0));
+    usbNet.dhcpServer(true);
+    usbNet.dhcpAdvertiseGateway(true);
+    usbNet.dhcpDns(IPAddress(8, 8, 8, 8)); // Fallback DNS until STA connects
 
-    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
-    if (err != ESP_OK) {
-        Serial.printf("[USB] FATAL: tinyusb_driver_install() failed: %s\n",
-                      esp_err_to_name(err));
+    // ── Initialize USB device descriptors ────────────────────────────────────
+    EspUsbDeviceConfig config;
+    config.vid = 0x303a;
+    config.pid = 0x4032;
+    config.manufacturer = "ESP32-S3 WiFi Dongle";
+    config.product = "ESP32-S3 USB WiFi Adapter";
+    config.serialNumber = "ESP32S3-WIFI-001";
+
+    if (!usbDevice.begin(config)) {
+        Serial.printf("[USB] FATAL: usbDevice.begin() failed: %s\n", usbDevice.lastErrorName());
         return;
     }
-    Serial.println("[USB] TinyUSB driver installed");
 
-    // ── Initialize USB-NCM network layer ─────────────────────────────────────
-    // This creates an esp_netif internally and binds it to TinyUSB's NCM class.
-    // The host PC will see this as a standard Ethernet adapter.
-    tinyusb_net_config_t net_cfg = {};
-    memcpy(net_cfg.mac_addr, usb_mac_device, sizeof(usb_mac_device));
-
-    err = tinyusb_net_init(TINYUSB_USBDEV_0, &net_cfg);
-    if (err != ESP_OK) {
-        Serial.printf("[USB] FATAL: tinyusb_net_init() failed: %s\n",
-                      esp_err_to_name(err));
-        Serial.println("[USB] Check: Is USB Mode set to 'USB-OTG (TinyUSB)' in Arduino IDE?");
-        Serial.println("[USB] Check: Does sdkconfig.defaults have CONFIG_TINYUSB_NET_MODE_NCM=y?");
+    // ── Bring up NCM network interface (lwIP / esp_netif) ────────────────────
+    if (!usbNet.beginNetwork()) {
+        Serial.println("[USB] FATAL: usbNet.beginNetwork() failed");
         return;
     }
     Serial.println("[USB] NCM network layer initialized");
 
-    // ── Find the USB network interface ───────────────────────────────────────
-    // The esp_tinyusb component creates a netif. Try known key names.
-    const char *usb_keys[] = {"usb0", "USB_DEF", "tusb_ncm", NULL};
+    // ── Find the USB network interface handle ────────────────────────────────
+    // EspUsbDeviceNet registers its esp_netif with if_key "USB_NCM"
+    const char *usb_keys[] = {"USB_NCM", "usb0", "USB_DEF", "tusb_ncm", NULL};
     for (int i = 0; usb_keys[i] != NULL; i++) {
         usb_netif = esp_netif_get_handle_from_ifkey(usb_keys[i]);
         if (usb_netif) {
@@ -216,23 +208,6 @@ static void setupUSBNetwork() {
         Serial.println("[USB] The USB-NCM adapter will appear to the host but");
         Serial.println("[USB] NAT routing and DHCP won't work.");
         return;
-    }
-
-    // ── Configure static IP and DHCP server on the USB interface ─────────────
-    esp_netif_dhcps_stop(usb_netif);
-
-    esp_netif_ip_info_t ip_info = {};
-    IP4_ADDR(&ip_info.ip,      192, 168, 7, 1);
-    IP4_ADDR(&ip_info.gw,      192, 168, 7, 1);
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-    esp_netif_set_ip_info(usb_netif, &ip_info);
-
-    // Start DHCP server — host PC will get 192.168.7.2+ automatically
-    err = esp_netif_dhcps_start(usb_netif);
-    if (err == ESP_OK) {
-        Serial.println("[USB] DHCP server started on 192.168.7.0/24");
-    } else {
-        Serial.printf("[USB] DHCP server start failed: %s\n", esp_err_to_name(err));
     }
 
     usb_link_up = true;

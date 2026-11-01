@@ -54,7 +54,7 @@ flowchart LR
 | Setting | Value |
 |---------|-------|
 | **Board** | ESP32S3 Dev Module |
-| **USB Mode** | **USB-OTG (TinyUSB)** ← MUST select this |
+| **USB Mode** | **Hardware CDC and JTAG** (Default) |
 | **USB CDC On Boot** | Disabled |
 | **PSRAM** | OPI PSRAM (if your board has it) |
 | **Partition Scheme** | Default 4MB or larger |
@@ -124,7 +124,7 @@ NAPT (Network Address Port Translation) rewrites packet headers so:
 
 | Problem | Solution |
 |---------|----------|
-| PC doesn't detect network adapter | Ensure USB Mode is "USB-OTG (TinyUSB)" in Arduino IDE |
+| PC doesn't detect network adapter | Ensure USB Mode is "Hardware CDC and JTAG" in Arduino IDE |
 | Adapter detected but no IP | Wait 10s, or check if `sdkconfig.defaults` was included |
 | "No internet" on the PC | Open `http://192.168.7.1` and configure STA WiFi credentials |
 | Windows shows "Code 10" error | Ensure `sdkconfig.defaults` is in the sketch folder |
