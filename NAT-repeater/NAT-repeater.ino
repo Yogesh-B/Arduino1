@@ -216,6 +216,50 @@ static void onWiFiEvent(WiFiEvent_t event) {
     }
 }
 
+// ── WiFi Scan ────────────────────────────────────────────────────────────────
+
+/**
+ * Scan for nearby WiFi networks and return a JSON array.
+ * Each entry: { "ssid": "...", "bssid": "AA:BB:CC:DD:EE:FF", "rssi": -42, "enc": "WPA2" }
+ */
+static String scanNetworksJSON() {
+    int n = WiFi.scanNetworks(false, false, false, 500);
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+        if (i > 0) json += ",";
+        String ssid = WiFi.SSID(i);
+        // Escape quotes in SSID for valid JSON
+        ssid.replace("\\", "\\\\");
+        ssid.replace("\"", "\\\"");
+
+        uint8_t *bssid = WiFi.BSSID(i);
+        char macBuf[18];
+        snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+
+        const char *enc;
+        switch (WiFi.encryptionType(i)) {
+            case WIFI_AUTH_OPEN:            enc = "Open";     break;
+            case WIFI_AUTH_WEP:             enc = "WEP";      break;
+            case WIFI_AUTH_WPA_PSK:         enc = "WPA";      break;
+            case WIFI_AUTH_WPA2_PSK:        enc = "WPA2";     break;
+            case WIFI_AUTH_WPA_WPA2_PSK:    enc = "WPA/2";    break;
+            case WIFI_AUTH_WPA3_PSK:        enc = "WPA3";     break;
+            case WIFI_AUTH_WPA2_WPA3_PSK:   enc = "WPA2/3";   break;
+            default:                        enc = "Other";    break;
+        }
+
+        json += "{\"ssid\":\"" + ssid + "\","
+                "\"bssid\":\"" + String(macBuf) + "\","
+                "\"rssi\":" + String(WiFi.RSSI(i)) + ","
+                "\"ch\":" + String(WiFi.channel(i)) + ","
+                "\"enc\":\"" + String(enc) + "\"}";
+    }
+    json += "]";
+    WiFi.scanDelete();
+    return json;
+}
+
 // ── Web config portal ────────────────────────────────────────────────────────
 WebServer server(80);
 
@@ -225,7 +269,7 @@ static const char HTML_PAGE[] PROGMEM = R"rawhtml(
 <title>ESP32 NAT Router Setup</title>
 <style>
 body{font-family:sans-serif;background:#181818;color:#eee;display:flex;justify-content:center;padding:20px;}
-.card{background:#242424;padding:25px;border-radius:10px;width:100%;max-width:440px;box-shadow:0 4px 15px rgba(0,0,0,.5);}
+.card{background:#242424;padding:25px;border-radius:10px;width:100%;max-width:480px;box-shadow:0 4px 15px rgba(0,0,0,.5);}
 h2{margin-top:0;color:#3b82f6;}
 h3{color:#94a3b8;border-bottom:1px solid #374151;padding-bottom:6px;}
 label{display:block;margin-top:12px;font-size:13px;color:#bbb;}
@@ -233,11 +277,42 @@ label{display:block;margin-top:12px;font-size:13px;color:#bbb;}
 input{width:100%;padding:10px;margin-top:4px;border:1px solid #444;border-radius:6px;background:#333;color:#fff;box-sizing:border-box;font-family:monospace;}
 input:focus{outline:none;border-color:#3b82f6;}
 .cur{font-size:11px;color:#6b7280;margin-top:4px;font-family:monospace;}
-button{margin-top:22px;width:100%;padding:12px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;font-size:15px;}
-button:hover{background:#1d4ed8;}
+button,.btn{margin-top:22px;width:100%;padding:12px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;font-size:15px;}
+button:hover,.btn:hover{background:#1d4ed8;}
 .clr{color:#f87171;font-size:11px;cursor:pointer;float:right;margin-top:2px;}
 .status{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px;margin-bottom:16px;font-size:12px;line-height:1.8;font-family:monospace;}
 .ok{color:#4ade80;} .fail{color:#f87171;} .na{color:#94a3b8;}
+
+/* ── Scan button ────────────────────────────────────── */
+.btn-scan{display:inline-block;margin-top:8px;padding:8px 18px;background:#334155;color:#94a3b8;
+  border:1px solid #475569;border-radius:8px;font-size:13px;cursor:pointer;
+  transition:all .15s;font-weight:600;width:auto;}
+.btn-scan:hover{background:#475569;color:#e2e8f0;}
+.btn-scan.scanning{opacity:.6;pointer-events:none;}
+
+/* ── Network list ───────────────────────────────────── */
+#netlist{margin-top:10px;max-height:300px;overflow-y:auto;border-radius:8px;}
+.net{display:flex;align-items:center;padding:10px 12px;background:#1e293b;
+  border:1px solid #334155;border-bottom:none;cursor:pointer;transition:background .12s;gap:10px;}
+.net:last-child{border-bottom:1px solid #334155;border-radius:0 0 8px 8px;}
+.net:first-child{border-radius:8px 8px 0 0;}
+.net:only-child{border-radius:8px;border-bottom:1px solid #334155;}
+.net:hover{background:#293548;}
+.net.sel{background:#1e3a5f;border-color:#3b82f6;}
+
+.net-info{flex:1;min-width:0;}
+.net-ssid{font-weight:700;font-size:14px;color:#f1f5f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.net-meta{font-size:11px;color:#64748b;font-family:monospace;margin-top:2px;}
+.net-rssi{font-size:12px;font-weight:600;white-space:nowrap;min-width:52px;text-align:right;}
+.net-enc{font-size:10px;color:#94a3b8;background:#334155;padding:2px 7px;border-radius:4px;white-space:nowrap;}
+
+/* signal bars */
+.bars{display:flex;align-items:flex-end;gap:2px;height:16px;}
+.bars span{width:3px;background:#475569;border-radius:1px;}
+.bars span.on{background:#4ade80;}
+.bars .b1{height:4px;} .bars .b2{height:7px;} .bars .b3{height:11px;} .bars .b4{height:16px;}
+
+.scan-msg{color:#94a3b8;font-size:12px;padding:14px;text-align:center;}
 </style></head><body>
 <div class='card'>
 <h2>&#x1F4F6; NAT Router Config</h2>
@@ -255,7 +330,11 @@ AP Clients: %AP_CLIENTS%
 
 <h3>Uplink &mdash; connects TO this AP</h3>
 <label>Target SSID</label>
-<input type='text' name='sta_ssid' value='%STA_SSID%' required>
+<input type='text' name='sta_ssid' id='sta_ssid' value='%STA_SSID%' required
+  placeholder='Select from scan or type manually'>
+<span class='btn-scan' id='scanBtn' onclick='doScan()'>&#x1F50D; Scan Networks</span>
+<div id='netlist'></div>
+
 <label>Target Password</label>
 <input type='password' name='sta_pwd' value='%STA_PWD%'>
 <label>
@@ -275,7 +354,7 @@ AP Clients: %AP_CLIENTS%
 <input type='password' name='ap_pwd' value='%AP_PWD%' minlength='8' required>
 <label>
   Spoof AP MAC
-  <span class='clr' onclick="this.closest('label').nextElementSibling.value=''">clear</span>
+  <span class='clr' onclick="this.closest('label').nextElementSibling.value=''" >clear</span>
 </label>
 <input type='text' name='ap_mac' value='%AP_MAC%'
   placeholder='AA:BB:CC:DD:EE:FF  (leave empty = chip default)'
@@ -284,7 +363,65 @@ AP Clients: %AP_CLIENTS%
 <div class='cur'>Current AP MAC: %CUR_AP_MAC%</div>
 
 <button type='submit'>&#x1F4BE; Save &amp; Reboot</button>
-</form></div></body></html>
+</form></div>
+
+<script>
+function barsHTML(rssi){
+  var n = rssi>=-50?4 : rssi>=-65?3 : rssi>=-78?2 : 1;
+  var h='<div class="bars">';
+  for(var i=1;i<=4;i++) h+='<span class="b'+i+(i<=n?' on':'')+'"></span>';
+  return h+'</div>';
+}
+
+function rssiColor(r){return r>=-50?'#4ade80':r>=-65?'#a3e635':r>=-78?'#fbbf24':'#f87171';}
+
+function doScan(){
+  var b=document.getElementById('scanBtn');
+  var nl=document.getElementById('netlist');
+  b.classList.add('scanning');
+  b.innerHTML='&#x23F3; Scanning...';
+  nl.innerHTML='<div class="scan-msg">Scanning nearby networks...</div>';
+
+  fetch('/scan').then(function(r){return r.json();}).then(function(nets){
+    b.classList.remove('scanning');
+    b.innerHTML='&#x1F50D; Scan Networks';
+
+    if(!nets.length){
+      nl.innerHTML='<div class="scan-msg">No networks found. Try again.</div>';
+      return;
+    }
+
+    // Sort by signal strength (strongest first)
+    nets.sort(function(a,b){return b.rssi-a.rssi;});
+
+    var h='';
+    for(var i=0;i<nets.length;i++){
+      var n=nets[i];
+      h+='<div class="net" onclick="pickNet(this)" data-ssid="'+n.ssid.replace(/"/g,'&quot;')+'">'
+        + barsHTML(n.rssi)
+        + '<div class="net-info">'
+        + '<div class="net-ssid">'+(n.ssid||'<i style="color:#64748b">[Hidden]</i>')+'</div>'
+        + '<div class="net-meta">'+n.bssid+' &nbsp; CH '+n.ch+'</div>'
+        + '</div>'
+        + '<span class="net-enc">'+n.enc+'</span>'
+        + '<span class="net-rssi" style="color:'+rssiColor(n.rssi)+'">'+n.rssi+' dBm</span>'
+        + '</div>';
+    }
+    nl.innerHTML=h;
+  }).catch(function(){
+    b.classList.remove('scanning');
+    b.innerHTML='&#x1F50D; Scan Networks';
+    nl.innerHTML='<div class="scan-msg" style="color:#f87171">Scan failed. Try again.</div>';
+  });
+}
+
+function pickNet(el){
+  document.querySelectorAll('.net').forEach(function(e){e.classList.remove('sel');});
+  el.classList.add('sel');
+  document.getElementById('sta_ssid').value=el.getAttribute('data-ssid');
+}
+</script>
+</body></html>
 )rawhtml";
 
 void handleRoot() {
@@ -316,6 +453,11 @@ void handleRoot() {
     page.replace("%AP_CLIENTS%", String(WiFi.softAPgetStationNum()));
 
     server.send(200, "text/html", page);
+}
+
+void handleScan() {
+    String json = scanNetworksJSON();
+    server.send(200, "application/json", json);
 }
 
 void handleSave() {
@@ -435,6 +577,7 @@ void setup() {
 
     // ── Start config portal (always available at 192.168.4.1) ────────────────
     server.on("/",     HTTP_GET,  handleRoot);
+    server.on("/scan", HTTP_GET,  handleScan);
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
     Serial.println("[Web] Config portal → http://192.168.4.1\n");
