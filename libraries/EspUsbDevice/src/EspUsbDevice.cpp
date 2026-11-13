@@ -1,0 +1,7829 @@
+#include "EspUsbDevice.h"
+#include "internal/EspUsbHidDescriptor.h"
+#include "internal/EspUsbTinyUsbRuntime.h"
+
+#include <ctype.h>
+#include <new>
+#include <string.h>
+#include "keymap/keymap_da_dk.h"
+#include "keymap/keymap_de_de.h"
+#include "keymap/keymap_en_gb.h"
+#include "keymap/keymap_en_us.h"
+#include "keymap/keymap_es_es.h"
+#include "keymap/keymap_fi_fi.h"
+#include "keymap/keymap_fr_ch.h"
+#include "keymap/keymap_fr_fr.h"
+#include "keymap/keymap_hu_hu.h"
+#include "keymap/keymap_it_it.h"
+#include "keymap/keymap_ja_jp.h"
+#include "keymap/keymap_nb_no.h"
+#include "keymap/keymap_nl_nl.h"
+#include "keymap/keymap_pt_br.h"
+#include "keymap/keymap_pt_pt.h"
+#include "keymap/keymap_sv_se.h"
+
+#if __has_include("soc/soc_caps.h")
+#include "soc/soc_caps.h"
+#endif
+
+#if defined(SOC_USB_OTG_SUPPORTED) && SOC_USB_OTG_SUPPORTED
+#include "tusb.h"
+#include "class/cdc/cdc_device.h"
+#include "class/midi/midi_device.h"
+#include "class/msc/msc_device.h"
+#include "class/vendor/vendor_device.h"
+// usbd_edpt_claim() / usbd_edpt_xfer(), for EspUsbDeviceVendor::writeDirect().
+#include "device/usbd_pvt.h"
+#if __has_include("esp_memory_utils.h")
+#include "esp_memory_utils.h"
+#define ESP_USB_DEVICE_HAS_DMA_CAPABLE_CHECK 1
+#else
+#define ESP_USB_DEVICE_HAS_DMA_CAPABLE_CHECK 0
+#endif
+#include "class/net/net_device.h"
+#include "class/dfu/dfu_device.h"
+#include "class/dfu/dfu_rt_device.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#define ESP_USB_DEVICE_HAS_TINYUSB 1
+#if __has_include("esp_mac.h")
+#include "esp_mac.h"
+#define ESP_USB_DEVICE_HAS_ESP_MAC 1
+#else
+#define ESP_USB_DEVICE_HAS_ESP_MAC 0
+#endif
+#else
+#define ESP_USB_DEVICE_HAS_TINYUSB 0
+#define ESP_USB_DEVICE_HAS_ESP_MAC 0
+#endif
+
+// esp_netif / lwIP integration for the NCM class (EspUsbDeviceNet::beginNetwork()).
+// Optional: only referenced when the sketch actually calls beginNetwork().
+#if ESP_USB_DEVICE_HAS_TINYUSB && __has_include("esp_netif.h")
+#include "esp_netif.h"
+#include "esp_netif_defaults.h"
+#include "esp_event.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#define ESP_USB_DEVICE_HAS_ESP_NETIF 1
+#else
+#define ESP_USB_DEVICE_HAS_ESP_NETIF 0
+#endif
+
+// OTA partition access for EspUsbDeviceFirmwareUpdate. Part of ESP-IDF's
+// app_update component, which Arduino-ESP32 always builds - unlike Arduino's
+// Update library, referencing it adds no Arduino library dependency to a sketch
+// that never touches firmware update.
+#if __has_include("esp_ota_ops.h")
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_err.h"
+#define ESP_USB_DEVICE_HAS_OTA 1
+#else
+#define ESP_USB_DEVICE_HAS_OTA 0
+#endif
+
+// The always-on register that asks the ROM to stay in its download loader after
+// the next reset, plus the S2/S3 ROM persist flags that ask it to come up as a
+// DFU device rather than a serial loader.
+#if __has_include("esp_system.h")
+#include "esp_system.h"
+#include "soc/soc.h"
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+#include "soc/rtc_cntl_reg.h"
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && __has_include("soc/usb_serial_jtag_reg.h")
+#include "soc/usb_serial_jtag_reg.h"
+#define ESP_USB_DEVICE_HAS_SHARED_PHY 1
+#else
+#define ESP_USB_DEVICE_HAS_SHARED_PHY 0
+#endif
+#define ESP_USB_DEVICE_HAS_DOWNLOAD_BOOT 1
+#elif defined(CONFIG_IDF_TARGET_ESP32P4)
+#include "soc/lp_system_reg.h"
+#define ESP_USB_DEVICE_HAS_DOWNLOAD_BOOT 1
+#define ESP_USB_DEVICE_HAS_SHARED_PHY 0
+#else
+#define ESP_USB_DEVICE_HAS_DOWNLOAD_BOOT 0
+#define ESP_USB_DEVICE_HAS_SHARED_PHY 0
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && __has_include("esp32s3/rom/usb/usb_persist.h")
+#include "esp32s3/rom/usb/usb_persist.h"
+#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"
+#if __has_include("esp_efuse.h") && __has_include("esp_efuse_table.h")
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
+#define ESP_USB_DEVICE_HAS_PHY_SEL_EFUSE 1
+#else
+#define ESP_USB_DEVICE_HAS_PHY_SEL_EFUSE 0
+#endif
+#define ESP_USB_DEVICE_HAS_ROM_DFU 1
+#elif defined(CONFIG_IDF_TARGET_ESP32S2) && __has_include("esp32s2/rom/usb/usb_persist.h")
+#include "esp32s2/rom/usb/usb_persist.h"
+#include "esp32s2/rom/usb/chip_usb_dw_wrapper.h"
+#define ESP_USB_DEVICE_HAS_PHY_SEL_EFUSE 0
+#define ESP_USB_DEVICE_HAS_ROM_DFU 1
+#else
+#define ESP_USB_DEVICE_HAS_ROM_DFU 0
+#define ESP_USB_DEVICE_HAS_PHY_SEL_EFUSE 0
+#endif
+#else
+#define ESP_USB_DEVICE_HAS_DOWNLOAD_BOOT 0
+#define ESP_USB_DEVICE_HAS_ROM_DFU 0
+#define ESP_USB_DEVICE_HAS_SHARED_PHY 0
+#define ESP_USB_DEVICE_HAS_PHY_SEL_EFUSE 0
+#endif
+
+// The HID interrupt endpoint buffer this build compiled, which is what bounds a
+// single report. Mirrored here so the code below also compiles on a target
+// without TinyUSB, where nothing defines it.
+#if ESP_USB_DEVICE_HAS_TINYUSB
+static constexpr uint16_t ESP_USB_DEVICE_HID_EP_BUFSIZE = CFG_TUD_HID_EP_BUFSIZE;
+#else
+static constexpr uint16_t ESP_USB_DEVICE_HID_EP_BUFSIZE = 64;
+#endif
+// Full speed caps an interrupt endpoint at 64 bytes (USB 2.0 table 9-13).
+static constexpr uint16_t ESP_USB_DEVICE_FS_INTERRUPT_MAX_PACKET = 64;
+// What EspUsbController::Auto resolves to. Only the P4 has a high-speed
+// controller to resolve to.
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+static constexpr bool ESP_USB_DEVICE_HIGH_SPEED_DEFAULT = true;
+#else
+static constexpr bool ESP_USB_DEVICE_HIGH_SPEED_DEFAULT = false;
+#endif
+
+static constexpr uint8_t USB_DESC_DEVICE = 0x01;
+static constexpr uint8_t USB_DESC_CONFIGURATION = 0x02;
+static constexpr uint8_t USB_DESC_STRING = 0x03;
+static constexpr uint8_t USB_DESC_INTERFACE = 0x04;
+static constexpr uint8_t USB_DESC_ENDPOINT = 0x05;
+static constexpr uint8_t USB_DESC_INTERFACE_ASSOCIATION = 0x0b;
+static constexpr uint8_t USB_DESC_BOS = 0x0f;
+static constexpr uint8_t USB_DESC_DEVICE_CAPABILITY = 0x10;
+static constexpr uint8_t USB_DESC_HID = 0x21;
+
+static constexpr uint8_t USB_CLASS_HID = 0x03;
+static constexpr uint8_t USB_CLASS_VENDOR_SPECIFIC = 0xff;
+static constexpr uint8_t USB_SUBCLASS_BOOT = 0x01;
+static constexpr uint8_t USB_PROTOCOL_KEYBOARD = 0x01;
+static constexpr uint8_t USB_PROTOCOL_MOUSE = 0x02;
+
+static constexpr uint8_t USB_ENDPOINT_ATTR_ISOCHRONOUS = 0x01;
+static constexpr uint8_t USB_ENDPOINT_ATTR_BULK = 0x02;
+static constexpr uint8_t USB_ENDPOINT_ATTR_INTERRUPT = 0x03;
+static constexpr uint8_t USB_SCSI_CMD_SYNCHRONIZE_CACHE_10 = 0x35;
+
+static EspUsbDevice *g_activeDevice = nullptr;
+// Compile-time CDC port capacity. Mirrors CFG_TUD_CDC where TinyUSB exists and
+// keeps a single nominal port on targets built without it, so the CDC class
+// still compiles (and reports "not connected") off a USB-capable SoC.
+#if ESP_USB_DEVICE_HAS_TINYUSB
+#define ESP_USB_DEVICE_CDC_PORTS CFG_TUD_CDC
+#else
+#define ESP_USB_DEVICE_CDC_PORTS 1
+#endif
+
+// One slot per compiled TinyUSB CDC instance. The index is the instance number
+// TinyUSB reports in its callbacks, so dispatch is a lookup rather than a
+// search, and a device with fewer ports than CFG_TUD_CDC leaves the tail null.
+static EspUsbDeviceCdcSerial *g_cdcSerials[ESP_USB_DEVICE_CDC_PORTS] = {};
+static EspUsbDeviceMidi *g_activeMidi = nullptr;
+static EspUsbDeviceMsc *g_activeMsc = nullptr;
+static EspUsbDeviceVendor *g_activeVendor = nullptr;
+static EspUsbDeviceNet *g_activeNet = nullptr;
+static EspUsbDeviceDfu *g_activeDfu = nullptr;
+// The active Audio function registry lives in EspUsbAudio.cpp.
+
+static void put16(uint8_t *dst, uint16_t value)
+{
+  dst[0] = static_cast<uint8_t>(value & 0xff);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+}
+
+static void put32(uint8_t *dst, uint32_t value)
+{
+  dst[0] = static_cast<uint8_t>(value & 0xff);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+  dst[2] = static_cast<uint8_t>((value >> 16) & 0xff);
+  dst[3] = static_cast<uint8_t>((value >> 24) & 0xff);
+}
+
+static size_t putUtf16Le(uint8_t *dst, const char *text, bool doubleTerminated)
+{
+  size_t offset = 0;
+  while (*text)
+  {
+    dst[offset++] = static_cast<uint8_t>(*text++);
+    dst[offset++] = 0;
+  }
+  dst[offset++] = 0;
+  dst[offset++] = 0;
+  if (doubleTerminated)
+  {
+    dst[offset++] = 0;
+    dst[offset++] = 0;
+  }
+  return offset;
+}
+
+static uint8_t powerToDescriptor(uint16_t milliamps)
+{
+  uint16_t units = (milliamps + 1) / 2;
+  if (units > 250)
+  {
+    units = 250;
+  }
+  return static_cast<uint8_t>(units);
+}
+
+// Length of the HID item starting at `item`, or 0 if it is malformed or runs
+// past `available`.
+//
+// A HID report descriptor is a stream of items, not a fixed layout, and the
+// prefix byte says how much data follows: two bits of size, where 3 means four
+// bytes rather than three. 0xFE introduces a long item, which nothing here
+// emits but which must still be stepped over correctly rather than silently
+// mis-parsed.
+static size_t hidItemLength(const uint8_t *item, size_t available)
+{
+  if (!item || available == 0)
+  {
+    return 0;
+  }
+  if (item[0] == 0xfe)
+  {
+    if (available < 3)
+    {
+      return 0;
+    }
+    const size_t length = 3u + item[1];
+    return length <= available ? length : 0;
+  }
+  static constexpr uint8_t DATA_SIZE[4] = {0, 1, 2, 4};
+  const size_t length = 1u + DATA_SIZE[item[0] & 0x03];
+  return length <= available ? length : 0;
+}
+
+// Item prefixes with the size bits masked off.
+static constexpr uint8_t HID_ITEM_COLLECTION = 0xa0;
+static constexpr uint8_t HID_ITEM_REPORT_ID = 0x84;
+
+static uint16_t writeHidConfigurationDescriptor(uint8_t *dst,
+                                                uint8_t interfaceNumber,
+                                                uint8_t endpointNumber,
+                                                uint16_t endpointSize,
+                                                uint8_t subclass,
+                                                uint8_t protocol,
+                                                uint16_t reportDescriptorLength,
+                                                bool hasOutEndpoint)
+{
+  using espusb::internal::DescriptorBuildContext;
+  using espusb::internal::HidFunctionConfig;
+  using espusb::internal::HidFunctionLayout;
+  using espusb::internal::UsbSpeed;
+  using espusb::internal::writeHidFunction;
+
+  if (dst == nullptr || endpointNumber == 0 || endpointNumber > 15 ||
+      endpointSize == 0 || reportDescriptorLength == 0)
+  {
+    return 0;
+  }
+
+  const size_t capacity = hasOutEndpoint ? 32U : 25U;
+  espusb::internal::DescriptorBuffer buffer(dst, capacity);
+  DescriptorBuildContext context(UsbSpeed::Full, buffer);
+  HidFunctionLayout layout;
+  layout.interfaceNumber = interfaceNumber;
+  layout.endpoint.out = endpointNumber;
+  layout.endpoint.in = static_cast<uint8_t>(0x80U | endpointNumber);
+  HidFunctionConfig config;
+  config.subclass = subclass;
+  config.protocol = protocol;
+  config.reportDescriptorLength = reportDescriptorLength;
+  config.fullSpeedPacketSize = endpointSize;
+  config.highSpeedPacketSize = endpointSize;
+  config.hasOutEndpoint = hasOutEndpoint;
+  return writeHidFunction(context, layout, config)
+             ? static_cast<uint16_t>(buffer.size())
+             : 0;
+}
+
+static constexpr uint8_t KEYBOARD_REPORT_DESCRIPTOR[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x06,       // Usage (Keyboard)
+    0xa1, 0x01,       // Collection (Application)
+    0x05, 0x07,       //   Usage Page (Keyboard/Keypad)
+    0x19, 0xe0,       //   Usage Minimum (Keyboard LeftControl)
+    0x29, 0xe7,       //   Usage Maximum (Keyboard Right GUI)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x08,       //   Report Count (8)
+    0x81, 0x02,       //   Input (Data,Var,Abs)
+    0x95, 0x01,       //   Report Count (1)
+    0x75, 0x08,       //   Report Size (8)
+    0x81, 0x01,       //   Input (Const,Array,Abs)
+    0x05, 0x08,       //   Usage Page (LEDs)
+    0x19, 0x01,       //   Usage Minimum (Num Lock)
+    0x29, 0x05,       //   Usage Maximum (Kana)
+    0x95, 0x05,       //   Report Count (5)
+    0x75, 0x01,       //   Report Size (1)
+    0x91, 0x02,       //   Output (Data,Var,Abs)
+    0x95, 0x01,       //   Report Count (1)
+    0x75, 0x03,       //   Report Size (3)
+    0x91, 0x01,       //   Output (Const,Array,Abs)
+    0x05, 0x07,       //   Usage Page (Keyboard/Keypad)
+    0x19, 0x00,       //   Usage Minimum (Reserved)
+    0x29, 0xff,       //   Usage Maximum
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0xff,       //   Logical Maximum (255)
+    0x75, 0x08,       //   Report Size (8)
+    0x95, 0x06,       //   Report Count (6)
+    0x81, 0x00,       //   Input (Data,Array,Abs)
+    0xc0,             // End Collection
+};
+
+// N-key rollover keyboard. Input report = 1 modifier byte (usages 0xE0-0xE7) +
+// a 224-bit bitmap for usages 0x00-0xDF (one bit per key), so any number of keys
+// can be held at once, including International1-9 (0x87-0x8F) and LANG1-9
+// (0x90-0x98) used by JIS / other non-US layouts. The LED output report is kept
+// identical to the boot descriptor. The leading 6 bytes (Usage Page / Usage /
+// Collection) match KEYBOARD_REPORT_DESCRIPTOR so the composite report-ID
+// injection in buildDescriptors() works unchanged.
+static constexpr uint8_t NKRO_KEYBOARD_REPORT_DESCRIPTOR[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x06,       // Usage (Keyboard)
+    0xa1, 0x01,       // Collection (Application)
+    0x05, 0x07,       //   Usage Page (Keyboard/Keypad)
+    0x19, 0xe0,       //   Usage Minimum (Keyboard LeftControl)
+    0x29, 0xe7,       //   Usage Maximum (Keyboard Right GUI)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x08,       //   Report Count (8)
+    0x81, 0x02,       //   Input (Data,Var,Abs) -- modifier byte
+    0x05, 0x08,       //   Usage Page (LEDs)
+    0x19, 0x01,       //   Usage Minimum (Num Lock)
+    0x29, 0x05,       //   Usage Maximum (Kana)
+    0x95, 0x05,       //   Report Count (5)
+    0x75, 0x01,       //   Report Size (1)
+    0x91, 0x02,       //   Output (Data,Var,Abs)
+    0x95, 0x01,       //   Report Count (1)
+    0x75, 0x03,       //   Report Size (3)
+    0x91, 0x01,       //   Output (Const,Array,Abs) -- LED padding
+    0x05, 0x07,       //   Usage Page (Keyboard/Keypad)
+    0x19, 0x00,       //   Usage Minimum (0)
+    0x29, 0xdf,       //   Usage Maximum (0xDF)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0xe0,       //   Report Count (224)
+    0x81, 0x02,       //   Input (Data,Var,Abs) -- NKRO key bitmap
+    0xc0,             // End Collection
+};
+
+static constexpr uint8_t MOUSE_REPORT_DESCRIPTOR[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x02,       // Usage (Mouse)
+    0xa1, 0x01,       // Collection (Application)
+    0x09, 0x01,       //   Usage (Pointer)
+    0xa1, 0x00,       //   Collection (Physical)
+    0x05, 0x09,       //     Usage Page (Button)
+    0x19, 0x01,       //     Usage Minimum (Button 1)
+    0x29, 0x05,       //     Usage Maximum (Button 5)
+    0x15, 0x00,       //     Logical Minimum (0)
+    0x25, 0x01,       //     Logical Maximum (1)
+    0x95, 0x05,       //     Report Count (5)
+    0x75, 0x01,       //     Report Size (1)
+    0x81, 0x02,       //     Input (Data,Var,Abs)
+    0x95, 0x01,       //     Report Count (1)
+    0x75, 0x03,       //     Report Size (3)
+    0x81, 0x01,       //     Input (Const,Array,Abs)
+    0x05, 0x01,       //     Usage Page (Generic Desktop)
+    0x09, 0x30,       //     Usage (X)
+    0x09, 0x31,       //     Usage (Y)
+    0x09, 0x38,       //     Usage (Wheel)
+    0x15, 0x81,       //     Logical Minimum (-127)
+    0x25, 0x7f,       //     Logical Maximum (127)
+    0x75, 0x08,       //     Report Size (8)
+    0x95, 0x03,       //     Report Count (3)
+    0x81, 0x06,       //     Input (Data,Var,Rel)
+    0xc0,             //   End Collection
+    0xc0,             // End Collection
+};
+
+static constexpr uint8_t GAMEPAD_REPORT_DESCRIPTOR[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x05,       // Usage (Game Pad)
+    0xa1, 0x01,       // Collection (Application)
+    0x85, 0x03,       //   Report ID (3)
+    0x15, 0x81,       //   Logical Minimum (-127)
+    0x25, 0x7f,       //   Logical Maximum (127)
+    0x09, 0x30,       //   Usage (X)
+    0x09, 0x31,       //   Usage (Y)
+    0x09, 0x32,       //   Usage (Z)
+    0x09, 0x35,       //   Usage (Rz)
+    0x09, 0x33,       //   Usage (Rx)
+    0x09, 0x34,       //   Usage (Ry)
+    0x75, 0x08,       //   Report Size (8)
+    0x95, 0x06,       //   Report Count (6)
+    0x81, 0x02,       //   Input (Data,Var,Abs)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x08,       //   Logical Maximum (8)
+    0x35, 0x00,       //   Physical Minimum (0)
+    0x46, 0x3b, 0x01, //   Physical Maximum (315)
+    0x65, 0x14,       //   Unit (Eng Rot:Angular Pos)
+    0x09, 0x39,       //   Usage (Hat switch)
+    0x75, 0x08,       //   Report Size (8)
+    0x95, 0x01,       //   Report Count (1)
+    0x81, 0x02,       //   Input (Data,Var,Abs)
+    0x65, 0x00,       //   Unit (None)
+    0x05, 0x09,       //   Usage Page (Button)
+    0x19, 0x01,       //   Usage Minimum (Button 1)
+    0x29, 0x20,       //   Usage Maximum (Button 32)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x01,       //   Logical Maximum (1)
+    0x75, 0x01,       //   Report Size (1)
+    0x95, 0x20,       //   Report Count (32)
+    0x81, 0x02,       //   Input (Data,Var,Abs)
+    0xc0,             // End Collection
+};
+
+static constexpr uint8_t CONSUMER_CONTROL_REPORT_DESCRIPTOR[] = {
+    0x05, 0x0c,       // Usage Page (Consumer)
+    0x09, 0x01,       // Usage (Consumer Control)
+    0xa1, 0x01,       // Collection (Application)
+    0x85, 0x04,       //   Report ID (4)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x26, 0xff, 0x03, //   Logical Maximum (1023)
+    0x19, 0x00,       //   Usage Minimum (Unassigned)
+    0x2a, 0xff, 0x03, //   Usage Maximum (1023)
+    0x75, 0x10,       //   Report Size (16)
+    0x95, 0x01,       //   Report Count (1)
+    0x81, 0x00,       //   Input (Data,Array,Abs)
+    0xc0,             // End Collection
+};
+
+static constexpr uint8_t SYSTEM_CONTROL_REPORT_DESCRIPTOR[] = {
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x80,       // Usage (System Control)
+    0xa1, 0x01,       // Collection (Application)
+    0x85, 0x05,       //   Report ID (5)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x25, 0x03,       //   Logical Maximum (3)
+    0x19, 0x00,       //   Usage Minimum (Unassigned)
+    0x29, 0x03,       //   Usage Maximum (3)
+    0x75, 0x08,       //   Report Size (8)
+    0x95, 0x01,       //   Report Count (1)
+    0x81, 0x00,       //   Input (Data,Array,Abs)
+    0xc0,             // End Collection
+};
+
+uint8_t tud_network_mac_address[6] = {0x02, 0x02, 0x84, 0x6a, 0x96, 0x00};
+static bool g_netMacUserSet = false;
+static char g_netMacString[13] = {};
+static uint8_t g_webUsbUrlDescriptor[128] = {};
+
+static constexpr uint8_t WEBUSB_VENDOR_CODE = 0x01;
+static constexpr uint8_t MICROSOFT_OS_20_VENDOR_CODE = 0x02;
+static constexpr uint16_t MICROSOFT_OS_20_DESCRIPTOR_INDEX = 0x0007;
+
+#if ESP_USB_DEVICE_HAS_TINYUSB
+static constexpr uint8_t USB_REQ_GET_DESCRIPTOR = 0x06;
+
+// Note for the descriptor callbacks below: each one records the length it just
+// returned so the ACK observation can report it. The stack asks for a pointer
+// and reads the length out of the descriptor itself, so this is the only place
+// that number exists. Nothing is recorded when no sketch is watching.
+static void recordDescriptorResponse(uint16_t wValue, uint16_t wIndex, uint16_t length)
+{
+  if (g_activeDevice && g_activeDevice->hasControlObserver())
+  {
+    g_activeDevice->recordControlResponse(USB_REQ_GET_DESCRIPTOR, wValue, wIndex,
+                                          length);
+  }
+}
+
+extern "C" uint8_t const *tud_descriptor_device_cb(void)
+{
+  const uint8_t *descriptor = g_activeDevice ? g_activeDevice->deviceDescriptor() : nullptr;
+  recordDescriptorResponse(0x0100, 0, descriptor ? descriptor[0] : 0);
+  return descriptor;
+}
+
+extern "C" uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
+{
+  const uint8_t *descriptor =
+      g_activeDevice ? g_activeDevice->configurationDescriptorForSpeed(
+                           index, tud_speed_get() == TUSB_SPEED_HIGH)
+                     : nullptr;
+  recordDescriptorResponse(static_cast<uint16_t>(0x0200 | index), 0,
+                           descriptor ? static_cast<uint16_t>(descriptor[2] | (descriptor[3] << 8)) : 0);
+  return descriptor;
+}
+
+extern "C" uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
+{
+  const uint16_t *descriptor =
+      g_activeDevice ? g_activeDevice->stringDescriptor(index, langid) : nullptr;
+  recordDescriptorResponse(static_cast<uint16_t>(0x0300 | index), langid,
+                           descriptor ? static_cast<uint16_t>(descriptor[0] & 0xff) : 0);
+  return descriptor;
+}
+
+extern "C" uint8_t const *tud_descriptor_bos_cb(void)
+{
+  const uint8_t *descriptor = g_activeDevice ? g_activeDevice->bosDescriptor() : nullptr;
+  recordDescriptorResponse(0x0f00, 0,
+                           g_activeDevice ? g_activeDevice->bosDescriptorLength() : 0);
+  return descriptor;
+}
+
+extern "C" uint8_t const *tud_descriptor_device_qualifier_cb(void)
+{
+  const uint8_t *descriptor = g_activeDevice ? g_activeDevice->deviceQualifierDescriptor() : nullptr;
+  recordDescriptorResponse(0x0600, 0, descriptor ? descriptor[0] : 0);
+  return descriptor;
+}
+
+extern "C" uint8_t const *tud_descriptor_other_speed_configuration_cb(uint8_t index)
+{
+  const uint8_t *descriptor =
+      g_activeDevice ? g_activeDevice->otherSpeedConfigurationDescriptor(
+                           index, tud_speed_get() == TUSB_SPEED_HIGH)
+                     : nullptr;
+  recordDescriptorResponse(static_cast<uint16_t>(0x0700 | index), 0,
+                           descriptor ? static_cast<uint16_t>(descriptor[2] | (descriptor[3] << 8)) : 0);
+  return descriptor;
+}
+
+// Status stage of a control transfer has completed. Weak in device/usbd.c and
+// left undefined by the dwc2 driver, which makes it the one place a library can
+// see the standard and class requests the stack answers by itself - SET_ADDRESS,
+// SET_CONFIGURATION, GET_DESCRIPTOR, a HID SET_REPORT - without editing the
+// vendored TinyUSB. A stalled request has no status stage and so never arrives
+// here, which is why vendor requests are also reported at SETUP below.
+extern "C" void dcd_edpt0_status_complete(uint8_t rhport, const tusb_control_request_t *request)
+{
+  if (!g_activeDevice || !request || !g_activeDevice->hasControlObserver())
+  {
+    return;
+  }
+  EspUsbDeviceControlRequestInfo info;
+  info.rhport = rhport;
+  info.stage = ESP_USB_DEVICE_CONTROL_STAGE_ACK;
+  info.bmRequestType = request->bmRequestType;
+  info.bRequest = request->bRequest;
+  info.wValue = request->wValue;
+  info.wIndex = request->wIndex;
+  info.wLength = request->wLength;
+  info.responseLength = g_activeDevice->takeControlResponse(
+      request->bRequest, request->wValue, request->wIndex);
+  info.handled = true;
+  g_activeDevice->notifyControlRequest(info);
+}
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+  return g_activeDevice ? g_activeDevice->hidReportDescriptor(instance) : nullptr;
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t reportId, hid_report_type_t reportType, uint8_t *buffer, uint16_t reqlen)
+{
+  (void)instance;
+  (void)reportId;
+  (void)reportType;
+  (void)buffer;
+  (void)reqlen;
+  return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t reportId, hid_report_type_t reportType, const uint8_t *buffer, uint16_t bufsize)
+{
+  if (g_activeDevice)
+  {
+    g_activeDevice->handleHidSetReport(instance, reportId, static_cast<uint8_t>(reportType), buffer, bufsize);
+  }
+}
+
+void tud_hid_set_protocol_cb(uint8_t instance, uint8_t protocol)
+{
+  if (g_activeDevice)
+  {
+    g_activeDevice->handleHidSetProtocol(instance, protocol);
+  }
+}
+
+void tud_mount_cb(void)
+{
+  if (g_activeDevice)
+  {
+    g_activeDevice->handleBusAttached();
+  }
+}
+
+void tud_umount_cb(void)
+{
+  if (g_activeDevice)
+  {
+    g_activeDevice->handleBusDetached();
+  }
+}
+
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
+{
+  if (itf < ESP_USB_DEVICE_CDC_PORTS && g_cdcSerials[itf])
+  {
+    g_cdcSerials[itf]->handleLineState(dtr, rts);
+  }
+}
+
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *lineCoding)
+{
+  if (itf < ESP_USB_DEVICE_CDC_PORTS && g_cdcSerials[itf] && lineCoding)
+  {
+    g_cdcSerials[itf]->handleLineCoding(lineCoding->bit_rate, lineCoding->stop_bits, lineCoding->parity, lineCoding->data_bits);
+  }
+}
+
+void tud_cdc_rx_cb(uint8_t itf)
+{
+  if (itf < ESP_USB_DEVICE_CDC_PORTS && g_cdcSerials[itf])
+  {
+    g_cdcSerials[itf]->handleRx();
+  }
+}
+
+uint8_t tud_msc_get_maxlun_cb(void)
+{
+  return g_activeMsc ? g_activeMsc->maxLun() : 0;
+}
+
+void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendorId[8], uint8_t productId[16], uint8_t productRev[4])
+{
+  (void)lun;
+  if (g_activeMsc)
+  {
+    g_activeMsc->inquiry(vendorId, productId, productRev);
+  }
+}
+
+bool tud_msc_test_unit_ready_cb(uint8_t lun)
+{
+  (void)lun;
+  return g_activeMsc ? g_activeMsc->testUnitReady() : false;
+}
+
+void tud_msc_capacity_cb(uint8_t lun, uint32_t *blockCount, uint16_t *blockSize)
+{
+  (void)lun;
+  if (g_activeMsc)
+  {
+    g_activeMsc->capacity(blockCount, blockSize);
+  }
+}
+
+bool tud_msc_start_stop_cb(uint8_t lun, uint8_t powerCondition, bool start, bool loadEject)
+{
+  (void)lun;
+  return g_activeMsc ? g_activeMsc->startStop(powerCondition, start, loadEject) : true;
+}
+
+int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
+{
+  (void)lun;
+  return g_activeMsc ? g_activeMsc->read10(lba, offset, buffer, bufsize) : -1;
+}
+
+int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
+{
+  (void)lun;
+  return g_activeMsc ? g_activeMsc->write10(lba, offset, buffer, bufsize) : -1;
+}
+
+int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsiCmd[16], void *buffer, uint16_t bufsize)
+{
+  (void)buffer;
+  (void)bufsize;
+  if (scsiCmd[0] == SCSI_CMD_PREVENT_ALLOW_MEDIUM_REMOVAL)
+  {
+    return 0;
+  }
+  if (scsiCmd[0] == USB_SCSI_CMD_SYNCHRONIZE_CACHE_10)
+  {
+    return 0;
+  }
+  tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+  return -1;
+}
+
+bool tud_msc_is_writable_cb(uint8_t lun)
+{
+  (void)lun;
+  return g_activeMsc ? g_activeMsc->writable() : false;
+}
+
+// The signature MUST match the arduino-esp32 TinyUSB prototype exactly
+// (class/vendor/vendor_device.h): `void tud_vendor_rx_cb(uint8_t idx,
+// const uint8_t *buffer, uint32_t bufsize)`. That declaration is inside the
+// header's `extern "C"` block, so defining a matching signature here gives this
+// function C linkage and overrides TinyUSB's weak default. Using a mismatched
+// signature (e.g. a single `uint8_t` argument) does NOT conflict at compile time
+// — instead the compiler emits a *C++-mangled* symbol that silently fails to
+// override the weak C default, so vendord_xfer_cb keeps calling the empty stub
+// and onRx() never fires (data still reaches the RX FIFO, which is why polling
+// "works" — but the callback is dead). In buffered mode (CFG_TUD_VENDOR_TXRX_BUFFERED,
+// the default) buffer/bufsize are NULL/0 and the payload is in the RX FIFO, which
+// handleRx() drains via available()/read().
+void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint32_t bufsize)
+{
+  (void)idx;
+  if (g_activeVendor)
+  {
+    // buffer/bufsize are NULL/0 in a buffered build and the real payload in a
+    // direct one; handleRx() is what knows the difference.
+    g_activeVendor->handleRx(buffer, static_cast<size_t>(bufsize));
+  }
+}
+
+// Room has just come back in the transmit FIFO. Same signature rule as
+// tud_vendor_rx_cb above - this must match class/vendor/vendor_device.h exactly
+// or it silently stops overriding TinyUSB's weak default and
+// EspUsbDeviceVendor::waitWritable() waits out its full timeout every call.
+void tud_vendor_tx_cb(uint8_t idx, uint32_t sent_bytes)
+{
+  (void)idx;
+  if (g_activeVendor)
+  {
+    g_activeVendor->handleTxComplete(static_cast<size_t>(sent_bytes));
+  }
+}
+
+// The vendor-request handling itself. `observation`, when not null, collects
+// what this decided so the caller can report it.
+static bool handleVendorControlXfer(uint8_t rhport, uint8_t stage,
+                                    tusb_control_request_t const *request,
+                                    EspUsbDeviceControlRequestInfo *observation)
+{
+  if (g_activeDevice && request &&
+      request->bRequest == WEBUSB_VENDOR_CODE &&
+      g_activeDevice->config().webusbEnabled)
+  {
+    if (stage != CONTROL_STAGE_SETUP)
+    {
+      return true;
+    }
+    const char *url = g_activeDevice->config().webusbUrl;
+    if (!url)
+    {
+      return false;
+    }
+    uint8_t scheme = 0xff;
+    if (strncmp(url, "https://", 8) == 0)
+    {
+      scheme = 1;
+      url += 8;
+    }
+    else if (strncmp(url, "http://", 7) == 0)
+    {
+      scheme = 0;
+      url += 7;
+    }
+    else
+    {
+      scheme = 1;
+    }
+    size_t length = strlen(url);
+    if (length > sizeof(g_webUsbUrlDescriptor) - 3)
+    {
+      length = sizeof(g_webUsbUrlDescriptor) - 3;
+    }
+    g_webUsbUrlDescriptor[0] = static_cast<uint8_t>(length + 3);
+    g_webUsbUrlDescriptor[1] = 0x03;
+    g_webUsbUrlDescriptor[2] = scheme;
+    memcpy(&g_webUsbUrlDescriptor[3], url, length);
+    if (observation)
+    {
+      observation->responseLength = g_webUsbUrlDescriptor[0];
+      observation->handled = true;
+    }
+    return tud_control_xfer(rhport, request, g_webUsbUrlDescriptor,
+                            g_webUsbUrlDescriptor[0]);
+  }
+  if (g_activeDevice && request &&
+      request->bRequest == MICROSOFT_OS_20_VENDOR_CODE &&
+      request->wIndex == MICROSOFT_OS_20_DESCRIPTOR_INDEX &&
+      g_activeDevice->microsoftOs20Descriptor())
+  {
+    if (stage != CONTROL_STAGE_SETUP)
+    {
+      return true;
+    }
+    if (observation)
+    {
+      observation->responseLength = g_activeDevice->microsoftOs20DescriptorLength();
+      observation->handled = true;
+    }
+    return tud_control_xfer(
+        rhport, request,
+        const_cast<uint8_t *>(g_activeDevice->microsoftOs20Descriptor()),
+        g_activeDevice->microsoftOs20DescriptorLength());
+  }
+  const bool handled =
+      g_activeVendor ? g_activeVendor->handleControlRequest(rhport, stage, request) : false;
+  if (observation)
+  {
+    observation->handled = handled;
+  }
+  return handled;
+}
+
+extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request)
+{
+  // Every vendor request is reported at SETUP, before the library decides what
+  // to do with it, so a sketch can tell "the host never asked" from "the host
+  // asked and the answer was wrong" - which is the whole question when Windows
+  // refuses to bind WinUSB to a vendor interface. SETUP rather than ACK because
+  // a request the device stalls never reaches a status stage.
+  const bool observing = g_activeDevice && request &&
+                         stage == CONTROL_STAGE_SETUP &&
+                         g_activeDevice->hasControlObserver();
+  EspUsbDeviceControlRequestInfo observation;
+  if (observing)
+  {
+    observation.rhport = rhport;
+    observation.stage = ESP_USB_DEVICE_CONTROL_STAGE_SETUP;
+    observation.bmRequestType = request->bmRequestType;
+    observation.bRequest = request->bRequest;
+    observation.wValue = request->wValue;
+    observation.wIndex = request->wIndex;
+    observation.wLength = request->wLength;
+  }
+  const bool result = handleVendorControlXfer(rhport, stage, request,
+                                              observing ? &observation : nullptr);
+  if (observing)
+  {
+    g_activeDevice->notifyControlRequest(observation);
+  }
+  return result;
+}
+
+// TinyUSB net (CDC-NCM) callbacks. Signatures must match class/net/net_device.h
+// (included above) so they get C linkage and override TinyUSB's weak defaults —
+// see the tud_vendor_rx_cb note above for why a mismatch silently fails.
+bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
+{
+  // Return true = we took ownership of this frame and TinyUSB may reuse its
+  // buffer. We copy out synchronously in handleRecv, so always accept.
+  if (g_activeNet)
+  {
+    return g_activeNet->handleRecv(src, size);
+  }
+  tud_network_recv_renew();
+  return true;
+}
+
+uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg)
+{
+  return g_activeNet ? g_activeNet->handleXmit(dst, ref, arg) : 0;
+}
+
+void tud_network_init_cb(void)
+{
+  if (g_activeNet)
+  {
+    g_activeNet->handleInit();
+  }
+}
+#endif
+
+
+EspUsbDevice::EspUsbDevice()
+{
+}
+
+EspUsbDevice::~EspUsbDevice()
+{
+  end();
+  // configDescriptor_ is the base of the single allocation the three buffers are
+  // carved out of.
+  free(configDescriptor_);
+  configDescriptor_ = nullptr;
+  configDescriptorHighSpeed_ = nullptr;
+  otherSpeedDescriptor_ = nullptr;
+}
+
+bool EspUsbDevice::allocateDescriptorBuffers()
+{
+  if (configDescriptor_)
+  {
+    return true;
+  }
+  uint8_t *storage = static_cast<uint8_t *>(calloc(3, MAX_CONFIG_DESCRIPTOR));
+  if (!storage)
+  {
+    setLastError(ESP_ERR_NO_MEM);
+    return false;
+  }
+  configDescriptor_ = storage;
+  configDescriptorHighSpeed_ = storage + MAX_CONFIG_DESCRIPTOR;
+  otherSpeedDescriptor_ = storage + 2 * MAX_CONFIG_DESCRIPTOR;
+  return true;
+}
+
+namespace
+{
+// Defined with the rest of the Microsoft OS 2.0 helpers, below; begin() needs it
+// before that.
+bool isDeviceInterfaceGuid(const char *guid);
+} // namespace
+
+bool EspUsbDevice::begin()
+{
+  return begin(EspUsbDeviceConfig());
+}
+
+bool EspUsbDevice::begin(const EspUsbDeviceConfig &config)
+{
+  if (running_)
+  {
+    return true;
+  }
+  config_ = config;
+  // Checked before the descriptors are built: the registry property writes a
+  // constant length, so a GUID of the wrong shape would produce a set Windows
+  // rejects with nothing here to say why.
+  if (config_.deviceInterfaceGuid && !isDeviceInterfaceGuid(config_.deviceInterfaceGuid))
+  {
+    lastError_ = ESP_ERR_INVALID_ARG;
+    return false;
+  }
+  if (!buildDescriptors())
+  {
+    return false;
+  }
+
+  // Decided here rather than beside the runtime start so a sketch that only
+  // builds descriptors (config.startTinyUsb = false) can still read it back,
+  // which is how the arithmetic is checked without a host.
+  const bool highSpeedBudget =
+      config_.controller == EspUsbController::HighSpeed ||
+      (config_.controller == EspUsbController::Auto && ESP_USB_DEVICE_HIGH_SPEED_DEFAULT);
+  bool doubleBufferFits = true;
+  bulkInDoubleBuffered_ = bulkInDoubleBufferMask(highSpeedBudget, &doubleBufferFits);
+  if (config_.bulkInBuffering == EspUsbBulkInBuffering::Double && !doubleBufferFits)
+  {
+    // Asked for two packets per bulk IN endpoint and the controller's FIFO
+    // cannot hold that. Saying so here is the whole point: the alternative is
+    // an endpoint that silently fails to open at enumeration.
+    setLastError(ESP_ERR_INVALID_SIZE);
+    return false;
+  }
+  // Isochronous IN endpoints are allocated up front and their allocation is
+  // not refused when it does not fit, so a camera or microphone that outgrows
+  // the FIFO enumerates, binds a host driver and transmits nothing. Checked
+  // only when the configuration has one, because every other transfer type
+  // already fails visibly at enumeration and this arithmetic should not be
+  // able to refuse a configuration that has been working.
+  if (hasIsochronousInEndpoint(highSpeedBudget) && !transmitFifoFits(highSpeedBudget))
+  {
+    setLastError(ESP_ERR_NO_MEM);
+    return false;
+  }
+
+  size_t begunClassCount = 0;
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && !classes_[i]->begin())
+    {
+      classes_[i]->end();
+      while (begunClassCount > 0)
+      {
+        --begunClassCount;
+        classes_[begunClassCount]->end();
+      }
+      setLastError(ESP_FAIL);
+      return false;
+    }
+    ++begunClassCount;
+  }
+  if (config_.startTinyUsb && classCount_ > 0)
+  {
+#if ESP_USB_DEVICE_HAS_TINYUSB
+    if (g_activeDevice && g_activeDevice != this)
+    {
+      while (begunClassCount > 0)
+      {
+        --begunClassCount;
+        classes_[begunClassCount]->end();
+      }
+      setLastError(ESP_ERR_INVALID_STATE);
+      return false;
+    }
+    g_activeDevice = this;
+
+    espusb::internal::TinyUsbRuntimeOptions runtimeOptions;
+    switch (config_.controller)
+    {
+    case EspUsbController::FullSpeed:
+      runtimeOptions.controller = espusb::internal::UsbController::FullSpeed;
+      break;
+    case EspUsbController::HighSpeed:
+      runtimeOptions.controller = espusb::internal::UsbController::HighSpeed;
+      break;
+    case EspUsbController::Auto:
+    default:
+      runtimeOptions.controller = espusb::internal::UsbController::Auto;
+      break;
+    }
+
+    runtimeOptions.bulkInDoubleBuffered = bulkInDoubleBuffered_;
+    runtimeOptions.taskCoreId = config_.taskCoreId;
+
+    const esp_err_t err = espusb::internal::startTinyUsbRuntime(runtimeOptions);
+    if (err != ESP_OK)
+    {
+      g_activeDevice = nullptr;
+      while (begunClassCount > 0)
+      {
+        --begunClassCount;
+        classes_[begunClassCount]->end();
+      }
+      setLastError(err);
+      return false;
+    }
+    tinyusbStarted_ = true;
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (classes_[i] && !classes_[i]->afterDeviceStarted())
+      {
+        espusb::internal::stopTinyUsbRuntime();
+        tinyusbStarted_ = false;
+        g_activeDevice = nullptr;
+        while (begunClassCount > 0)
+        {
+          --begunClassCount;
+          classes_[begunClassCount]->end();
+        }
+        setLastError(ESP_FAIL);
+        return false;
+      }
+    }
+#else
+    while (begunClassCount > 0)
+    {
+      --begunClassCount;
+      classes_[begunClassCount]->end();
+    }
+    setLastError(ESP_ERR_NOT_SUPPORTED);
+    return false;
+#endif
+  }
+
+  running_ = true;
+  ready_ = tinyusbStarted_;
+  setLastError(ESP_OK);
+  return true;
+}
+
+void EspUsbDevice::end()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (tinyusbStarted_)
+  {
+    espusb::internal::stopTinyUsbRuntime();
+    tinyusbStarted_ = false;
+  }
+#endif
+  if (running_)
+  {
+    for (size_t i = classCount_; i > 0; --i)
+    {
+      if (classes_[i - 1])
+      {
+        classes_[i - 1]->end();
+      }
+    }
+  }
+  if (g_activeDevice == this)
+  {
+    g_activeDevice = nullptr;
+  }
+  running_ = false;
+  ready_ = false;
+}
+
+void EspUsbDevice::task()
+{
+}
+
+bool EspUsbDevice::ready() const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (tinyusbStarted_)
+  {
+    return tud_mounted();
+  }
+#endif
+  return ready_;
+}
+
+const EspUsbDeviceConfig &EspUsbDevice::config() const
+{
+  return config_;
+}
+
+uint16_t EspUsbDevice::bulkInDoubleBuffered() const
+{
+  return bulkInDoubleBuffered_;
+}
+
+uint16_t EspUsbDevice::hidEndpointSize() const
+{
+  return 8;
+}
+
+esp_err_t EspUsbDevice::lastError() const
+{
+  return lastError_;
+}
+
+const char *EspUsbDevice::lastErrorName() const
+{
+  switch (lastError_)
+  {
+  case ESP_OK:
+    return "ESP_OK";
+  case ESP_FAIL:
+    return "ESP_FAIL";
+  case ESP_ERR_INVALID_STATE:
+    return "ESP_ERR_INVALID_STATE";
+  case ESP_ERR_INVALID_SIZE:
+    return "ESP_ERR_INVALID_SIZE";
+  case ESP_ERR_NOT_SUPPORTED:
+    return "ESP_ERR_NOT_SUPPORTED";
+  default:
+    return "ESP_ERR_UNKNOWN";
+  }
+}
+
+bool EspUsbDevice::addClass(EspUsbDeviceClass *deviceClass)
+{
+  if (!deviceClass || running_ || classCount_ >= MAX_CLASSES)
+  {
+    setLastError(running_ ? ESP_ERR_INVALID_STATE : ESP_FAIL);
+    return false;
+  }
+  classes_[classCount_] = deviceClass;
+  deviceClass->hidInstance_ = static_cast<uint8_t>(classCount_);
+  classCount_++;
+  setLastError(ESP_OK);
+  return true;
+}
+
+void EspUsbDevice::removeClass(EspUsbDeviceClass *deviceClass)
+{
+  for (size_t i = 0; i < classCount_; ++i)
+  {
+    if (classes_[i] != deviceClass)
+    {
+      continue;
+    }
+    for (size_t j = i + 1; j < classCount_; ++j)
+    {
+      classes_[j - 1] = classes_[j];
+      if (classes_[j - 1])
+      {
+        classes_[j - 1]->hidInstance_ = static_cast<uint8_t>(j - 1);
+      }
+    }
+    classes_[--classCount_] = nullptr;
+    // Slot indices shifted, so the names published against them are stale.
+    // buildDescriptors() refills the table; until then no index resolves.
+    memset(functionStrings_, 0, sizeof(functionStrings_));
+    return;
+  }
+}
+
+bool EspUsbDevice::sendHidReport(uint8_t instance, uint8_t reportId, const void *data, size_t length, uint32_t timeoutMs)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!tinyusbStarted_)
+  {
+    setLastError(ESP_ERR_INVALID_STATE);
+    return false;
+  }
+  if (!data || length == 0)
+  {
+    setLastError(ESP_FAIL);
+    return false;
+  }
+  if (instance >= CFG_TUD_HID)
+  {
+    setLastError(ESP_ERR_INVALID_ARG);
+    return false;
+  }
+  const uint32_t startedAt = millis();
+  while (!tud_hid_n_ready(instance))
+  {
+    if (!tinyusbStarted_ || !tud_ready())
+    {
+      setLastError(ESP_ERR_INVALID_STATE);
+      return false;
+    }
+    if (millis() - startedAt >= timeoutMs)
+    {
+      setLastError(ESP_ERR_TIMEOUT);
+      return false;
+    }
+    // The library's USB task processes completion; let it run while waiting.
+    delay(1);
+  }
+  const bool ok = tud_hid_n_report(instance, reportId, data, length);
+  setLastError(ok ? ESP_OK : ESP_FAIL);
+  return ok;
+#else
+  (void)timeoutMs;
+  (void)instance;
+  (void)reportId;
+  (void)data;
+  (void)length;
+  setLastError(ESP_ERR_NOT_SUPPORTED);
+  return false;
+#endif
+}
+
+const uint8_t *EspUsbDevice::deviceDescriptor()
+{
+  buildDescriptors();
+  return deviceDescriptor_;
+}
+
+const uint8_t *EspUsbDevice::configurationDescriptor(uint8_t index)
+{
+  return configurationDescriptorForSpeed(index, false);
+}
+
+const uint8_t *EspUsbDevice::configurationDescriptorForSpeed(uint8_t index, bool highSpeed)
+{
+  if (index != 0)
+  {
+    return nullptr;
+  }
+  if (!buildDescriptors())
+  {
+    return nullptr;
+  }
+  return highSpeed ? configDescriptorHighSpeed_ : configDescriptor_;
+}
+
+const uint8_t *EspUsbDevice::deviceQualifierDescriptor()
+{
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+  if (config_.controller == EspUsbController::FullSpeed)
+  {
+    return nullptr;
+  }
+  buildDescriptors();
+  return deviceQualifierDescriptor_;
+#else
+  return nullptr;
+#endif
+}
+
+const uint8_t *EspUsbDevice::otherSpeedConfigurationDescriptor(uint8_t index, bool currentHighSpeed)
+{
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+  if (index != 0 || config_.controller == EspUsbController::FullSpeed ||
+      !buildDescriptors())
+  {
+    return nullptr;
+  }
+  const uint8_t *source =
+      currentHighSpeed ? configDescriptor_ : configDescriptorHighSpeed_;
+  memcpy(otherSpeedDescriptor_, source, configDescriptorLength_);
+  otherSpeedDescriptor_[1] = 0x07;
+  return otherSpeedDescriptor_;
+#else
+  (void)index;
+  (void)currentHighSpeed;
+  return nullptr;
+#endif
+}
+
+const uint8_t *EspUsbDevice::bosDescriptor() const
+{
+  return bosDescriptorLength_ ? bosDescriptor_ : nullptr;
+}
+
+uint16_t EspUsbDevice::bosDescriptorLength() const
+{
+  return bosDescriptorLength_;
+}
+
+const uint8_t *EspUsbDevice::microsoftOs20Descriptor() const
+{
+  return microsoftOs20DescriptorLength_ ? microsoftOs20Descriptor_ : nullptr;
+}
+
+uint16_t EspUsbDevice::microsoftOs20DescriptorLength() const
+{
+  return microsoftOs20DescriptorLength_;
+}
+
+uint16_t EspUsbDevice::microsoftOs20VendorRevision() const
+{
+  return microsoftOs20VendorRevision_;
+}
+
+uint16_t EspUsbDevice::hidInterfacesLength() const
+{
+  return hidInterfacesLength_;
+}
+
+uint8_t EspUsbDevice::hidInterfaceCount() const
+{
+  return hidInterfaceCount_;
+}
+
+const uint16_t *EspUsbDevice::stringDescriptor(uint8_t index, uint16_t langid)
+{
+  (void)langid;
+  memset(stringDescriptor_, 0, sizeof(stringDescriptor_));
+  if (index == 0)
+  {
+    stringDescriptor_[0] = (USB_DESC_STRING << 8) | 4;
+    stringDescriptor_[1] = 0x0409;
+    return stringDescriptor_;
+  }
+
+  const char *value = nullptr;
+  if (index == 1)
+  {
+    value = config_.manufacturer;
+  }
+  else if (index == 2)
+  {
+    value = config_.product;
+  }
+  else if (index == 3)
+  {
+    value = config_.serialNumber;
+  }
+  else if (index == 4 && g_activeNet)
+  {
+    value = g_netMacString;
+  }
+  else if (index >= FIRST_FUNCTION_STRING_INDEX &&
+           index < FIRST_FUNCTION_STRING_INDEX + MAX_CLASSES)
+  {
+    value = functionStrings_[index - FIRST_FUNCTION_STRING_INDEX];
+  }
+  if (!value)
+  {
+    return nullptr;
+  }
+
+  size_t length = strlen(value);
+  if (length > MAX_STRING_DESCRIPTOR - 1)
+  {
+    length = MAX_STRING_DESCRIPTOR - 1;
+  }
+  stringDescriptor_[0] = static_cast<uint16_t>((USB_DESC_STRING << 8) | (2 + length * 2));
+  for (size_t i = 0; i < length; i++)
+  {
+    stringDescriptor_[1 + i] = static_cast<uint8_t>(value[i]);
+  }
+  return stringDescriptor_;
+}
+
+// The class behind TinyUSB HID instance `instance` when the HID is not merged.
+//
+// `instance` is TinyUSB's slot number, not a position in classes_. This build
+// drives one HID interface (CFG_TUD_HID == 1), so the slot is always 0 and the
+// class behind it is whichever one HID class was registered - wherever it sits
+// in registration order. Indexing classes_ with the slot number used to work
+// only while the HID class happened to be registered first: a vendor, CDC or
+// MSC class registered before it made the lookup land on that class, fail the
+// isHid() test and return nullptr. TinyUSB then armed no data stage for
+// GET_DESCRIPTOR(Report) and sent no STALL either (tu_memcpy_s refuses a null
+// source and hid_device.c ignores the result), so the host waited out its
+// control-transfer timeout. Measured on Windows 11: HidUsb failed to start
+// with Code 10 about 6 s after arrival, and because usbccgp starts a composite
+// device's children in order, a WinUSB function next to it was held behind the
+// failure and never enabled its device interface.
+EspUsbDeviceClass *EspUsbDevice::hidClassForInstance(uint8_t instance) const
+{
+  if (instance != 0 || compositeHid())
+  {
+    return nullptr;
+  }
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isHid())
+    {
+      return classes_[i];
+    }
+  }
+  return nullptr;
+}
+
+const uint8_t *EspUsbDevice::hidReportDescriptor(uint8_t instance)
+{
+  if (compositeHid())
+  {
+    return instance == 0 ? hidReportDescriptor_ : nullptr;
+  }
+  EspUsbDeviceClass *hid = hidClassForInstance(instance);
+  return hid ? hid->hidReportDescriptor() : nullptr;
+}
+
+uint16_t EspUsbDevice::hidReportDescriptorLength(uint8_t instance)
+{
+  if (compositeHid())
+  {
+    return instance == 0 ? hidReportDescriptorLength_ : 0;
+  }
+  EspUsbDeviceClass *hid = hidClassForInstance(instance);
+  return hid ? hid->hidReportDescriptorLength() : 0;
+}
+
+void EspUsbDevice::handleHidSetReport(uint8_t instance, uint8_t reportId, uint8_t reportType, const uint8_t *data, uint16_t length)
+{
+  if (compositeHid())
+  {
+    // A report that arrived on the interrupt OUT endpoint has no report ID yet.
+    // TinyUSB's HID driver does not parse report descriptors, so it passes 0
+    // and leaves the payload untouched (hid_device.c); only the control
+    // SET_REPORT path knows the ID, from wValue. A merged descriptor declares
+    // report IDs, so the host prefixes every report with one and the first byte
+    // is it - without this, a composite HID device silently dropped everything
+    // its host sent to the OUT endpoint, while the same device received control
+    // SET_REPORTs fine.
+    //
+    // Only consumed when it actually names one of the merged classes, so a
+    // device whose classes somehow declare no IDs is left alone rather than
+    // having its first payload byte eaten.
+    if (reportId == 0 && length > 0)
+    {
+      for (size_t i = 0; i < classCount_; i++)
+      {
+        if (classes_[i] && classes_[i]->isHid() &&
+            classReportId(static_cast<uint8_t>(i)) == data[0])
+        {
+          reportId = data[0];
+          data++;
+          length--;
+          break;
+        }
+      }
+    }
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (!classes_[i] || !classes_[i]->isHid())
+      {
+        continue;
+      }
+      if (classReportId(static_cast<uint8_t>(i)) == reportId && classes_[i])
+      {
+        classes_[i]->onHidSetReport(reportId, reportType, data, length);
+        return;
+      }
+    }
+    return;
+  }
+  EspUsbDeviceClass *hid = hidClassForInstance(instance);
+  if (hid)
+  {
+    hid->onHidSetReport(reportId, reportType, data, length);
+  }
+}
+
+void EspUsbDevice::handleHidSetProtocol(uint8_t instance, uint8_t protocol)
+{
+  if (compositeHid())
+  {
+    if (instance != 0)
+    {
+      return;
+    }
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (classes_[i])
+      {
+        classes_[i]->onHidSetProtocol(protocol);
+      }
+    }
+    return;
+  }
+  EspUsbDeviceClass *hid = hidClassForInstance(instance);
+  if (hid)
+  {
+    hid->onHidSetProtocol(protocol);
+  }
+}
+
+void EspUsbDevice::onAnyControlRequest(ControlRequestObserver callback)
+{
+  controlObserver_ = callback;
+  controlResponseLength_ = 0;
+}
+
+void EspUsbDevice::notifyControlRequest(const EspUsbDeviceControlRequestInfo &info)
+{
+  if (controlObserver_)
+  {
+    controlObserver_(info);
+  }
+}
+
+void EspUsbDevice::recordControlResponse(uint8_t bRequest, uint16_t wValue,
+                                         uint16_t wIndex, uint16_t length)
+{
+  controlResponseRequest_ = bRequest;
+  controlResponseValue_ = wValue;
+  controlResponseIndex_ = wIndex;
+  controlResponseLength_ = length;
+}
+
+uint16_t EspUsbDevice::takeControlResponse(uint8_t bRequest, uint16_t wValue,
+                                           uint16_t wIndex)
+{
+  if (controlResponseLength_ == 0 || bRequest != controlResponseRequest_ ||
+      wValue != controlResponseValue_ || wIndex != controlResponseIndex_)
+  {
+    return 0;
+  }
+  const uint16_t length = controlResponseLength_;
+  controlResponseLength_ = 0;
+  return length;
+}
+
+void EspUsbDevice::handleBusAttached()
+{
+  // Every class hears this, composite or not: the bus is shared by all of them.
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i])
+    {
+      classes_[i]->onBusAttached();
+    }
+  }
+}
+
+void EspUsbDevice::handleBusDetached()
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i])
+    {
+      classes_[i]->onBusDetached();
+    }
+  }
+}
+
+bool EspUsbDevice::buildDescriptors()
+{
+  if (!allocateDescriptorBuffers())
+  {
+    return false;
+  }
+  vendorInterfaceNumber_ = 0xff;
+  dfuInterfaceNumber_ = 0xff;
+
+  // Hand every function its identity before any descriptor bytes are written.
+  // The CDC instance index has to match the order the functions appear in the
+  // configuration descriptor, because that is the order TinyUSB claims their
+  // interfaces in and therefore the order it numbers its class instances. HID
+  // functions are emitted first but are never CDC, so counting in registration
+  // order gives the same sequence as the emitted descriptor.
+  uint8_t cdcInstance = 0;
+  memset(functionStrings_, 0, sizeof(functionStrings_));
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (!classes_[i])
+    {
+      continue;
+    }
+    const char *name = classes_[i]->functionName();
+    uint8_t stringIndex = 0;
+    if (name && name[0] != '\0')
+    {
+      stringIndex = static_cast<uint8_t>(FIRST_FUNCTION_STRING_INDEX + i);
+      functionStrings_[i] = name;
+    }
+    classes_[i]->assignFunctionIds(classes_[i]->isCdc() ? cdcInstance++ : 0,
+                                   stringIndex);
+  }
+
+  const bool composite = compositeHid();
+  uint8_t interfaceCount = composite ? 1 : 0;
+  if (!composite)
+  {
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (classes_[i] && classes_[i]->isHid())
+      {
+        interfaceCount += classes_[i]->interfaceCount();
+      }
+    }
+  }
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && !classes_[i]->isHid())
+    {
+      interfaceCount += classes_[i]->interfaceCount();
+    }
+  }
+
+  memset(deviceDescriptor_, 0, sizeof(deviceDescriptor_));
+  deviceDescriptor_[0] = 18;
+  deviceDescriptor_[1] = USB_DESC_DEVICE;
+  // Raised to 0x0201 below if this configuration ends up publishing a BOS.
+  put16(&deviceDescriptor_[2], 0x0200);
+  deviceDescriptor_[4] = 0x00;
+  deviceDescriptor_[5] = 0x00;
+  deviceDescriptor_[6] = 0x00;
+  deviceDescriptor_[7] = 64;
+  put16(&deviceDescriptor_[8], config_.vid);
+  put16(&deviceDescriptor_[10], config_.pid);
+  put16(&deviceDescriptor_[12], config_.deviceVersion);
+  deviceDescriptor_[14] = config_.manufacturer ? 1 : 0;
+  deviceDescriptor_[15] = config_.product ? 2 : 0;
+  deviceDescriptor_[16] = config_.serialNumber ? 3 : 0;
+  deviceDescriptor_[17] = 1;
+
+  memset(configDescriptor_, 0, MAX_CONFIG_DESCRIPTOR);
+  memset(hidReportDescriptor_, 0, sizeof(hidReportDescriptor_));
+  hidReportDescriptorLength_ = 0;
+  configDescriptor_[0] = 9;
+  configDescriptor_[1] = USB_DESC_CONFIGURATION;
+  configDescriptor_[4] = interfaceCount;
+  configDescriptor_[5] = 1;
+  configDescriptor_[6] = 0;
+  configDescriptor_[7] = static_cast<uint8_t>(0x80 | (config_.selfPowered ? 0x40 : 0x00));
+  configDescriptor_[8] = powerToDescriptor(config_.maxPowerMilliamps);
+
+  uint16_t offset = 9;
+  uint8_t interfaceNumber = 0;
+  uint8_t endpointNumber = 1;
+  uint16_t endpointSize = composite ? 16 : hidEndpointSize();
+  // HID functions whose interrupt endpoints are larger in the high-speed
+  // configuration than in the full-speed one, as byte ranges of the descriptor.
+  // The high-speed copy is made by patching the full-speed bytes below, and
+  // patching per function rather than per descriptor type is what keeps a
+  // keyboard's 8-byte endpoint at 8 while a vendor HID function next to it goes
+  // to 512.
+  struct HidSpeedFixup
+  {
+    uint16_t offset;
+    uint16_t length;
+    uint16_t highSpeedPacketSize;
+  };
+  HidSpeedFixup hidSpeedFixups[MAX_CLASSES] = {};
+  size_t hidSpeedFixupCount = 0;
+  if (composite)
+  {
+    // Raise the shared HID endpoint if any merged class needs more room (e.g. an
+    // NKRO keyboard's bitmap report). Bounded by CFG_TUD_HID_EP_BUFSIZE (64).
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (classes_[i] && classes_[i]->isHid())
+      {
+        const uint16_t hint = classes_[i]->hidInEndpointSize();
+        if (hint > endpointSize)
+        {
+          endpointSize = hint;
+        }
+      }
+    }
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (!classes_[i] || !classes_[i]->isHid())
+      {
+        continue;
+      }
+      const uint8_t *src = classes_[i]->hidReportDescriptor();
+      const uint16_t srcLen = classes_[i]->hidReportDescriptorLength();
+      if (!src || srcLen < 6 || hidReportDescriptorLength_ + srcLen + 2 > MAX_HID_REPORT_DESCRIPTOR)
+      {
+        setLastError(ESP_FAIL);
+        return false;
+      }
+      // Merging means giving each class its own Report ID, which has to go
+      // immediately after that class's Collection (Application) item.
+      //
+      // Finding that point by walking items is not pedantry. The obvious
+      // shortcut - copy six bytes, insert the ID, copy the rest - holds only
+      // for a descriptor that opens with a one-byte Usage Page, a one-byte
+      // Usage and the Collection. EspUsbDeviceHidVendor opens with a
+      // vendor-defined Usage Page, which is a three-byte item, so cutting at
+      // six landed inside the Collection item and the merged descriptor was
+      // nonsense from there on: the host read 0xA1 0x85 as "Collection
+      // (vendor)" and every later item shifted by one.
+      //
+      // A class that already declares a Report ID of its own (gamepad,
+      // consumer control, system control, vendor HID) has it replaced rather
+      // than duplicated, since the composite device is the one deciding IDs.
+      size_t sourceOffset = 0;
+      bool reportIdWritten = false;
+      bool justInsertedId = false;
+      while (sourceOffset < srcLen)
+      {
+        const size_t itemLength = hidItemLength(&src[sourceOffset], srcLen - sourceOffset);
+        if (itemLength == 0)
+        {
+          setLastError(ESP_FAIL);
+          return false;
+        }
+        const uint8_t prefix = src[sourceOffset];
+        if (justInsertedId && (prefix & 0xfc) == HID_ITEM_REPORT_ID)
+        {
+          justInsertedId = false;
+          sourceOffset += itemLength;
+          continue;
+        }
+        justInsertedId = false;
+        if (hidReportDescriptorLength_ + itemLength > MAX_HID_REPORT_DESCRIPTOR)
+        {
+          setLastError(ESP_FAIL);
+          return false;
+        }
+        memcpy(&hidReportDescriptor_[hidReportDescriptorLength_], &src[sourceOffset], itemLength);
+        hidReportDescriptorLength_ = static_cast<uint16_t>(hidReportDescriptorLength_ + itemLength);
+        sourceOffset += itemLength;
+        if (!reportIdWritten && (prefix & 0xfc) == HID_ITEM_COLLECTION)
+        {
+          if (hidReportDescriptorLength_ + 2 > MAX_HID_REPORT_DESCRIPTOR)
+          {
+            setLastError(ESP_FAIL);
+            return false;
+          }
+          hidReportDescriptor_[hidReportDescriptorLength_++] = 0x85;
+          hidReportDescriptor_[hidReportDescriptorLength_++] =
+              classReportId(static_cast<uint8_t>(i));
+          reportIdWritten = true;
+          justInsertedId = true;
+        }
+      }
+      if (!reportIdWritten)
+      {
+        // No Collection to hang a Report ID on, so this class cannot be merged
+        // with another. Failing here beats shipping a descriptor whose reports
+        // are indistinguishable on the wire.
+        setLastError(ESP_FAIL);
+        return false;
+      }
+    }
+
+    // Single duplex endpoint on EP1 (OUT=0x01 / IN=0x81).
+    const uint16_t written = writeHidConfigurationDescriptor(
+        &configDescriptor_[offset],
+        interfaceNumber,
+        endpointNumber,
+        endpointSize,
+        0,
+        0,
+        hidReportDescriptorLength_,
+        true);
+    if (written == 0)
+    {
+      setLastError(ESP_FAIL);
+      return false;
+    }
+    uint16_t compositeHighSpeedSize = 0;
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (!classes_[i] || !classes_[i]->isHid())
+      {
+        continue;
+      }
+      const uint16_t hint = classes_[i]->hidHighSpeedEndpointSize();
+      if (hint > compositeHighSpeedSize)
+      {
+        compositeHighSpeedSize = hint;
+      }
+    }
+    if (compositeHighSpeedSize > endpointSize)
+    {
+      hidSpeedFixups[hidSpeedFixupCount++] = {offset, written, compositeHighSpeedSize};
+    }
+    offset += written;
+    interfaceNumber += 1;
+    endpointNumber += 1;
+  }
+  else
+  {
+    for (size_t i = 0; i < classCount_; i++)
+    {
+      if (!classes_[i] || !classes_[i]->isHid())
+      {
+        continue;
+      }
+      uint16_t written = classes_[i]->configurationDescriptor(&configDescriptor_[offset], interfaceNumber, endpointNumber, endpointSize);
+      const uint16_t highSpeedSize = classes_[i]->hidHighSpeedEndpointSize();
+      if (written > 0 && highSpeedSize > 0)
+      {
+        hidSpeedFixups[hidSpeedFixupCount++] = {offset, written, highSpeedSize};
+      }
+      offset += written;
+      interfaceNumber += classes_[i]->interfaceCount();
+      endpointNumber += classes_[i]->endpointCount();
+      if (offset > MAX_CONFIG_DESCRIPTOR)
+      {
+        setLastError(ESP_FAIL);
+        return false;
+      }
+    }
+  }
+  // Everything written so far is HID; keep the extent for descriptor tests and
+  // report-instance bookkeeping.
+  hidInterfacesLength_ = static_cast<uint16_t>(offset - 9);
+  hidInterfaceCount_ = interfaceNumber;
+  // Classes whose high-speed descriptor differs by more than a packet size in
+  // an endpoint descriptor have to be asked again for the high-speed
+  // configuration rather than patched. Audio and video both size isochronous
+  // endpoints from the speed, so the offsets they were written at are kept.
+  EspUsbDeviceClass *audioClass = nullptr;
+  uint16_t audioOffset = 0;
+  uint16_t audioLength = 0;
+  uint8_t audioInterfaceNumber = 0;
+  uint8_t audioEndpointNumber = 0;
+  EspUsbDeviceClass *videoClass = nullptr;
+  uint16_t videoOffset = 0;
+  uint16_t videoLength = 0;
+  uint8_t videoInterfaceNumber = 0;
+  uint8_t videoEndpointNumber = 0;
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (!classes_[i] || classes_[i]->isHid())
+    {
+      continue;
+    }
+    const uint16_t classOffset = offset;
+    const uint8_t classInterface = interfaceNumber;
+    const uint8_t classEndpoint = endpointNumber;
+    uint16_t written = classes_[i]->configurationDescriptorForSpeed(
+        &configDescriptor_[offset], MAX_CONFIG_DESCRIPTOR - offset,
+        interfaceNumber, endpointNumber, false);
+    if (written == 0)
+    {
+      setLastError(ESP_FAIL);
+      return false;
+    }
+    offset += written;
+    if (classes_[i]->isAudio())
+    {
+      audioClass = classes_[i];
+      audioOffset = classOffset;
+      audioLength = written;
+      audioInterfaceNumber = classInterface;
+      audioEndpointNumber = classEndpoint;
+    }
+    if (classes_[i]->isVideo())
+    {
+      videoClass = classes_[i];
+      videoOffset = classOffset;
+      videoLength = written;
+      videoInterfaceNumber = classInterface;
+      videoEndpointNumber = classEndpoint;
+    }
+    if (classes_[i]->isVendor())
+    {
+      vendorInterfaceNumber_ = classInterface;
+    }
+    if (classes_[i]->isDfu())
+    {
+      dfuInterfaceNumber_ = classInterface;
+    }
+    interfaceNumber += classes_[i]->interfaceCount();
+    endpointNumber += classes_[i]->endpointCount();
+    if (offset > MAX_CONFIG_DESCRIPTOR)
+    {
+      setLastError(ESP_FAIL);
+      return false;
+    }
+  }
+  configDescriptorLength_ = offset;
+  put16(&configDescriptor_[2], configDescriptorLength_);
+  if (!validateControllerEndpoints(configDescriptor_,
+                                   configDescriptorLength_))
+  {
+    setLastError(ESP_ERR_INVALID_SIZE);
+    return false;
+  }
+
+  // A configuration that groups interfaces with Interface Association
+  // Descriptors must say so at the device level: the IAD ECN reserves
+  // 0xEF/0x02/0x01 (Miscellaneous / Common Class / Interface Association) for
+  // exactly that, and it is what tells Windows to load usbccgp.sys as the
+  // parent and then bind a driver per function instead of per interface.
+  // Without it a device with two CDC functions is a coin flip - the host may
+  // bind one driver across all four interfaces and expose a single broken
+  // port. Devices that emit no IAD (HID, MSC, MIDI, bulk Vendor) keep 0x00,
+  // where the class lives entirely in the interface descriptors.
+  for (uint16_t descriptorOffset = 9;
+       descriptorOffset + 2 <= configDescriptorLength_;)
+  {
+    const uint8_t descriptorLength = configDescriptor_[descriptorOffset];
+    if (descriptorLength < 2)
+    {
+      break;
+    }
+    if (configDescriptor_[descriptorOffset + 1] ==
+        USB_DESC_INTERFACE_ASSOCIATION)
+    {
+      deviceDescriptor_[4] = 0xef;
+      deviceDescriptor_[5] = 0x02;
+      deviceDescriptor_[6] = 0x01;
+      break;
+    }
+    descriptorOffset = static_cast<uint16_t>(descriptorOffset + descriptorLength);
+  }
+
+  memcpy(configDescriptorHighSpeed_, configDescriptor_, configDescriptorLength_);
+  for (uint16_t descriptorOffset = 0;
+       descriptorOffset + 1 < configDescriptorLength_;)
+  {
+    const uint8_t descriptorLength =
+        configDescriptorHighSpeed_[descriptorOffset];
+    if (descriptorLength < 2 ||
+        descriptorOffset + descriptorLength > configDescriptorLength_)
+    {
+      setLastError(ESP_FAIL);
+      return false;
+    }
+    if (configDescriptorHighSpeed_[descriptorOffset + 1] == USB_DESC_ENDPOINT &&
+        descriptorLength >= 7 &&
+        (configDescriptorHighSpeed_[descriptorOffset + 3] & 0x03) ==
+            USB_ENDPOINT_ATTR_BULK)
+    {
+      put16(&configDescriptorHighSpeed_[descriptorOffset + 4], 512);
+    }
+    descriptorOffset = static_cast<uint16_t>(descriptorOffset + descriptorLength);
+  }
+  for (size_t fixup = 0; fixup < hidSpeedFixupCount; fixup++)
+  {
+    const HidSpeedFixup &range = hidSpeedFixups[fixup];
+    for (uint16_t descriptorOffset = range.offset;
+         descriptorOffset + 1 < range.offset + range.length;)
+    {
+      const uint8_t descriptorLength =
+          configDescriptorHighSpeed_[descriptorOffset];
+      if (descriptorLength < 2 ||
+          descriptorOffset + descriptorLength > range.offset + range.length)
+      {
+        setLastError(ESP_FAIL);
+        return false;
+      }
+      if (configDescriptorHighSpeed_[descriptorOffset + 1] == USB_DESC_ENDPOINT &&
+          descriptorLength >= 7 &&
+          (configDescriptorHighSpeed_[descriptorOffset + 3] & 0x03) ==
+              USB_ENDPOINT_ATTR_INTERRUPT)
+      {
+        put16(&configDescriptorHighSpeed_[descriptorOffset + 4],
+              range.highSpeedPacketSize);
+      }
+      descriptorOffset = static_cast<uint16_t>(descriptorOffset + descriptorLength);
+    }
+  }
+  if (audioClass)
+  {
+    const uint16_t highSpeedAudioLength =
+        audioClass->configurationDescriptorForSpeed(
+            &configDescriptorHighSpeed_[audioOffset],
+            MAX_CONFIG_DESCRIPTOR - audioOffset, audioInterfaceNumber,
+            audioEndpointNumber, true);
+    if (highSpeedAudioLength != audioLength)
+    {
+      setLastError(ESP_FAIL);
+      return false;
+    }
+  }
+  if (videoClass)
+  {
+    // Only the isochronous wMaxPacketSize differs between the two speeds, so
+    // the lengths must match; a mismatch would mean the rest of the
+    // configuration had shifted underneath the copy.
+    const uint16_t highSpeedVideoLength =
+        videoClass->configurationDescriptorForSpeed(
+            &configDescriptorHighSpeed_[videoOffset],
+            MAX_CONFIG_DESCRIPTOR - videoOffset, videoInterfaceNumber,
+            videoEndpointNumber, true);
+    if (highSpeedVideoLength != videoLength)
+    {
+      setLastError(ESP_FAIL);
+      return false;
+    }
+  }
+
+  memset(deviceQualifierDescriptor_, 0, sizeof(deviceQualifierDescriptor_));
+  deviceQualifierDescriptor_[0] = sizeof(deviceQualifierDescriptor_);
+  deviceQualifierDescriptor_[1] = 0x06;
+  put16(&deviceQualifierDescriptor_[2], 0x0200);
+  deviceQualifierDescriptor_[4] = deviceDescriptor_[4];
+  deviceQualifierDescriptor_[5] = deviceDescriptor_[5];
+  deviceQualifierDescriptor_[6] = deviceDescriptor_[6];
+  deviceQualifierDescriptor_[7] = deviceDescriptor_[7];
+  deviceQualifierDescriptor_[8] = 1;
+  buildWebUsbDescriptors();
+
+  // bcdUSB has to say 0x0201 or later or a host does not ask for the BOS at
+  // all, and the BOS is where both the WebUSB and the Microsoft OS 2.0
+  // capabilities live. 0x0201 rather than 0x0210 on purpose: it is the exact
+  // threshold at which hosts read the BOS (Linux and Windows both), and
+  // claiming 2.10 would assert a level of USB 2.1 compliance this device does
+  // not implement. Measured to bind WinUSB on Windows 11 either way.
+  //
+  // Tied to whether a BOS was actually built rather than to config_.webusbEnabled:
+  // a DFU-only device publishes a Microsoft capability and no WebUSB one.
+  if (bosDescriptorLength_ > 0)
+  {
+    put16(&deviceDescriptor_[2], 0x0201);
+    put16(&deviceQualifierDescriptor_[2], 0x0201);
+  }
+  setLastError(ESP_OK);
+  return true;
+}
+
+bool EspUsbDevice::microsoftOs20SubsetLayout() const
+{
+  switch (config_.msOs20Layout)
+  {
+  case ESP_USB_DEVICE_MS_OS_20_FLAT:
+    return false;
+  case ESP_USB_DEVICE_MS_OS_20_SUBSETS:
+    return true;
+  default:
+    break;
+  }
+  // Asking to be treated as composite makes usbccgp load whatever the interface
+  // count is, so the function subsets it needs become the right shape.
+  if (config_.msOs20CcgpDevice)
+  {
+    return true;
+  }
+  // Windows resolves a function subset through usbccgp.sys, which it loads only
+  // for a composite device. bNumInterfaces is what decides that here: one
+  // interface means no usbccgp, so the compatible ID has to sit directly under
+  // the set header or it reaches nothing.
+  return configDescriptor_ && configDescriptor_[4] > 1;
+}
+
+bool EspUsbDevice::microsoftOs20UsesSubsets() const
+{
+  return microsoftOs20DescriptorLength_ > 0 && microsoftOs20SubsetLayout();
+}
+
+namespace
+{
+// The GUID every EspUsbDevice vendor interface answered to before
+// EspUsbDeviceConfig::deviceInterfaceGuid existed. Kept as the default so an
+// existing sketch's host-side lookup does not stop finding it.
+constexpr char kDefaultDeviceInterfaceGuid[] = "{975F44D9-0D08-43FD-8B3E-127CA8AFFF9D}";
+
+// `{8-4-4-4-12}`, braces included. The registry property's length is written
+// into the descriptor as a constant, so a GUID of any other length would
+// silently produce a malformed set - which is why this is checked at begin()
+// rather than clamped here.
+bool isDeviceInterfaceGuid(const char *guid)
+{
+  if (!guid)
+  {
+    return false;
+  }
+  static const uint8_t groups[] = {8, 4, 4, 4, 12};
+  size_t index = 0;
+  if (guid[index++] != '{')
+  {
+    return false;
+  }
+  for (size_t group = 0; group < sizeof(groups); group++)
+  {
+    for (uint8_t i = 0; i < groups[group]; i++)
+    {
+      const char c = guid[index++];
+      if (!isxdigit(static_cast<unsigned char>(c)))
+      {
+        return false;
+      }
+    }
+    const char expected = (group + 1 < sizeof(groups)) ? '-' : '}';
+    if (guid[index++] != expected)
+    {
+      return false;
+    }
+  }
+  return guid[index] == '\0';
+}
+
+// CRC-16/CCITT over the finished descriptor set, so wVendorRevision moves
+// whenever any byte of the set moves. Folded to 15 bits and offset by one: the
+// value has to be non-zero to be a revision, and never colliding with "unset"
+// matters more here than using the top bit.
+uint16_t descriptorSetRevision(const uint8_t *data, size_t length)
+{
+  uint16_t crc = 0xffff;
+  for (size_t i = 0; i < length; i++)
+  {
+    crc = static_cast<uint16_t>(crc ^ (static_cast<uint16_t>(data[i]) << 8));
+    for (int bit = 0; bit < 8; bit++)
+    {
+      crc = static_cast<uint16_t>((crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1));
+    }
+  }
+  return static_cast<uint16_t>((crc & 0x7fff) + 1);
+}
+} // namespace
+
+void EspUsbDevice::buildWebUsbDescriptors()
+{
+  memset(bosDescriptor_, 0, sizeof(bosDescriptor_));
+  memset(microsoftOs20Descriptor_, 0, sizeof(microsoftOs20Descriptor_));
+  bosDescriptorLength_ = 0;
+  microsoftOs20DescriptorLength_ = 0;
+
+  // Which interfaces want Windows to bind WinUSB to them. Both of these are
+  // classes no in-box driver claims by its class code, so without this a
+  // Windows user is sent to Zadig - which is not "driverless" and cannot be
+  // shipped to anyone.
+  //
+  // Deliberately independent of config_.webusbEnabled. WebUSB is about a
+  // browser reaching the device; WinUSB is about the device being reachable at
+  // all. A DFU function needs the second and not the first.
+  uint8_t winUsbInterfaces[2];
+  bool winUsbRegistryProperty[2];
+  uint8_t winUsbCount = 0;
+  if (vendorInterfaceNumber_ != 0xff)
+  {
+    winUsbRegistryProperty[winUsbCount] = true;
+    winUsbInterfaces[winUsbCount++] = vendorInterfaceNumber_;
+  }
+  if (dfuInterfaceNumber_ != 0xff)
+  {
+    // No DeviceInterfaceGUIDs for DFU: libusb - and therefore dfu-util - finds
+    // a WinUSB device through the USB device interface class, not through a
+    // per-function GUID, so the 132 bytes would buy nothing. The compatible ID
+    // is the part that binds the driver.
+    winUsbRegistryProperty[winUsbCount] = false;
+    winUsbInterfaces[winUsbCount++] = dfuInterfaceNumber_;
+  }
+  // Ascending bFirstInterface. The specification does not require the subsets
+  // to be ordered, but every set Microsoft publishes is, and a host walking
+  // them in one pass is the obvious implementation to write - so emitting them
+  // out of order is a risk taken for nothing. Two entries, so a swap is the
+  // whole sort.
+  if (winUsbCount == 2 && winUsbInterfaces[0] > winUsbInterfaces[1])
+  {
+    const uint8_t interfaceNumber = winUsbInterfaces[0];
+    const bool property = winUsbRegistryProperty[0];
+    winUsbInterfaces[0] = winUsbInterfaces[1];
+    winUsbRegistryProperty[0] = winUsbRegistryProperty[1];
+    winUsbInterfaces[1] = interfaceNumber;
+    winUsbRegistryProperty[1] = property;
+  }
+
+  if (!config_.webusbEnabled && winUsbCount == 0)
+  {
+    return;
+  }
+
+  static constexpr uint8_t webUsbUuid[] = {
+      0x38, 0xb6, 0x08, 0x34, 0xa9, 0x09, 0xa0, 0x47,
+      0x8b, 0xfd, 0xa0, 0x76, 0x88, 0x15, 0xb6, 0x65,
+  };
+  static constexpr uint8_t microsoftOs20Uuid[] = {
+      0xdf, 0x60, 0xdd, 0xd8, 0x89, 0x45, 0xc7, 0x4c,
+      0x9c, 0xd2, 0x65, 0x9d, 0x9e, 0x64, 0x8a, 0x9f,
+  };
+
+  // The Microsoft descriptor set is built first: the BOS platform capability
+  // has to publish its total length, and that length depends on how many
+  // functions are named and whether the subsets are there at all.
+  if (winUsbCount > 0)
+  {
+    const bool useSubsets = microsoftOs20SubsetLayout();
+    uint8_t *const set = microsoftOs20Descriptor_;
+    size_t offset = 0;
+
+    // Set header: wLength, wDescriptorType, dwWindowsVersion, wTotalLength.
+    // wTotalLength is filled in once the rest is written.
+    put16(&set[offset], 10);
+    offset += 2;
+    put16(&set[offset], 0); // MS_OS_20_SET_HEADER_DESCRIPTOR
+    offset += 2;
+    put32(&set[offset], 0x06030000); // Windows 8.1 and later
+    offset += 4;
+    const size_t setLengthOffset = offset;
+    offset += 2;
+
+    // Where each wVendorRevision goes, filled in once the set is complete: the
+    // value is a checksum of the finished bytes, so it cannot be written while
+    // they are still being produced.
+    size_t revisionOffsets[3];
+    uint8_t revisionCount = 0;
+
+    // Device scope, so it goes under the set header ahead of any subset: it is
+    // what makes usbccgp load in the first place.
+    if (config_.msOs20CcgpDevice)
+    {
+      put16(&set[offset], 4);
+      offset += 2;
+      put16(&set[offset], 7); // MS_OS_20_FEATURE_CCGP_DEVICE
+      offset += 2;
+    }
+
+    // Flat sets carry it once, directly under the set header. Subsets carry one
+    // in every function subset, which is where Windows looks for it when
+    // usbccgp has split the device up.
+    if (!useSubsets)
+    {
+      put16(&set[offset], 6);
+      offset += 2;
+      put16(&set[offset], 8); // MS_OS_20_FEATURE_VENDOR_REVISION
+      offset += 2;
+      revisionOffsets[revisionCount++] = offset;
+      put16(&set[offset], 0);
+      offset += 2;
+    }
+
+    size_t configurationLengthOffset = 0;
+    size_t configurationOffset = offset;
+    if (useSubsets)
+    {
+      configurationOffset = offset;
+      put16(&set[offset], 8);
+      offset += 2;
+      put16(&set[offset], 1); // MS_OS_20_SUBSET_HEADER_CONFIGURATION
+      offset += 2;
+      set[offset++] = 0; // configuration index, not bConfigurationValue
+      set[offset++] = 0; // bReserved
+      configurationLengthOffset = offset;
+      offset += 2;
+    }
+
+    bool built = true;
+    for (uint8_t i = 0; i < winUsbCount; i++)
+    {
+      size_t functionLengthOffset = 0;
+      const size_t functionOffset = offset;
+      if (useSubsets)
+      {
+        put16(&set[offset], 8);
+        offset += 2;
+        put16(&set[offset], 2); // MS_OS_20_SUBSET_HEADER_FUNCTION
+        offset += 2;
+        set[offset++] = winUsbInterfaces[i];
+        set[offset++] = 0; // bReserved
+        functionLengthOffset = offset;
+        offset += 2;
+
+        put16(&set[offset], 6);
+        offset += 2;
+        put16(&set[offset], 8); // MS_OS_20_FEATURE_VENDOR_REVISION
+        offset += 2;
+        if (revisionCount < (sizeof(revisionOffsets) / sizeof(revisionOffsets[0])))
+        {
+          revisionOffsets[revisionCount++] = offset;
+        }
+        put16(&set[offset], 0);
+        offset += 2;
+      }
+
+      put16(&set[offset], 20);
+      offset += 2;
+      put16(&set[offset], 3); // MS_OS_20_FEATURE_COMPATIBLE_ID
+      offset += 2;
+      static constexpr uint8_t winUsbId[16] = {
+          'W', 'I', 'N', 'U', 'S', 'B', 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0,
+      };
+      memcpy(&set[offset], winUsbId, sizeof(winUsbId));
+      offset += sizeof(winUsbId);
+
+      if (winUsbRegistryProperty[i])
+      {
+        const size_t propertyOffset = offset;
+        put16(&set[offset], 132);
+        offset += 2;
+        put16(&set[offset], 4); // MS_OS_20_FEATURE_REG_PROPERTY
+        offset += 2;
+        put16(&set[offset], 7); // REG_MULTI_SZ
+        offset += 2;
+        put16(&set[offset], 42);
+        offset += 2;
+        offset += putUtf16Le(&set[offset], "DeviceInterfaceGUIDs", false);
+        put16(&set[offset], 80);
+        offset += 2;
+        offset += putUtf16Le(&set[offset],
+                             config_.deviceInterfaceGuid ? config_.deviceInterfaceGuid
+                                                         : kDefaultDeviceInterfaceGuid,
+                             true);
+        if (offset != propertyOffset + 132)
+        {
+          built = false;
+          break;
+        }
+      }
+
+      if (offset > sizeof(microsoftOs20Descriptor_))
+      {
+        built = false;
+        break;
+      }
+      if (useSubsets)
+      {
+        put16(&set[functionLengthOffset], static_cast<uint16_t>(offset - functionOffset));
+      }
+    }
+
+    if (built && offset <= sizeof(microsoftOs20Descriptor_))
+    {
+      put16(&set[setLengthOffset], static_cast<uint16_t>(offset));
+      if (useSubsets)
+      {
+        put16(&set[configurationLengthOffset],
+              static_cast<uint16_t>(offset - configurationOffset));
+      }
+      // Derived from the completed set, with the revision fields still zero, so
+      // the same descriptors always produce the same number and any change to
+      // them - a different GUID, another function, a different layout - produces
+      // a different one. That is what makes Windows re-read the registry
+      // properties it cached the first time it saw this VID/PID/serial.
+      const uint16_t revision =
+          config_.msOs20VendorRevision != 0
+              ? config_.msOs20VendorRevision
+              : descriptorSetRevision(set, offset);
+      for (uint8_t i = 0; i < revisionCount; i++)
+      {
+        put16(&set[revisionOffsets[i]], revision);
+      }
+      microsoftOs20VendorRevision_ = revision;
+      microsoftOs20DescriptorLength_ = static_cast<uint16_t>(offset);
+    }
+    else
+    {
+      // Keep whatever else the BOS carries usable rather than advertising a
+      // malformed Microsoft capability.
+      memset(microsoftOs20Descriptor_, 0, sizeof(microsoftOs20Descriptor_));
+      microsoftOs20DescriptorLength_ = 0;
+      microsoftOs20VendorRevision_ = 0;
+    }
+  }
+
+  uint8_t capabilities = 0;
+  size_t bosOffset = 5;
+  if (config_.webusbEnabled)
+  {
+    bosDescriptor_[bosOffset++] = 24;
+    bosDescriptor_[bosOffset++] = USB_DESC_DEVICE_CAPABILITY;
+    bosDescriptor_[bosOffset++] = 0x05;
+    bosDescriptor_[bosOffset++] = 0x00;
+    memcpy(&bosDescriptor_[bosOffset], webUsbUuid, sizeof(webUsbUuid));
+    bosOffset += sizeof(webUsbUuid);
+    put16(&bosDescriptor_[bosOffset], 0x0100);
+    bosOffset += 2;
+    bosDescriptor_[bosOffset++] = WEBUSB_VENDOR_CODE;
+    bosDescriptor_[bosOffset++] = 1;
+    capabilities++;
+  }
+
+  if (microsoftOs20DescriptorLength_)
+  {
+    bosDescriptor_[bosOffset++] = 28;
+    bosDescriptor_[bosOffset++] = USB_DESC_DEVICE_CAPABILITY;
+    bosDescriptor_[bosOffset++] = 0x05;
+    bosDescriptor_[bosOffset++] = 0x00;
+    memcpy(&bosDescriptor_[bosOffset], microsoftOs20Uuid,
+           sizeof(microsoftOs20Uuid));
+    bosOffset += sizeof(microsoftOs20Uuid);
+    put32(&bosDescriptor_[bosOffset], 0x06030000);
+    bosOffset += 4;
+    put16(&bosDescriptor_[bosOffset], microsoftOs20DescriptorLength_);
+    bosOffset += 2;
+    bosDescriptor_[bosOffset++] = MICROSOFT_OS_20_VENDOR_CODE;
+    bosDescriptor_[bosOffset++] = 0;
+    capabilities++;
+  }
+
+  if (capabilities == 0)
+  {
+    return;
+  }
+
+  bosDescriptor_[0] = 5;
+  bosDescriptor_[1] = USB_DESC_BOS;
+  put16(&bosDescriptor_[2], static_cast<uint16_t>(bosOffset));
+  bosDescriptor_[4] = capabilities;
+  bosDescriptorLength_ = static_cast<uint16_t>(bosOffset);
+}
+
+uint16_t EspUsbDevice::bulkInDoubleBufferMask(bool highSpeed, bool *fits) const
+{
+  if (fits)
+  {
+    *fits = true;
+  }
+  if (config_.bulkInBuffering == EspUsbBulkInBuffering::Single)
+  {
+    return 0;
+  }
+
+  // The DWC2 port's own geometry, from _dwc2_controller[] in dwc2_esp32.h.
+  // Mirrored rather than read back because the decision has to be made before
+  // tusb_init(), which is where those tables first become reachable.
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  (void)highSpeed;
+  constexpr uint16_t fifoDepthWords = 256;
+  constexpr uint8_t endpointCount = 7;
+#elif defined(CONFIG_IDF_TARGET_ESP32P4)
+  const uint16_t fifoDepthWords = highSpeed ? 1024 : 256;
+  const uint8_t endpointCount = highSpeed ? 16 : 7;
+#else
+  (void)highSpeed;
+  if (fits)
+  {
+    *fits = false;
+  }
+  return 0;
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || \
+    defined(CONFIG_IDF_TARGET_ESP32P4)
+  // grxfsiz as calc_device_grxfsiz() computes it: a fixed overhead plus room
+  // for the largest OUT packet, plus two words per endpoint.
+  const auto receiveWords = [endpointCount](uint16_t largestOutPacket) -> uint16_t {
+    return static_cast<uint16_t>(14 + 2 * ((largestOutPacket / 4) + 1) + 2 * endpointCount);
+  };
+  const auto packetWords = [](uint16_t packet) -> uint16_t {
+    return static_cast<uint16_t>((packet + 3) / 4);
+  };
+
+  const uint8_t *descriptor =
+      const_cast<EspUsbDevice *>(this)->configurationDescriptorForSpeed(0, highSpeed);
+  if (!descriptor)
+  {
+    if (fits)
+    {
+      *fits = false;
+    }
+    return 0;
+  }
+  const uint16_t total = static_cast<uint16_t>(descriptor[2] | (descriptor[3] << 8));
+
+  // EP0 IN is allocated before any class endpoint, and its packet size sets the
+  // receive FIFO's floor.
+  uint32_t inWords = packetWords(CFG_TUD_ENDPOINT0_SIZE);
+  uint16_t largestOutPacket = CFG_TUD_ENDPOINT0_SIZE;
+  uint16_t candidateMask = 0;
+  uint32_t candidateWords = 0;
+
+  uint16_t offset = 0;
+  while (offset + 2 <= total && descriptor[offset] > 0)
+  {
+    const uint8_t length = descriptor[offset];
+    if (descriptor[offset + 1] == USB_DESC_ENDPOINT && length >= 7)
+    {
+      const uint8_t address = descriptor[offset + 2];
+      const uint8_t transferType = static_cast<uint8_t>(descriptor[offset + 3] & 0x03);
+      const uint16_t packet =
+          static_cast<uint16_t>((descriptor[offset + 4] | (descriptor[offset + 5] << 8)) & 0x07ff);
+      if (address & 0x80)
+      {
+        const uint16_t words = packetWords(packet);
+        inWords += words;
+        if (transferType == USB_ENDPOINT_ATTR_BULK)
+        {
+          // Only bulk IN endpoints are double buffered; the port ignores the
+          // bit for anything else.
+          candidateMask = static_cast<uint16_t>(candidateMask | (1u << (address & 0x0f)));
+          candidateWords += words;
+        }
+      }
+      else if (packet > largestOutPacket)
+      {
+        largestOutPacket = packet;
+      }
+    }
+    offset = static_cast<uint16_t>(offset + length);
+  }
+
+  if (candidateMask == 0)
+  {
+    return 0;
+  }
+
+  // Buffer DMA reserves two words per endpoint for its endpoint-info area
+  // before anything else is allocated.
+  const uint32_t available = fifoDepthWords - (2u * endpointCount);
+  const uint32_t needed = inWords + candidateWords + receiveWords(largestOutPacket);
+  if (needed > available)
+  {
+    if (fits)
+    {
+      *fits = false;
+    }
+    return 0;
+  }
+  return candidateMask;
+#endif
+}
+
+// Whether every transmit FIFO this configuration needs can be placed in the
+// controller's FIFO SPRAM.
+//
+// The DWC2 shares one small SPRAM between the receive FIFO, one transmit FIFO
+// per IN endpoint and, in DMA mode, two words per endpoint of endpoint-info.
+// dcd_edpt_open() allocates downward and refuses when the space is gone, which
+// for a bulk or interrupt endpoint surfaces as a failed enumeration. For an
+// isochronous endpoint it does not: the allocation happens up front, through
+// usbd_edpt_iso_alloc(), and an ESP32-S3 measured on 2026-09-16 programmed
+// DIEPTXF1 with 256 words at offset 512 - past the end of a 242-word area -
+// without complaint. The device then enumerated, bound its host driver,
+// reported frames going out, and delivered nothing.
+//
+// So this is checked before starting, in the same arithmetic dcd_dwc2.c uses.
+// Does this configuration declare an isochronous IN endpoint? Audio capture
+// and video both do; everything else in the library does not.
+bool EspUsbDevice::hasIsochronousInEndpoint(bool highSpeed) const
+{
+  const uint8_t *descriptor =
+      const_cast<EspUsbDevice *>(this)->configurationDescriptorForSpeed(0, highSpeed);
+  if (!descriptor)
+  {
+    return false;
+  }
+  const uint16_t total = static_cast<uint16_t>(descriptor[2] | (descriptor[3] << 8));
+  for (uint16_t offset = 0; offset + 2 <= total && descriptor[offset] > 0;
+       offset = static_cast<uint16_t>(offset + descriptor[offset]))
+  {
+    if (descriptor[offset + 1] == USB_DESC_ENDPOINT && descriptor[offset] >= 7 &&
+        (descriptor[offset + 2] & 0x80) != 0 &&
+        (descriptor[offset + 3] & 0x03) == USB_ENDPOINT_ATTR_ISOCHRONOUS)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::transmitFifoFits(bool highSpeed) const
+{
+  // Same geometry as bulkInDoubleBufferMask(), from _dwc2_controller[] in
+  // dwc2_esp32.h, mirrored because the decision precedes tusb_init().
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  (void)highSpeed;
+  constexpr uint16_t fifoDepthWords = 256;
+  constexpr uint8_t endpointCount = 7;
+#elif defined(CONFIG_IDF_TARGET_ESP32P4)
+  const uint16_t fifoDepthWords = highSpeed ? 1024 : 256;
+  const uint8_t endpointCount = highSpeed ? 16 : 7;
+#else
+  // An unrepresented target is not second-guessed: dcd_edpt_open() still has
+  // the final say, and refusing to start here would be worse than letting it.
+  (void)highSpeed;
+  return true;
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || \
+    defined(CONFIG_IDF_TARGET_ESP32P4)
+  const uint8_t *descriptor =
+      const_cast<EspUsbDevice *>(this)->configurationDescriptorForSpeed(0, highSpeed);
+  if (!descriptor)
+  {
+    return true;
+  }
+  const uint16_t total = static_cast<uint16_t>(descriptor[2] | (descriptor[3] << 8));
+
+  const auto packetWords = [](uint16_t packet) -> uint16_t {
+    return static_cast<uint16_t>((packet + 3) / 4);
+  };
+
+  // EP0 IN is allocated first and its packet size also sets the receive FIFO's
+  // floor. Alternate settings of the same interface reuse one endpoint number,
+  // so an address is counted once, at its largest packet size.
+  uint16_t inPacket[16] = {};
+  inPacket[0] = CFG_TUD_ENDPOINT0_SIZE;
+  uint16_t largestOutPacket = CFG_TUD_ENDPOINT0_SIZE;
+  uint16_t offset = 0;
+  while (offset + 2 <= total && descriptor[offset] > 0)
+  {
+    const uint8_t length = descriptor[offset];
+    if (descriptor[offset + 1] == USB_DESC_ENDPOINT && length >= 7)
+    {
+      const uint8_t address = descriptor[offset + 2];
+      const uint16_t packet =
+          static_cast<uint16_t>((descriptor[offset + 4] | (descriptor[offset + 5] << 8)) & 0x07ff);
+      const uint8_t number = static_cast<uint8_t>(address & 0x0f);
+      if (address & 0x80)
+      {
+        if (packet > inPacket[number])
+        {
+          inPacket[number] = packet;
+        }
+      }
+      else if (packet > largestOutPacket)
+      {
+        largestOutPacket = packet;
+      }
+    }
+    offset = static_cast<uint16_t>(offset + length);
+  }
+
+  uint32_t needed = 0;
+  for (uint8_t number = 0; number < 16; number++)
+  {
+    if (inPacket[number] != 0)
+    {
+      needed += packetWords(inPacket[number]);
+    }
+  }
+  // Double-buffered bulk IN endpoints take twice their packet in FIFO.
+  const uint16_t doubled = bulkInDoubleBuffered_;
+  for (uint8_t number = 0; number < 16; number++)
+  {
+    if ((doubled & (1u << number)) != 0 && inPacket[number] != 0)
+    {
+      needed += packetWords(inPacket[number]);
+    }
+  }
+  // calc_device_grxfsiz(): fixed overhead, room for the largest OUT packet,
+  // two words per endpoint.
+  needed += static_cast<uint32_t>(14 + 2 * ((largestOutPacket / 4) + 1) +
+                                  2 * endpointCount);
+  // Buffer DMA reserves two words per endpoint above everything else.
+  const uint32_t available = fifoDepthWords - (2u * endpointCount);
+  return needed <= available;
+#endif
+}
+
+bool EspUsbDevice::validateControllerEndpoints(const uint8_t *descriptor,
+                                               uint16_t length)
+{
+  if (!descriptor || length < 9)
+  {
+    return false;
+  }
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  constexpr uint8_t maxEndpointNumber = 5;
+  constexpr uint8_t maxNonControlInEndpoints = 4;
+  constexpr uint8_t maxNonControlOutEndpoints = 5;
+#elif defined(CONFIG_IDF_TARGET_ESP32P4)
+  // P4 rhport 0 is the FS controller (7 endpoint numbers total, 5 IN
+  // endpoints including EP0). rhport 1 is the HS controller (16 endpoint
+  // numbers total, 8 IN endpoints including EP0). Auto selects HS on P4.
+  const bool fullSpeed = config_.controller == EspUsbController::FullSpeed;
+  const uint8_t maxEndpointNumber = fullSpeed ? 6 : 15;
+  const uint8_t maxNonControlInEndpoints = fullSpeed ? 4 : 7;
+  const uint8_t maxNonControlOutEndpoints = fullSpeed ? 6 : 15;
+#else
+  // Unknown future targets keep USB's protocol maximum until their controller
+  // capabilities are represented here.
+  constexpr uint8_t maxEndpointNumber = 15;
+  constexpr uint8_t maxNonControlInEndpoints = 15;
+  constexpr uint8_t maxNonControlOutEndpoints = 15;
+#endif
+  uint16_t inMask = 0;
+  uint16_t outMask = 0;
+  uint8_t endpointOwner[2][16];
+  memset(endpointOwner, 0xff, sizeof(endpointOwner));
+  uint8_t currentInterface = 0xff;
+  for (uint16_t offset = 9; offset + 2 <= length;)
+  {
+    const uint8_t descriptorLength = descriptor[offset];
+    if (descriptorLength < 2 ||
+        offset + descriptorLength > length)
+    {
+      return false;
+    }
+    if (descriptor[offset + 1] == USB_DESC_INTERFACE &&
+        descriptorLength >= 9)
+    {
+      currentInterface = descriptor[offset + 2];
+    }
+    if (descriptor[offset + 1] == USB_DESC_ENDPOINT &&
+        descriptorLength >= 7)
+    {
+      const uint8_t address = descriptor[offset + 2];
+      const uint8_t number = static_cast<uint8_t>(address & 0x0f);
+      if (currentInterface == 0xff || number == 0 ||
+          number > maxEndpointNumber)
+      {
+        return false;
+      }
+      const uint8_t direction = (address & 0x80) != 0 ? 1 : 0;
+      uint8_t &owner = endpointOwner[direction][number];
+      if (owner != 0xff && owner != currentInterface)
+      {
+        return false;
+      }
+      owner = currentInterface;
+      uint16_t &mask = direction != 0 ? inMask : outMask;
+      const uint16_t bit = static_cast<uint16_t>(1U << number);
+      mask = static_cast<uint16_t>(mask | bit);
+    }
+    offset = static_cast<uint16_t>(offset + descriptorLength);
+  }
+  const auto endpointCount = [](uint16_t mask) {
+    uint8_t count = 0;
+    while (mask != 0)
+    {
+      count = static_cast<uint8_t>(count + (mask & 1U));
+      mask >>= 1;
+    }
+    return count;
+  };
+  return endpointCount(inMask) <= maxNonControlInEndpoints &&
+         endpointCount(outMask) <= maxNonControlOutEndpoints;
+}
+
+bool EspUsbDevice::compositeHid() const
+{
+  size_t hidCount = 0;
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isHid())
+    {
+      hidCount++;
+    }
+  }
+  return hidCount > 1;
+}
+
+bool EspUsbDevice::hasHidClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isHid())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasCdcClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isCdc())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasMidiClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isMidi())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasMscClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isMsc())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasVendorClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isVendor())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasAudioClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isAudio())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasVideoClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isVideo())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDevice::hasNetClass() const
+{
+  for (size_t i = 0; i < classCount_; i++)
+  {
+    if (classes_[i] && classes_[i]->isNet())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint8_t EspUsbDevice::classReportId(uint8_t classInstance) const
+{
+  if (!compositeHid())
+  {
+    return 0;
+  }
+  if (classInstance < classCount_ && classes_[classInstance])
+  {
+    const uint8_t reportId = classes_[classInstance]->hidReportId();
+    if (reportId)
+    {
+      return reportId;
+    }
+  }
+  return ESP_USB_DEVICE_HID_REPORT_ID_KEYBOARD;
+}
+
+uint8_t EspUsbDevice::maxCdcPorts()
+{
+  return ESP_USB_DEVICE_CDC_PORTS;
+}
+
+// The TinyUSB HID instance a class's reports go out on. There is one HID
+// interface in this build whether the HID is a single class or a merged
+// composite, so it is slot 0 either way; `classInstance` is the class's
+// position in classes_ and says nothing about the slot. Returning it used to
+// send a HID class registered after a non-HID one to tud_hid_n_report() with an
+// instance that does not exist - see hidClassForInstance() for the symptom the
+// same mistake produced on the descriptor side.
+uint8_t EspUsbDevice::classRuntimeInstance(uint8_t classInstance) const
+{
+  (void)classInstance;
+  return 0;
+}
+
+void EspUsbDevice::setLastError(esp_err_t error)
+{
+  lastError_ = error;
+}
+
+EspUsbDeviceClass::EspUsbDeviceClass(EspUsbDevice &device) : device_(device)
+{
+  device_.addClass(this);
+}
+
+EspUsbDeviceClass::~EspUsbDeviceClass()
+{
+  device_.removeClass(this);
+}
+
+EspUsbDeviceCdcSerial::EspUsbDeviceCdcSerial(EspUsbDevice &device, const char *name)
+    : EspUsbDeviceClass(device), name_(name)
+{
+}
+
+EspUsbDeviceCdcSerial::~EspUsbDeviceCdcSerial()
+{
+  end();
+}
+
+void EspUsbDeviceCdcSerial::assignFunctionIds(uint8_t instance, uint8_t stringIndex)
+{
+  instance_ = instance;
+  stringIndex_ = stringIndex;
+}
+
+bool EspUsbDeviceCdcSerial::instanceValid() const
+{
+  return instance_ < ESP_USB_DEVICE_CDC_PORTS;
+}
+
+bool EspUsbDeviceCdcSerial::begin()
+{
+  // More CDC functions were registered than this build has TinyUSB instances
+  // for. The descriptor would promise a port that nothing drives, so refuse
+  // here rather than enumerate a dead COM port.
+  if (!instanceValid())
+  {
+    return false;
+  }
+  if (g_cdcSerials[instance_] && g_cdcSerials[instance_] != this)
+  {
+    return false;
+  }
+  g_cdcSerials[instance_] = this;
+  return true;
+}
+
+bool EspUsbDeviceCdcSerial::afterDeviceStarted()
+{
+  return true;
+}
+
+void EspUsbDeviceCdcSerial::end()
+{
+  if (instanceValid() && g_cdcSerials[instance_] == this)
+  {
+    g_cdcSerials[instance_] = nullptr;
+  }
+}
+
+uint16_t EspUsbDeviceCdcSerial::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  if (!dst || endpointNumber == 0 || endpointNumber > 14)
+  {
+    return 0;
+  }
+  const uint8_t epNotification = static_cast<uint8_t>(0x80 | endpointNumber);
+  const uint8_t epOut = static_cast<uint8_t>(endpointNumber + 1);
+  const uint8_t epIn = static_cast<uint8_t>(0x80 | (endpointNumber + 1));
+  uint8_t descriptor[] = {
+      TUD_CDC_DESCRIPTOR(interfaceNumber, stringIndex_, epNotification, 8,
+                         epOut, epIn, endpointSize),
+  };
+  // The macro routes its string index to the control interface's iInterface
+  // and hardcodes the association's iFunction (byte 7 of the leading 8-byte
+  // IAD) to 0. Windows names a composite child device from iFunction, so a
+  // multi-port device that filled in only iInterface would still show two
+  // identically named COM ports in Device Manager.
+  descriptor[7] = stringIndex_;
+  memcpy(dst, descriptor, sizeof(descriptor));
+  return sizeof(descriptor);
+}
+
+int EspUsbDeviceCdcSerial::available()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!instanceValid())
+  {
+    return 0;
+  }
+  return static_cast<int>(tud_cdc_n_available(instance_));
+#else
+  return 0;
+#endif
+}
+
+int EspUsbDeviceCdcSerial::read()
+{
+  uint8_t data = 0;
+  return read(&data, 1) == 1 ? data : -1;
+}
+
+size_t EspUsbDeviceCdcSerial::read(uint8_t *buffer, size_t size)
+{
+  if (!buffer || size == 0)
+  {
+    return 0;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!instanceValid())
+  {
+    return 0;
+  }
+  return tud_cdc_n_read(instance_, buffer, static_cast<uint32_t>(size));
+#else
+  return 0;
+#endif
+}
+
+size_t EspUsbDeviceCdcSerial::write(uint8_t data)
+{
+  return write(&data, 1);
+}
+
+size_t EspUsbDeviceCdcSerial::write(const uint8_t *buffer, size_t size)
+{
+  if (!buffer || size == 0)
+  {
+    return 0;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!instanceValid() || !tud_cdc_n_ready(instance_))
+  {
+    return 0;
+  }
+  const uint32_t written = tud_cdc_n_write(instance_, buffer, static_cast<uint32_t>(size));
+  tud_cdc_n_write_flush(instance_);
+  return written;
+#else
+  return 0;
+#endif
+}
+
+void EspUsbDeviceCdcSerial::flush()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (instanceValid())
+  {
+    tud_cdc_n_write_flush(instance_);
+  }
+#endif
+}
+
+bool EspUsbDeviceCdcSerial::connected() const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return instanceValid() && tud_cdc_n_connected(instance_);
+#else
+  return false;
+#endif
+}
+
+const EspUsbDeviceCdcLineCoding &EspUsbDeviceCdcSerial::lineCoding() const
+{
+  return lineCoding_;
+}
+
+const EspUsbDeviceCdcLineState &EspUsbDeviceCdcSerial::lineState() const
+{
+  return lineState_;
+}
+
+void EspUsbDeviceCdcSerial::onLineCoding(LineCodingCallback callback)
+{
+  lineCodingCallback_ = callback;
+}
+
+void EspUsbDeviceCdcSerial::onLineState(LineStateCallback callback)
+{
+  lineStateCallback_ = callback;
+}
+
+void EspUsbDeviceCdcSerial::onRx(RxCallback callback)
+{
+  rxCallback_ = callback;
+}
+
+void EspUsbDeviceCdcSerial::handleLineCoding(uint32_t baud, uint8_t stopBits, uint8_t parity, uint8_t dataBits)
+{
+  lineCoding_.baud = baud;
+  lineCoding_.stopBits = stopBits;
+  lineCoding_.parity = parity;
+  lineCoding_.dataBits = dataBits;
+  if (lineCodingCallback_)
+  {
+    lineCodingCallback_(lineCoding_);
+  }
+}
+
+void EspUsbDeviceCdcSerial::handleLineState(bool dtr, bool rts)
+{
+  lineState_.dtr = dtr;
+  lineState_.rts = rts;
+  if (lineStateCallback_)
+  {
+    lineStateCallback_(lineState_);
+  }
+}
+
+void EspUsbDeviceCdcSerial::handleRx()
+{
+  if (rxCallback_)
+  {
+    rxCallback_(available());
+  }
+}
+
+EspUsbDeviceVendor::EspUsbDeviceVendor(EspUsbDevice &device, uint16_t endpointSize) : EspUsbDeviceClass(device)
+{
+  endpointSize_ = endpointSize == 0 ? 64 : endpointSize;
+}
+
+EspUsbDeviceVendor::~EspUsbDeviceVendor()
+{
+  end();
+}
+
+void EspUsbDeviceVendor::end()
+{
+  if (g_activeVendor == this)
+  {
+    g_activeVendor = nullptr;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (writableSignal_)
+  {
+    vSemaphoreDelete(static_cast<SemaphoreHandle_t>(writableSignal_));
+    writableSignal_ = nullptr;
+  }
+#endif
+}
+
+bool EspUsbDeviceVendor::begin()
+{
+  if (g_activeVendor && g_activeVendor != this)
+  {
+    return false;
+  }
+  g_activeVendor = this;
+  return true;
+}
+
+uint16_t EspUsbDeviceVendor::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  // endpointSize is the per-speed ceiling the caller has already worked out:
+  // configurationDescriptorForSpeed() passes 64 while building the full-speed
+  // configuration and 512 for high speed. Ignoring it and writing the
+  // constructor's value into both is how OTHER_SPEED_CONFIGURATION came to
+  // advertise wMaxPacketSize = 512 on a bulk endpoint, which USB 2.0 caps at 64
+  // at full speed. The constructor still decides how small the endpoint may be;
+  // the speed decides how large.
+  uint16_t maxPacket = endpointSize_;
+  if (endpointSize != 0 && maxPacket > endpointSize)
+  {
+    maxPacket = endpointSize;
+  }
+  const uint8_t epOut = endpointNumber;
+  const uint8_t epIn = static_cast<uint8_t>(0x80 | endpointNumber);
+  // writeDirect() addresses the IN endpoint itself, and this is the only place
+  // the number is known.
+  endpointNumber_ = endpointNumber;
+  uint8_t descriptor[] = {
+      9, USB_DESC_INTERFACE, interfaceNumber, 0, 2, USB_CLASS_VENDOR_SPECIFIC, 0x00, 0x00, 0,
+      7, USB_DESC_ENDPOINT, epOut, USB_ENDPOINT_ATTR_BULK, static_cast<uint8_t>(maxPacket & 0xff), static_cast<uint8_t>((maxPacket >> 8) & 0xff), 0,
+      7, USB_DESC_ENDPOINT, epIn, USB_ENDPOINT_ATTR_BULK, static_cast<uint8_t>(maxPacket & 0xff), static_cast<uint8_t>((maxPacket >> 8) & 0xff), 0,
+  };
+  memcpy(dst, descriptor, sizeof(descriptor));
+  return sizeof(descriptor);
+}
+
+bool EspUsbDeviceVendor::mounted() const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return tud_vendor_n_mounted(0);
+#else
+  return false;
+#endif
+}
+
+int EspUsbDeviceVendor::available()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB && CFG_TUD_VENDOR_TXRX_BUFFERED
+  return static_cast<int>(tud_vendor_n_available(0));
+#else
+  // Non-buffered builds have no RX FIFO to count: TinyUSB hands the payload to
+  // tud_vendor_rx_cb() instead and there is nothing to poll.
+  return 0;
+#endif
+}
+
+int EspUsbDeviceVendor::read()
+{
+  uint8_t data = 0;
+  return read(&data, 1) == 1 ? data : -1;
+}
+
+size_t EspUsbDeviceVendor::read(uint8_t *buffer, size_t size)
+{
+  if (!buffer || size == 0)
+  {
+    return 0;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB && CFG_TUD_VENDOR_TXRX_BUFFERED
+  return tud_vendor_n_read(0, buffer, static_cast<uint32_t>(size));
+#else
+  (void)buffer;
+  (void)size;
+  return 0;
+#endif
+}
+
+size_t EspUsbDeviceVendor::write(uint8_t data)
+{
+  return write(&data, 1);
+}
+
+size_t EspUsbDeviceVendor::write(const uint8_t *buffer, size_t size)
+{
+  if (!buffer || size == 0)
+  {
+    return 0;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!mounted())
+  {
+    return 0;
+  }
+  const uint32_t available = tud_vendor_n_write_available(0);
+  if (size > available)
+  {
+    size = available;
+  }
+  return size ? tud_vendor_n_write(0, buffer, static_cast<uint32_t>(size)) : 0;
+#else
+  return 0;
+#endif
+}
+
+size_t EspUsbDeviceVendor::writeAvailable() const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return static_cast<size_t>(tud_vendor_n_write_available(0));
+#else
+  return 0;
+#endif
+}
+
+size_t EspUsbDeviceVendor::writeCapacity()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return CFG_TUD_VENDOR_TX_BUFSIZE;
+#else
+  return 0;
+#endif
+}
+
+bool EspUsbDeviceVendor::waitWritable(size_t bytes, uint32_t timeoutMs)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (bytes == 0)
+  {
+    return true;
+  }
+  if (bytes > writeCapacity())
+  {
+    bytes = writeCapacity();
+  }
+  if (writeAvailable() >= bytes)
+  {
+    return true;
+  }
+  if (timeoutMs == 0 || !mounted())
+  {
+    return false;
+  }
+  // TinyUSB only arms a transfer once the FIFO holds a whole packet, so a
+  // remainder shorter than wMaxPacketSize sits there until something flushes
+  // it. Nothing here would: the caller is blocked precisely because it has no
+  // more data to push in behind it, which is how this wait used to hang
+  // forever on the last fragment of a stream. Flushing before waiting costs a
+  // short packet only in the case where the alternative was never finishing.
+  flush();
+  if (!writableSignal_)
+  {
+    // Binary rather than counting: the wait re-reads the FIFO after every wake,
+    // so a give that arrives while the task is already running is not a lost
+    // wake-up, it is a redundant one.
+    writableSignal_ = xSemaphoreCreateBinary();
+    if (!writableSignal_)
+    {
+      return false;
+    }
+  }
+  const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeoutMs);
+  for (;;)
+  {
+    const TickType_t now = xTaskGetTickCount();
+    // Signed compare so the subtraction survives the tick counter wrapping.
+    const TickType_t remaining =
+        static_cast<int32_t>(deadline - now) > 0 ? deadline - now : 0;
+    if (remaining == 0)
+    {
+      return writeAvailable() >= bytes;
+    }
+    // Bounded even without a transmit completion: an unplug stops the callbacks
+    // for good, and this is what lets the loop notice that mounted() went false.
+    // Short, because a slice is also what a missed wake-up costs, and never zero
+    // - a zero timeout would turn this into the spin it exists to replace.
+    TickType_t slice = remaining > pdMS_TO_TICKS(2) ? pdMS_TO_TICKS(2) : remaining;
+    if (slice == 0)
+    {
+      slice = 1;
+    }
+    xSemaphoreTake(static_cast<SemaphoreHandle_t>(writableSignal_), slice);
+    if (writeAvailable() >= bytes)
+    {
+      return true;
+    }
+    if (!mounted())
+    {
+      return false;
+    }
+  }
+#else
+  (void)bytes;
+  (void)timeoutMs;
+  return false;
+#endif
+}
+
+void EspUsbDeviceVendor::flush()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB && CFG_TUD_VENDOR_TXRX_BUFFERED
+  tud_vendor_n_write_flush(0);
+#endif
+}
+
+bool EspUsbDeviceVendor::directWriteSupported()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB && !CFG_TUD_VENDOR_TXRX_BUFFERED
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool EspUsbDeviceVendor::writeDirect(const void *buffer, size_t length)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB && !CFG_TUD_VENDOR_TXRX_BUFFERED
+  // usbd_edpt_xfer() takes a uint16_t length. There is no partial-write
+  // contract here, so an oversized request is refused rather than truncated.
+  if (!buffer || length == 0 || length > 0xffffu)
+  {
+    lastDirectError_ = EspUsbDeviceVendorDirectError::BadArgument;
+    return false;
+  }
+  // The address has to be cache-line aligned. The *length* deliberately does
+  // not: a run's final stage and a status line are both short and odd, and a
+  // partial-line writeback is safe for a transfer the device only reads out of.
+  if ((reinterpret_cast<uintptr_t>(buffer) & 63u) != 0)
+  {
+    lastDirectError_ = EspUsbDeviceVendorDirectError::NotAligned;
+    return false;
+  }
+#if ESP_USB_DEVICE_HAS_DMA_CAPABLE_CHECK
+  if (!esp_ptr_dma_capable(buffer))
+  {
+    lastDirectError_ = EspUsbDeviceVendorDirectError::NotDmaCapable;
+    return false;
+  }
+#endif
+  if (endpointNumber_ == 0 || !mounted())
+  {
+    lastDirectError_ = EspUsbDeviceVendorDirectError::NotMounted;
+    return false;
+  }
+  const uint8_t rhport = espusb::internal::tinyUsbRuntimeRhport();
+  if (rhport == 0xff)
+  {
+    lastDirectError_ = EspUsbDeviceVendorDirectError::NotMounted;
+    return false;
+  }
+  const uint8_t epIn = static_cast<uint8_t>(0x80 | endpointNumber_);
+  // The same claim the vendor class itself takes, so a transfer already in
+  // flight makes this fail rather than corrupt it. This is the one refusal a
+  // streaming caller should expect: it is backpressure, not a mistake.
+  if (!usbd_edpt_claim(rhport, epIn))
+  {
+    lastDirectError_ = EspUsbDeviceVendorDirectError::Busy;
+    return false;
+  }
+  if (!usbd_edpt_xfer(rhport, epIn,
+                      static_cast<uint8_t *>(const_cast<void *>(buffer)),
+                      static_cast<uint16_t>(length), false))
+  {
+    usbd_edpt_release(rhport, epIn);
+    lastDirectError_ = EspUsbDeviceVendorDirectError::TransferFailed;
+    return false;
+  }
+  lastDirectError_ = EspUsbDeviceVendorDirectError::None;
+  return true;
+#else
+  (void)buffer;
+  (void)length;
+  lastDirectError_ = EspUsbDeviceVendorDirectError::NotSupported;
+  return false;
+#endif
+}
+
+EspUsbDeviceVendorDirectError EspUsbDeviceVendor::lastDirectError() const
+{
+  return lastDirectError_;
+}
+
+const char *EspUsbDeviceVendor::lastDirectErrorName() const
+{
+  switch (lastDirectError_)
+  {
+  case EspUsbDeviceVendorDirectError::None:
+    return "None";
+  case EspUsbDeviceVendorDirectError::NotSupported:
+    return "NotSupported";
+  case EspUsbDeviceVendorDirectError::NotMounted:
+    return "NotMounted";
+  case EspUsbDeviceVendorDirectError::BadArgument:
+    return "BadArgument";
+  case EspUsbDeviceVendorDirectError::NotAligned:
+    return "NotAligned";
+  case EspUsbDeviceVendorDirectError::NotDmaCapable:
+    return "NotDmaCapable";
+  case EspUsbDeviceVendorDirectError::Busy:
+    return "Busy";
+  case EspUsbDeviceVendorDirectError::TransferFailed:
+    return "TransferFailed";
+  }
+  return "Unknown";
+}
+
+void EspUsbDeviceVendor::onTxComplete(TxCompleteCallback callback)
+{
+  txCompleteCallback_ = callback;
+}
+
+void EspUsbDeviceVendor::onRxData(RxDataCallback callback)
+{
+  rxDataCallback_ = callback;
+}
+
+void EspUsbDeviceVendor::onRx(RxCallback callback)
+{
+  rxCallback_ = callback;
+}
+
+void EspUsbDeviceVendor::onControlRequest(ControlRequestCallback callback)
+{
+  controlRequestCallback_ = callback;
+}
+
+bool EspUsbDeviceVendor::sendControlResponse(const EspUsbDeviceVendorControlRequest &request, const void *data, size_t length)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  const tusb_control_request_t *raw = static_cast<const tusb_control_request_t *>(request.rawRequest);
+  if (!raw)
+  {
+    return false;
+  }
+  if (!data || length == 0)
+  {
+    return tud_control_status(request.rhport, raw);
+  }
+  return tud_control_xfer(request.rhport, raw, const_cast<void *>(data), static_cast<uint16_t>(length));
+#else
+  (void)request;
+  (void)data;
+  (void)length;
+  return false;
+#endif
+}
+
+uint16_t EspUsbDeviceVendor::endpointSize() const
+{
+  return endpointSize_;
+}
+
+void EspUsbDeviceVendor::handleRx(const uint8_t *data, size_t length)
+{
+  // Direct builds get the controller's buffer here and have no RX FIFO behind
+  // it, so this is the only chance to look at the payload.
+  if (data && length > 0 && rxDataCallback_)
+  {
+    rxDataCallback_(data, length);
+  }
+  if (rxCallback_)
+  {
+    rxCallback_(available());
+  }
+}
+
+void EspUsbDeviceVendor::handleTxComplete(size_t sentBytes)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // First, and deliberately. This runs inside vendord_xfer_cb before the class
+  // refills the endpoint from its FIFO, so a callback that arms the next
+  // writeDirect() here takes usbd_edpt_claim() ahead of that refill - and,
+  // in a buffered build, ahead of the ZLP the class would otherwise arm after
+  // a transfer whose length is a multiple of wMaxPacketSize. Arming from any
+  // other task loses that race. See docs/CHANGE_REQUESTS.ja.md (F1).
+  if (txCompleteCallback_)
+  {
+    txCompleteCallback_(sentBytes);
+  }
+  if (!writableSignal_)
+  {
+    return;
+  }
+  // Order matters here, and getting it wrong costs an order of magnitude.
+  //
+  // TinyUSB calls this from vendord_xfer_cb *before* it refills the endpoint
+  // from the transmit FIFO, so at this instant the room a waiter is waiting for
+  // does not exist yet - the completed transfer's bytes left the FIFO when it
+  // was armed, and the FIFO still holds whatever the sketch queued behind it.
+  // Waking a waiter now has it find nothing and block again, and on a
+  // dual-core part the waiter really does run that check before the usbd task
+  // reaches its own refill a few instructions later. Measured on ESP32-P4: a
+  // 4 MiB stream fell from 21 MB/s to 1.8, every wait costing a full timeout
+  // slice because the wake-up that mattered had already been spent.
+  //
+  // Draining here makes the room real before the wake-up. TinyUSB's refill, one
+  // line later, then finds the FIFO empty and does nothing.
+#if CFG_TUD_VENDOR_TXRX_BUFFERED
+  tud_vendor_n_write_flush(0);
+#endif
+  xSemaphoreGive(static_cast<SemaphoreHandle_t>(writableSignal_));
+#else
+  (void)sentBytes;
+#endif
+}
+
+bool EspUsbDeviceVendor::handleControlRequest(uint8_t rhport, uint8_t stage, const void *request)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  const tusb_control_request_t *raw = static_cast<const tusb_control_request_t *>(request);
+  if (!raw || !controlRequestCallback_)
+  {
+    return false;
+  }
+  EspUsbDeviceVendorControlRequest event;
+  event.rhport = rhport;
+  event.stage = stage;
+  event.bmRequestType = raw->bmRequestType;
+  event.bRequest = raw->bRequest;
+  event.wValue = raw->wValue;
+  event.wIndex = raw->wIndex;
+  event.wLength = raw->wLength;
+  event.rawRequest = raw;
+  return controlRequestCallback_(event);
+#else
+  (void)rhport;
+  (void)stage;
+  (void)request;
+  return false;
+#endif
+}
+
+#if ESP_USB_DEVICE_HAS_TINYUSB
+// Shared TX path used by both the sendFrame() raw API and the esp_netif transmit
+// callback.
+//
+// TinyUSB requires that its device API be called from the same context as
+// tud_task() (see device/usbd.h). tud_network_xmit() is not an exception: it
+// copies the datagram via tud_network_xmit_cb() and then goes all the way to
+// usbd_edpt_xfer() in the caller's context. Calling it from lwIP's tcpip task,
+// as this path used to, therefore races the usbd task on the dwc2 endpoint and
+// FIFO state. Under a sustained device->host stream the two overlap constantly
+// (measured: ~70% of transfer completions landed inside such a call), and the
+// IN endpoint eventually ends up armed with packets to send but an empty FIFO.
+// No completion interrupt ever arrives, the NTB is never returned to the pool,
+// and tud_network_can_xmit() stays false forever — the USB network is dead
+// until reboot.
+//
+// So producers only ever copy the frame into a pooled buffer and hand it to the
+// usbd task through a queue; espUsbDeviceNetDrainTx() below does every TinyUSB
+// call, from the usbd task, in espusb::internal's tud_task() loop. The copy also
+// keeps callers free to pass a stack buffer or an lwIP pbuf that is released the
+// moment we return.
+static constexpr size_t NET_TX_FRAME_MAX = 1600;
+// Deep enough to absorb the burst lwIP hands us between two usbd task turns
+// without so much buffering that TCP loses its feedback signal. Four slots is
+// ~6.4 KB.
+static constexpr size_t NET_TX_SLOTS = 4;
+// How long a producer waits for a free slot before reporting the frame as
+// dropped. Dropping is the correct backpressure here: TCP retransmits, whereas
+// blocking the tcpip task stalls every other interface with it.
+static constexpr TickType_t NET_TX_ACQUIRE_TIMEOUT = pdMS_TO_TICKS(20);
+
+struct EspUsbDeviceNetTxSlot
+{
+  uint16_t len;
+  uint8_t data[NET_TX_FRAME_MAX];
+};
+
+static EspUsbDeviceNetTxSlot *g_netTxSlots = nullptr;
+static QueueHandle_t g_netTxPending = nullptr; // producer -> usbd task
+static QueueHandle_t g_netTxFree = nullptr;    // usbd task -> producer
+
+static bool espUsbDeviceNetTxInit()
+{
+  if (g_netTxPending && g_netTxFree && g_netTxSlots)
+  {
+    return true;
+  }
+  if (!g_netTxSlots)
+  {
+    g_netTxSlots = static_cast<EspUsbDeviceNetTxSlot *>(
+        calloc(NET_TX_SLOTS, sizeof(EspUsbDeviceNetTxSlot)));
+  }
+  if (!g_netTxPending)
+  {
+    g_netTxPending = xQueueCreate(NET_TX_SLOTS, sizeof(EspUsbDeviceNetTxSlot *));
+  }
+  if (!g_netTxFree)
+  {
+    g_netTxFree = xQueueCreate(NET_TX_SLOTS, sizeof(EspUsbDeviceNetTxSlot *));
+    if (g_netTxFree && g_netTxSlots)
+    {
+      for (size_t i = 0; i < NET_TX_SLOTS; i++)
+      {
+        EspUsbDeviceNetTxSlot *slot = &g_netTxSlots[i];
+        xQueueSend(g_netTxFree, &slot, 0);
+      }
+    }
+  }
+  return g_netTxSlots && g_netTxPending && g_netTxFree;
+}
+
+// Intentionally no teardown: the pool outlives any single EspUsbDeviceNet, and
+// freeing it would race the usbd task draining the queue. It is one allocation
+// for the lifetime of the process, as the old static transmit buffer was.
+
+static bool espUsbDeviceNetTxFrame(const uint8_t *data, uint16_t len)
+{
+  if (!data || len == 0 || len > NET_TX_FRAME_MAX)
+  {
+    return false;
+  }
+  if (!espUsbDeviceNetTxInit())
+  {
+    return false;
+  }
+
+  EspUsbDeviceNetTxSlot *slot = nullptr;
+  if (xQueueReceive(g_netTxFree, &slot, NET_TX_ACQUIRE_TIMEOUT) != pdTRUE)
+  {
+    return false; // transmitter is behind; drop and let TCP retransmit
+  }
+  memcpy(slot->data, data, len);
+  slot->len = len;
+  if (xQueueSend(g_netTxPending, &slot, 0) != pdTRUE)
+  {
+    xQueueSend(g_netTxFree, &slot, 0);
+    return false;
+  }
+  return true;
+}
+#endif
+
+// Hands queued frames to TinyUSB. Called only from the usbd task, between
+// tud_task() turns - this is the one place in the library that may call the
+// tud_network_* API.
+extern "C" void espUsbDeviceNetDrainTx(void)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!g_netTxPending)
+  {
+    return;
+  }
+  EspUsbDeviceNetTxSlot *slot = nullptr;
+  while (xQueuePeek(g_netTxPending, &slot, 0) == pdTRUE)
+  {
+    if (!tud_network_can_xmit(slot->len))
+    {
+      // All NTBs are in flight. Leave the frame queued; the next turn (or the
+      // transfer-complete callback that frees an NTB) picks it up.
+      break;
+    }
+    // Synchronous in current TinyUSB: copies through tud_network_xmit_cb() and
+    // starts the transfer before returning, so the slot is reusable right after.
+    tud_network_xmit(slot->data, slot->len);
+    xQueueReceive(g_netTxPending, &slot, 0);
+    xQueueSend(g_netTxFree, &slot, 0);
+  }
+#endif
+}
+
+#if ESP_USB_DEVICE_HAS_ESP_NETIF
+static esp_netif_driver_base_t g_netDriverBase = {};
+static esp_netif_ip_info_t g_netIpInfo = {};
+
+static esp_err_t espUsbDeviceNetPostAttach(esp_netif_t *netif, esp_netif_iodriver_handle h)
+{
+  esp_netif_driver_base_t *base = static_cast<esp_netif_driver_base_t *>(h);
+  base->netif = netif;
+  return ESP_OK;
+}
+
+static void espUsbDeviceNetFreeRx(void *h, void *buffer)
+{
+  (void)h;
+  free(buffer);
+}
+
+// esp_netif calls this from the tcpip task to send a frame to the USB host.
+static esp_err_t espUsbDeviceNetTransmit(void *h, void *buffer, size_t len)
+{
+  (void)h;
+  if (!g_activeNet || len == 0 || len > 0xffff)
+  {
+    return ESP_ERR_INVALID_STATE;
+  }
+  return espUsbDeviceNetTxFrame(static_cast<const uint8_t *>(buffer), static_cast<uint16_t>(len)) ? ESP_OK : ESP_FAIL;
+}
+#endif
+
+EspUsbDeviceNet::EspUsbDeviceNet(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+EspUsbDeviceNet::~EspUsbDeviceNet()
+{
+  end();
+#if ESP_USB_DEVICE_HAS_ESP_NETIF
+  if (netif_)
+  {
+    esp_netif_destroy(static_cast<esp_netif_t *>(netif_));
+    netif_ = nullptr;
+    g_netDriverBase.netif = nullptr;
+  }
+#endif
+  netStarted_ = false;
+}
+
+bool EspUsbDeviceNet::begin()
+{
+  if (g_activeNet && g_activeNet != this)
+  {
+    return false;
+  }
+  g_activeNet = this;
+  return true;
+}
+
+bool EspUsbDeviceNet::afterDeviceStarted()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // Bring the network link up so the host starts exchanging frames.
+  tud_network_link_state(0, true);
+#endif
+  return true;
+}
+
+void EspUsbDeviceNet::end()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // Device::end() deinitializes TinyUSB before ending its classes. An NCM
+  // link notification after that would use deleted synchronization objects
+  // and a stopped controller; only send it while the stack is initialized.
+  if (g_activeNet == this && tud_inited())
+  {
+    tud_network_link_state(0, false);
+  }
+#endif
+  if (g_activeNet == this)
+  {
+    g_activeNet = nullptr;
+  }
+}
+
+uint16_t EspUsbDeviceNet::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  if (!dst || endpointNumber == 0 || endpointNumber > 14)
+  {
+    return 0;
+  }
+#if ESP_USB_DEVICE_HAS_ESP_MAC
+  if (!g_netMacUserSet)
+  {
+    esp_read_mac(tud_network_mac_address, ESP_MAC_ETH);
+  }
+#endif
+  static const char hex[] = "0123456789ABCDEF";
+  for (size_t i = 0; i < 6; ++i)
+  {
+    g_netMacString[i * 2] = hex[tud_network_mac_address[i] >> 4];
+    g_netMacString[i * 2 + 1] = hex[tud_network_mac_address[i] & 0x0f];
+  }
+  g_netMacString[12] = '\0';
+
+  const uint8_t epNotification = static_cast<uint8_t>(0x80 | endpointNumber);
+  const uint8_t epOut = static_cast<uint8_t>(endpointNumber + 1);
+  const uint8_t epIn = static_cast<uint8_t>(0x80 | (endpointNumber + 1));
+  const uint8_t descriptor[] = {
+      TUD_CDC_NCM_DESCRIPTOR(interfaceNumber, 0, 4,
+                             epNotification, 64, epOut, epIn, endpointSize,
+                             1514, 16, 0),
+  };
+  memcpy(dst, descriptor, sizeof(descriptor));
+  return sizeof(descriptor);
+}
+
+void EspUsbDeviceNet::macAddress(const uint8_t mac[6])
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  memcpy(tud_network_mac_address, mac, 6);
+  g_netMacUserSet = true;
+#else
+  (void)mac;
+#endif
+}
+
+const uint8_t *EspUsbDeviceNet::macAddress() const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return tud_network_mac_address;
+#else
+  return nullptr;
+#endif
+}
+
+void EspUsbDeviceNet::onFrame(FrameCallback callback)
+{
+  frameCallback_ = callback;
+}
+
+bool EspUsbDeviceNet::linkUp() const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // Reflect the actual USB attach/detach state rather than latching true after
+  // the first configuration.
+  return tud_mounted();
+#else
+  return false;
+#endif
+}
+
+bool EspUsbDeviceNet::sendFrame(const uint8_t *data, size_t length)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (length == 0 || length > 0xffff)
+  {
+    return false;
+  }
+  // Copies `data` into a pooled buffer and queues it for the usbd task, exactly
+  // like the esp_netif TX path, so the caller may pass a stack/temporary buffer
+  // and this is safe to mix with beginNetwork(). Returns false when the queue is
+  // full, i.e. the transmitter has not kept up.
+  return espUsbDeviceNetTxFrame(data, static_cast<uint16_t>(length));
+#else
+  (void)data;
+  (void)length;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceNet::handleRecv(const uint8_t *src, uint16_t size)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+#if ESP_USB_DEVICE_HAS_ESP_NETIF
+  if (netStarted_ && netif_ && src && size)
+  {
+    // Copy out of TinyUSB's buffer into one esp_netif owns; it frees it via
+    // espUsbDeviceNetFreeRx once lwIP is done, so we can renew immediately.
+    uint8_t *buf = static_cast<uint8_t *>(malloc(size));
+    if (buf)
+    {
+      memcpy(buf, src, size);
+      if (esp_netif_receive(static_cast<esp_netif_t *>(netif_), buf, size, buf) != ESP_OK)
+      {
+        free(buf);
+      }
+    }
+  }
+  else
+#endif
+      if (frameCallback_ && src && size)
+  {
+    frameCallback_(src, size);
+  }
+  // We consumed the frame synchronously; allow TinyUSB to receive the next one.
+  tud_network_recv_renew();
+  return true;
+#else
+  (void)src;
+  (void)size;
+  return true;
+#endif
+}
+
+uint16_t EspUsbDeviceNet::handleXmit(uint8_t *dst, void *ref, uint16_t arg)
+{
+  if (!dst || !ref || arg == 0)
+  {
+    return 0;
+  }
+  // Runs inside tud_network_xmit(), i.e. on the usbd task, with `ref` pointing
+  // at the queued slot espUsbDeviceNetDrainTx() passed in.
+  memcpy(dst, ref, arg);
+  return arg;
+}
+
+void EspUsbDeviceNet::handleInit()
+{
+  // tud_network init hook; link state is derived from tud_mounted() in linkUp().
+}
+
+void EspUsbDeviceNet::ipConfig(IPAddress local, IPAddress gateway, IPAddress subnet)
+{
+  cfgIp_ = static_cast<uint32_t>(local);
+  cfgGateway_ = static_cast<uint32_t>(gateway);
+  cfgNetmask_ = static_cast<uint32_t>(subnet);
+}
+
+void EspUsbDeviceNet::dhcpServer(bool enable)
+{
+  dhcpServer_ = enable;
+  if (enable)
+  {
+    dhcpClient_ = false;
+  }
+}
+
+void EspUsbDeviceNet::dhcpClient(bool enable)
+{
+  dhcpClient_ = enable;
+  if (enable)
+  {
+    dhcpServer_ = false;
+  }
+}
+
+void EspUsbDeviceNet::dhcpAdvertiseGateway(bool enable)
+{
+  dhcpAdvertiseGateway_ = enable;
+}
+
+void EspUsbDeviceNet::dhcpDns(IPAddress dns)
+{
+  dhcpDns_ = static_cast<uint32_t>(dns);
+}
+
+void EspUsbDeviceNet::defaultRoute(bool enable)
+{
+  defaultRoute_ = enable;
+}
+
+bool EspUsbDeviceNet::networkUp() const
+{
+  return netStarted_;
+}
+
+IPAddress EspUsbDeviceNet::localIP() const
+{
+#if ESP_USB_DEVICE_HAS_ESP_NETIF
+  if (netif_)
+  {
+    esp_netif_ip_info_t info = {};
+    if (esp_netif_get_ip_info(static_cast<esp_netif_t *>(netif_), &info) == ESP_OK)
+    {
+      return IPAddress(info.ip.addr);
+    }
+  }
+#endif
+  return IPAddress(cfgIp_);
+}
+
+bool EspUsbDeviceNet::beginNetwork()
+{
+#if ESP_USB_DEVICE_HAS_ESP_NETIF
+  if (netStarted_)
+  {
+    return true;
+  }
+
+  // Ensure the TCP/IP stack and default event loop exist. Both are idempotent —
+  // ESP_ERR_INVALID_STATE just means something already initialized them.
+  esp_netif_init();
+  esp_err_t evt = esp_event_loop_create_default();
+  if (evt != ESP_OK && evt != ESP_ERR_INVALID_STATE)
+  {
+    return false;
+  }
+
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!espUsbDeviceNetTxInit())
+  {
+    return false;
+  }
+#endif
+
+  // Defaults: 192.168.7.1 / gw 192.168.7.1 / mask 255.255.255.0 (network order).
+  const uint32_t defIp = static_cast<uint32_t>(IPAddress(192, 168, 7, 1));
+  const uint32_t defMask = static_cast<uint32_t>(IPAddress(255, 255, 255, 0));
+  g_netIpInfo.ip.addr = cfgIp_ ? cfgIp_ : defIp;
+  g_netIpInfo.gw.addr = cfgGateway_ ? cfgGateway_ : g_netIpInfo.ip.addr;
+  g_netIpInfo.netmask.addr = cfgNetmask_ ? cfgNetmask_ : defMask;
+
+  // Build a custom inherent config (avoids depending on esp_eth's event symbols
+  // that ESP_NETIF_INHERENT_DEFAULT_ETH would pull in). Our frames are standard
+  // Ethernet, so we reuse the ETH lwIP netstack glue.
+  esp_netif_inherent_config_t base = {};
+  uint32_t flags = ESP_NETIF_FLAG_AUTOUP;
+  if (dhcpServer_)
+  {
+    flags |= ESP_NETIF_DHCP_SERVER;
+  }
+  else if (dhcpClient_)
+  {
+    flags |= ESP_NETIF_DHCP_CLIENT;
+  }
+  base.flags = static_cast<esp_netif_flags_t>(flags);
+  base.ip_info = &g_netIpInfo;
+  base.if_key = "USB_NCM";
+  base.if_desc = "usbncm";
+  // Low priority by default so a coexisting Wi-Fi STA (100) stays the ESP's
+  // default netif; raise above it only when the USB host is meant to be our
+  // uplink (defaultRoute(true)). esp_netif auto-selects the default by priority.
+  base.route_prio = defaultRoute_ ? 255 : 10;
+
+  esp_netif_driver_ifconfig_t driver = {};
+  driver.handle = &g_netDriverBase;
+  driver.transmit = espUsbDeviceNetTransmit;
+  driver.driver_free_rx_buffer = espUsbDeviceNetFreeRx;
+
+  esp_netif_config_t cfg = {};
+  cfg.base = &base;
+  cfg.driver = &driver;
+  cfg.stack = ESP_NETIF_NETSTACK_DEFAULT_ETH;
+
+  esp_netif_t *netif = esp_netif_new(&cfg);
+  if (!netif)
+  {
+    return false;
+  }
+  netif_ = netif;
+
+  g_netDriverBase.post_attach = espUsbDeviceNetPostAttach;
+  if (esp_netif_attach(netif, &g_netDriverBase) != ESP_OK)
+  {
+    // Destroy the netif so a retry does not fail permanently on the duplicate
+    // if_key "USB_NCM", and so the netif is not leaked.
+    esp_netif_destroy(netif);
+    netif_ = nullptr;
+    return false;
+  }
+  // The iMACAddress descriptor (tud_network_mac_address) is the MAC assigned to
+  // the *host* end of the USB link, so our own netif must use a *different* MAC
+  // on this point-to-point segment — otherwise both ends share one MAC and ARP
+  // resolves the peer to the host's own address. Toggle the low bit of the last
+  // byte, exactly like TinyUSB's net_lwip_webserver. The USB link is an isolated
+  // segment, so this derived address never leaks onto a real network.
+  uint8_t devMac[6];
+  memcpy(devMac, tud_network_mac_address, 6);
+  devMac[5] ^= 0x01;
+  esp_netif_set_mac(netif, devMac);
+
+  // Start the interface, then apply addressing.
+  esp_netif_action_start(netif, nullptr, 0, nullptr);
+  if (dhcpClient_)
+  {
+    esp_netif_dhcpc_start(netif);
+  }
+  else
+  {
+    esp_netif_dhcps_stop(netif);
+    esp_netif_set_ip_info(netif, &g_netIpInfo);
+    if (dhcpServer_)
+    {
+      // By default advertise neither a router (option 3) nor DNS (option 6): the
+      // device is a local endpoint, not a forwarding gateway, so advertising
+      // itself as the host's default route would black-hole its off-link traffic.
+      // The host still gets the on-link route and reaches the device by IP; its
+      // real internet path is untouched. dhcpAdvertiseGateway()/dhcpDns() opt in
+      // when the device really does forward or has a reachable DNS.
+      const uint8_t routerOffer = dhcpAdvertiseGateway_ ? 1 : 0;
+      const uint8_t dnsOffer = dhcpDns_ ? 1 : 0;
+      if (dhcpDns_)
+      {
+        esp_netif_dns_info_t dns = {};
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = dhcpDns_;
+        esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
+      }
+      esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET, ESP_NETIF_ROUTER_SOLICITATION_ADDRESS,
+                             const_cast<uint8_t *>(&routerOffer), sizeof(routerOffer));
+      esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                             const_cast<uint8_t *>(&dnsOffer), sizeof(dnsOffer));
+      esp_netif_dhcps_start(netif);
+    }
+  }
+  // Mark the link connected so lwIP brings the interface up.
+  esp_netif_action_connected(netif, nullptr, 0, nullptr);
+
+  netStarted_ = true;
+  return true;
+#else
+  return false;
+#endif
+}
+
+static uint8_t midiClampCableCount(uint8_t cableCount)
+{
+  if (cableCount < 1)
+  {
+    return 1;
+  }
+  return cableCount > EspUsbDeviceMidi::MAX_CABLES ? EspUsbDeviceMidi::MAX_CABLES : cableCount;
+}
+
+EspUsbDeviceMidi::EspUsbDeviceMidi(EspUsbDevice &device, uint8_t cableCount) : EspUsbDeviceClass(device)
+{
+  inCableCount_ = midiClampCableCount(cableCount);
+  outCableCount_ = inCableCount_;
+}
+
+EspUsbDeviceMidi::EspUsbDeviceMidi(EspUsbDevice &device, uint8_t inCableCount, uint8_t outCableCount)
+    : EspUsbDeviceClass(device)
+{
+  inCableCount_ = midiClampCableCount(inCableCount);
+  outCableCount_ = midiClampCableCount(outCableCount);
+}
+
+EspUsbDeviceMidi::~EspUsbDeviceMidi()
+{
+  end();
+}
+
+bool EspUsbDeviceMidi::begin()
+{
+  if (g_activeMidi && g_activeMidi != this)
+  {
+    return false;
+  }
+  g_activeMidi = this;
+  return true;
+}
+
+void EspUsbDeviceMidi::end()
+{
+  if (g_activeMidi == this)
+  {
+    g_activeMidi = nullptr;
+  }
+}
+
+// TinyUSB's TUD_MIDI_DESC_JACK_DESC() always emits all four jacks of a cable, so
+// it can only describe a cable that exists in both directions. These two emit the
+// pair a one-directional cable needs, keeping the same field layout, jack ID
+// formula and In-jacks-before-Out-jacks order as that macro.
+//
+// An embedded jack always takes its data from an external jack of the opposite
+// name, which is what makes the jack graph complete: a host that walks it must not
+// find an embedded jack with no source.
+#define MIDI_ONE_WAY_JACK_LEN (6 + 9)
+
+// Device to host only: the embedded OUT jack the bulk IN endpoint will list, fed
+// by an external IN jack.
+#define MIDI_DESC_JACK_IN_ONLY(_cablenum) \
+  /* MS In Jack (External) */ \
+  6, TUSB_DESC_CS_INTERFACE, MIDI_CS_INTERFACE_IN_JACK, MIDI_JACK_EXTERNAL, TUD_MIDI_JACKID_IN_EXT(_cablenum), 0, \
+  /* MS Out Jack (Embedded), connected to In Jack External */ \
+  9, TUSB_DESC_CS_INTERFACE, MIDI_CS_INTERFACE_OUT_JACK, MIDI_JACK_EMBEDDED, TUD_MIDI_JACKID_OUT_EMB(_cablenum), 1, TUD_MIDI_JACKID_IN_EXT(_cablenum), 1, 0
+
+// Host to device only: the embedded IN jack the bulk OUT endpoint will list,
+// feeding an external OUT jack.
+#define MIDI_DESC_JACK_OUT_ONLY(_cablenum) \
+  /* MS In Jack (Embedded) */ \
+  6, TUSB_DESC_CS_INTERFACE, MIDI_CS_INTERFACE_IN_JACK, MIDI_JACK_EMBEDDED, TUD_MIDI_JACKID_IN_EMB(_cablenum), 0, \
+  /* MS Out Jack (External), connected to In Jack Embedded */ \
+  9, TUSB_DESC_CS_INTERFACE, MIDI_CS_INTERFACE_OUT_JACK, MIDI_JACK_EXTERNAL, TUD_MIDI_JACKID_OUT_EXT(_cablenum), 1, TUD_MIDI_JACKID_IN_EMB(_cablenum), 1, 0
+
+uint16_t EspUsbDeviceMidi::descriptorLength() const
+{
+  // Cables present in both directions get the full four-jack group; the surplus
+  // cables of the longer direction only need the two jacks of that direction.
+  const uint8_t both = inCableCount_ < outCableCount_ ? inCableCount_ : outCableCount_;
+  const uint8_t surplus = static_cast<uint8_t>(
+      (inCableCount_ > outCableCount_ ? inCableCount_ : outCableCount_) - both);
+  return static_cast<uint16_t>(TUD_MIDI_DESC_HEAD_LEN +
+                               TUD_MIDI_DESC_JACK_LEN * both +
+                               MIDI_ONE_WAY_JACK_LEN * surplus +
+                               TUD_MIDI_DESC_EP_LEN(outCableCount_) +
+                               TUD_MIDI_DESC_EP_LEN(inCableCount_));
+}
+
+// TUD_MIDI_DESCRIPTOR() is hardcoded to one cable, so the pieces it is built
+// from are emitted here instead. Most of them are already parameterized by the
+// cable count - including each MS endpoint descriptor's bNumEmbMIDIJack - so what
+// changes per cable is how many jack descriptors and trailing jack IDs get
+// written.
+//
+// The class document names embedded jacks from the device's side, which is the
+// opposite of the endpoint direction they belong to: the bulk IN endpoint (device
+// to host) carries the Embedded MIDI OUT Jacks, and the bulk OUT endpoint the
+// Embedded MIDI IN Jacks. Hence inCableCount_ pairs with JACKID_OUT_EMB below.
+uint16_t EspUsbDeviceMidi::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  if (!dst || endpointNumber == 0)
+  {
+    return 0;
+  }
+  const uint8_t inCables = inCableCount_;
+  const uint8_t outCables = outCableCount_;
+  const uint8_t both = inCables < outCables ? inCables : outCables;
+  const uint8_t epOut = endpointNumber;
+  const uint8_t epIn = static_cast<uint8_t>(0x80 | endpointNumber);
+  uint16_t offset = 0;
+
+  {
+    // The macro derives wTotalLength from a single cable count, which cannot
+    // describe an asymmetric interface, so it is overwritten below with the
+    // length this function actually writes. For a symmetric interface the two
+    // agree, which tests/unit/midi_descriptor asserts by comparing the one-cable
+    // output against TUD_MIDI_DESCRIPTOR() byte for byte.
+    const uint8_t head[] = {TUD_MIDI_DESC_HEAD(interfaceNumber, 0, inCables)};
+    memcpy(&dst[offset], head, sizeof(head));
+    offset = static_cast<uint16_t>(offset + sizeof(head));
+  }
+  // Descriptor cable numbers are 1-based; the packet header's cable field is
+  // 0-based, so cable N here is what a packet addresses as N-1.
+  for (uint8_t cable = 1; cable <= both; cable++)
+  {
+    const uint8_t jack[] = {TUD_MIDI_DESC_JACK_DESC(cable, 0)};
+    memcpy(&dst[offset], jack, sizeof(jack));
+    offset = static_cast<uint16_t>(offset + sizeof(jack));
+  }
+  // Cables that exist in one direction only. Jack IDs keep coming from the same
+  // per-cable formula, so the IDs of the missing direction are simply skipped -
+  // jack IDs have to be unique, not contiguous.
+  for (uint8_t cable = static_cast<uint8_t>(both + 1); cable <= inCables; cable++)
+  {
+    const uint8_t jack[] = {MIDI_DESC_JACK_IN_ONLY(cable)};
+    memcpy(&dst[offset], jack, sizeof(jack));
+    offset = static_cast<uint16_t>(offset + sizeof(jack));
+  }
+  for (uint8_t cable = static_cast<uint8_t>(both + 1); cable <= outCables; cable++)
+  {
+    const uint8_t jack[] = {MIDI_DESC_JACK_OUT_ONLY(cable)};
+    memcpy(&dst[offset], jack, sizeof(jack));
+    offset = static_cast<uint16_t>(offset + sizeof(jack));
+  }
+  {
+    const uint8_t out[] = {TUD_MIDI_DESC_EP(epOut, endpointSize, outCables)};
+    memcpy(&dst[offset], out, sizeof(out));
+    offset = static_cast<uint16_t>(offset + sizeof(out));
+  }
+  for (uint8_t cable = 1; cable <= outCables; cable++)
+  {
+    dst[offset++] = TUD_MIDI_JACKID_IN_EMB(cable);
+  }
+  {
+    const uint8_t in[] = {TUD_MIDI_DESC_EP(epIn, endpointSize, inCables)};
+    memcpy(&dst[offset], in, sizeof(in));
+    offset = static_cast<uint16_t>(offset + sizeof(in));
+  }
+  for (uint8_t cable = 1; cable <= inCables; cable++)
+  {
+    dst[offset++] = TUD_MIDI_JACKID_OUT_EMB(cable);
+  }
+  // wTotalLength covers the MS header and everything after it, and sits in the
+  // last two bytes of the head.
+  const uint16_t msTotal = static_cast<uint16_t>(offset - (TUD_MIDI_DESC_HEAD_LEN - 7));
+  dst[TUD_MIDI_DESC_HEAD_LEN - 2] = static_cast<uint8_t>(msTotal & 0xff);
+  dst[TUD_MIDI_DESC_HEAD_LEN - 1] = static_cast<uint8_t>(msTotal >> 8);
+  return offset;
+}
+
+uint16_t EspUsbDeviceMidi::configurationDescriptorForSpeed(
+    uint8_t *dst, size_t capacity, uint8_t interfaceNumber,
+    uint8_t endpointNumber, bool highSpeed)
+{
+  // A 16-cable descriptor is 572 bytes, so unlike the fixed-size functions this
+  // one can genuinely outgrow the buffer. Fail before writing rather than after.
+  if (descriptorLength() > capacity)
+  {
+    return 0;
+  }
+  return configurationDescriptor(dst, interfaceNumber, endpointNumber,
+                                 highSpeed ? 512 : 64);
+}
+
+bool EspUsbDeviceMidi::readPacket(EspUsbDeviceMidiPacket &packet)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return tud_midi_packet_read(reinterpret_cast<uint8_t *>(&packet));
+#else
+  (void)packet;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceMidi::writePacket(const EspUsbDeviceMidiPacket &packet)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return tud_midi_packet_write(reinterpret_cast<const uint8_t *>(&packet));
+#else
+  (void)packet;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceMidi::noteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  EspUsbDeviceMidiPacket packet = {header(ESP_USB_DEVICE_MIDI_CIN_NOTE_ON, cable), status(ESP_USB_DEVICE_MIDI_CIN_NOTE_ON, channel), clamp7(note), clamp7(velocity)};
+  return writePacket(packet);
+}
+
+bool EspUsbDeviceMidi::noteOff(uint8_t channel, uint8_t note, uint8_t velocity, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  EspUsbDeviceMidiPacket packet = {header(ESP_USB_DEVICE_MIDI_CIN_NOTE_OFF, cable), status(ESP_USB_DEVICE_MIDI_CIN_NOTE_OFF, channel), clamp7(note), clamp7(velocity)};
+  return writePacket(packet);
+}
+
+bool EspUsbDeviceMidi::controlChange(uint8_t channel, uint8_t control, uint8_t value, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  EspUsbDeviceMidiPacket packet = {header(ESP_USB_DEVICE_MIDI_CIN_CONTROL_CHANGE, cable), status(ESP_USB_DEVICE_MIDI_CIN_CONTROL_CHANGE, channel), clamp7(control), clamp7(value)};
+  return writePacket(packet);
+}
+
+bool EspUsbDeviceMidi::programChange(uint8_t channel, uint8_t program, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  EspUsbDeviceMidiPacket packet = {header(ESP_USB_DEVICE_MIDI_CIN_PROGRAM_CHANGE, cable), status(ESP_USB_DEVICE_MIDI_CIN_PROGRAM_CHANGE, channel), clamp7(program), 0};
+  return writePacket(packet);
+}
+
+bool EspUsbDeviceMidi::polyPressure(uint8_t channel, uint8_t note, uint8_t pressure, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  EspUsbDeviceMidiPacket packet = {header(ESP_USB_DEVICE_MIDI_CIN_POLY_KEYPRESS, cable), status(ESP_USB_DEVICE_MIDI_CIN_POLY_KEYPRESS, channel), clamp7(note), clamp7(pressure)};
+  return writePacket(packet);
+}
+
+bool EspUsbDeviceMidi::channelPressure(uint8_t channel, uint8_t pressure, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  EspUsbDeviceMidiPacket packet = {header(ESP_USB_DEVICE_MIDI_CIN_CHANNEL_PRESSURE, cable), status(ESP_USB_DEVICE_MIDI_CIN_CHANNEL_PRESSURE, channel), clamp7(pressure), 0};
+  return writePacket(packet);
+}
+
+bool EspUsbDeviceMidi::pitchBend(uint8_t channel, uint16_t value, uint8_t cable)
+{
+  if (cable >= inCableCount_)
+  {
+    return false;
+  }
+  if (value > 16383)
+  {
+    value = 16383;
+  }
+  EspUsbDeviceMidiPacket packet = {
+      header(ESP_USB_DEVICE_MIDI_CIN_PITCH_BEND_CHANGE, cable),
+      status(ESP_USB_DEVICE_MIDI_CIN_PITCH_BEND_CHANGE, channel),
+      static_cast<uint8_t>(value & 0x7f),
+      static_cast<uint8_t>((value >> 7) & 0x7f),
+  };
+  return writePacket(packet);
+}
+
+uint8_t EspUsbDeviceMidi::header(uint8_t codeIndex, uint8_t cable)
+{
+  return static_cast<uint8_t>((cable << 4) | (codeIndex & 0x0f));
+}
+
+uint8_t EspUsbDeviceMidi::status(uint8_t codeIndex, uint8_t channel)
+{
+  if (channel > 15)
+  {
+    channel = 15;
+  }
+  return static_cast<uint8_t>((codeIndex << 4) | channel);
+}
+
+uint8_t EspUsbDeviceMidi::clamp7(uint8_t value)
+{
+  return value > 127 ? 127 : value;
+}
+
+EspUsbDeviceMsc::EspUsbDeviceMsc(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+EspUsbDeviceMsc::~EspUsbDeviceMsc()
+{
+  end();
+}
+
+bool EspUsbDeviceMsc::begin()
+{
+  if (blockCount_ == 0 || blockSize_ == 0 || !readCallback_ || !writeCallback_)
+  {
+    return false;
+  }
+  if (g_activeMsc && g_activeMsc != this)
+  {
+    return false;
+  }
+  g_activeMsc = this;
+  return true;
+}
+
+bool EspUsbDeviceMsc::begin(uint32_t blockCount, uint16_t blockSize)
+{
+  blockCount_ = blockCount;
+  blockSize_ = blockSize;
+  return blockCount_ > 0 && blockSize_ > 0 && readCallback_ && writeCallback_;
+}
+
+void EspUsbDeviceMsc::end()
+{
+  if (g_activeMsc == this)
+  {
+    g_activeMsc = nullptr;
+  }
+}
+
+uint16_t EspUsbDeviceMsc::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  if (!dst || endpointNumber == 0)
+  {
+    return 0;
+  }
+  const uint8_t epOut = endpointNumber;
+  const uint8_t epIn = static_cast<uint8_t>(0x80 | endpointNumber);
+  const uint8_t descriptor[] = {
+      TUD_MSC_DESCRIPTOR(interfaceNumber, 0, epOut, epIn, endpointSize),
+  };
+  memcpy(dst, descriptor, sizeof(descriptor));
+  return sizeof(descriptor);
+}
+
+void EspUsbDeviceMsc::vendorID(const char *value)
+{
+  copyPadded(reinterpret_cast<uint8_t *>(vendor_), sizeof(vendor_) - 1, value);
+  vendor_[sizeof(vendor_) - 1] = '\0';
+}
+
+void EspUsbDeviceMsc::productID(const char *value)
+{
+  copyPadded(reinterpret_cast<uint8_t *>(product_), sizeof(product_) - 1, value);
+  product_[sizeof(product_) - 1] = '\0';
+}
+
+void EspUsbDeviceMsc::productRevision(const char *value)
+{
+  copyPadded(reinterpret_cast<uint8_t *>(revision_), sizeof(revision_) - 1, value);
+  revision_[sizeof(revision_) - 1] = '\0';
+}
+
+void EspUsbDeviceMsc::mediaPresent(bool value)
+{
+  mediaPresent_ = value;
+}
+
+void EspUsbDeviceMsc::isWritable(bool value)
+{
+  writable_ = value;
+}
+
+void EspUsbDeviceMsc::onRead(EspUsbDeviceMscReadCallback callback)
+{
+  readCallback_ = callback;
+}
+
+void EspUsbDeviceMsc::onWrite(EspUsbDeviceMscWriteCallback callback)
+{
+  writeCallback_ = callback;
+}
+
+void EspUsbDeviceMsc::onStartStop(EspUsbDeviceMscStartStopCallback callback)
+{
+  startStopCallback_ = callback;
+}
+
+uint8_t EspUsbDeviceMsc::maxLun() const
+{
+  return 0;
+}
+
+void EspUsbDeviceMsc::inquiry(uint8_t vendor[8], uint8_t product[16], uint8_t revision[4]) const
+{
+  copyPadded(vendor, 8, vendor_);
+  copyPadded(product, 16, product_);
+  copyPadded(revision, 4, revision_);
+}
+
+bool EspUsbDeviceMsc::testUnitReady() const
+{
+  return mediaPresent_;
+}
+
+void EspUsbDeviceMsc::capacity(uint32_t *blockCount, uint16_t *blockSize) const
+{
+  if (!mediaPresent_)
+  {
+    *blockCount = 0;
+    *blockSize = 0;
+    return;
+  }
+  *blockCount = blockCount_;
+  *blockSize = blockSize_;
+}
+
+bool EspUsbDeviceMsc::startStop(uint8_t powerCondition, bool start, bool loadEject)
+{
+  return startStopCallback_ ? startStopCallback_(powerCondition, start, loadEject) : true;
+}
+
+int32_t EspUsbDeviceMsc::read10(uint32_t lba, uint32_t offset, void *buffer, uint32_t size)
+{
+  if (!mediaPresent_ || !readCallback_)
+  {
+    return -1;
+  }
+  return readCallback_(lba, offset, buffer, size);
+}
+
+int32_t EspUsbDeviceMsc::write10(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t size)
+{
+  if (!mediaPresent_ || !writable_ || !writeCallback_)
+  {
+    return -1;
+  }
+  return writeCallback_(lba, offset, buffer, size);
+}
+
+bool EspUsbDeviceMsc::writable() const
+{
+  return writable_;
+}
+
+void EspUsbDeviceMsc::copyPadded(uint8_t *dst, size_t size, const char *value)
+{
+  memset(dst, 0, size);
+  if (!value)
+  {
+    return;
+  }
+  size_t length = strlen(value);
+  if (length > size)
+  {
+    length = size;
+  }
+  memcpy(dst, value, length);
+}
+
+EspUsbDeviceMscRamDisk::EspUsbDeviceMscRamDisk(uint8_t *storage, uint32_t blockCount, uint16_t blockSize)
+    : storage_(storage), blockCount_(blockCount), blockSize_(blockSize)
+{
+}
+
+bool EspUsbDeviceMscRamDisk::attach(EspUsbDeviceMsc &msc)
+{
+  if (!valid())
+  {
+    return false;
+  }
+  msc.onRead([this](uint32_t lba, uint32_t offset, void *buffer, uint32_t size)
+             { return read(lba, offset, buffer, size); });
+  msc.onWrite([this](uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t size)
+              { return write(lba, offset, buffer, size); });
+  return msc.begin(blockCount_, blockSize_);
+}
+
+bool EspUsbDeviceMscRamDisk::valid() const
+{
+  return storage_ && blockCount_ > 0 && blockSize_ > 0;
+}
+
+uint8_t *EspUsbDeviceMscRamDisk::data()
+{
+  return storage_;
+}
+
+const uint8_t *EspUsbDeviceMscRamDisk::data() const
+{
+  return storage_;
+}
+
+uint32_t EspUsbDeviceMscRamDisk::blockCount() const
+{
+  return blockCount_;
+}
+
+uint16_t EspUsbDeviceMscRamDisk::blockSize() const
+{
+  return blockSize_;
+}
+
+size_t EspUsbDeviceMscRamDisk::byteSize() const
+{
+  return static_cast<size_t>(blockCount_) * blockSize_;
+}
+
+void EspUsbDeviceMscRamDisk::clear(uint8_t value)
+{
+  if (valid())
+  {
+    memset(storage_, value, byteSize());
+  }
+}
+
+bool EspUsbDeviceMscRamDisk::readBlock(uint32_t lba, void *buffer) const
+{
+  return read(lba, 0, buffer, blockSize_) == blockSize_;
+}
+
+bool EspUsbDeviceMscRamDisk::writeBlock(uint32_t lba, const void *buffer)
+{
+  if (!buffer)
+  {
+    return false;
+  }
+  return write(lba, 0, const_cast<uint8_t *>(static_cast<const uint8_t *>(buffer)), blockSize_) == blockSize_;
+}
+
+void EspUsbDeviceMscRamDisk::writeByte(uint32_t lba, uint16_t offset, uint8_t value)
+{
+  if (!valid() || lba >= blockCount_ || offset >= blockSize_)
+  {
+    return;
+  }
+  storage_[static_cast<size_t>(lba) * blockSize_ + offset] = value;
+}
+
+int32_t EspUsbDeviceMscRamDisk::read(uint32_t lba, uint32_t offset, void *buffer, uint32_t size) const
+{
+  if (!valid() || !buffer || lba >= blockCount_ || offset >= blockSize_)
+  {
+    return -1;
+  }
+  const size_t start = static_cast<size_t>(lba) * blockSize_ + offset;
+  const size_t end = start + size;
+  if (end < start || end > byteSize())
+  {
+    return -1;
+  }
+  memcpy(buffer, storage_ + start, size);
+  return static_cast<int32_t>(size);
+}
+
+int32_t EspUsbDeviceMscRamDisk::write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t size)
+{
+  if (!valid() || !buffer || lba >= blockCount_ || offset >= blockSize_)
+  {
+    return -1;
+  }
+  const size_t start = static_cast<size_t>(lba) * blockSize_ + offset;
+  const size_t end = start + size;
+  if (end < start || end > byteSize())
+  {
+    return -1;
+  }
+  memcpy(storage_ + start, buffer, size);
+  return static_cast<int32_t>(size);
+}
+
+static void put16le(uint8_t *dst, uint16_t value)
+{
+  dst[0] = static_cast<uint8_t>(value & 0xff);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+}
+
+static void put32le(uint8_t *dst, uint32_t value)
+{
+  dst[0] = static_cast<uint8_t>(value & 0xff);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+  dst[2] = static_cast<uint8_t>((value >> 16) & 0xff);
+  dst[3] = static_cast<uint8_t>((value >> 24) & 0xff);
+}
+
+EspUsbDeviceMscFatRamDisk::EspUsbDeviceMscFatRamDisk(uint8_t *storage, size_t size)
+    : storage_(storage),
+      size_(size),
+      blockCount_(static_cast<uint32_t>(size / 512)),
+      blocks_(storage, static_cast<uint32_t>(size / 512), 512)
+{
+}
+
+bool EspUsbDeviceMscFatRamDisk::format(const char *volumeLabel)
+{
+  if (!storage_ || blockCount_ < 16)
+  {
+    return false;
+  }
+
+  memset(storage_, 0, blockCount_ * 512);
+  rootDirSectors_ = static_cast<uint16_t>(((rootEntryCount_ * 32) + 511) / 512);
+
+  uint16_t sectorsPerFat = 1;
+  uint16_t clusters = 0;
+  for (uint8_t i = 0; i < 8; ++i)
+  {
+    const uint32_t dataSectors = blockCount_ - 1 - rootDirSectors_ - (2 * sectorsPerFat);
+    clusters = static_cast<uint16_t>(dataSectors);
+    const uint32_t fatBytes = ((static_cast<uint32_t>(clusters) + 2) * 3 + 1) / 2;
+    const uint16_t requiredSectorsPerFat = static_cast<uint16_t>((fatBytes + 511) / 512);
+    if (requiredSectorsPerFat == sectorsPerFat)
+    {
+      break;
+    }
+    sectorsPerFat = requiredSectorsPerFat;
+  }
+
+  sectorsPerFat_ = sectorsPerFat;
+  dataStartSector_ = static_cast<uint16_t>(1 + (2 * sectorsPerFat_) + rootDirSectors_);
+  if (dataStartSector_ >= blockCount_)
+  {
+    return false;
+  }
+  clusterCount_ = static_cast<uint16_t>(blockCount_ - dataStartSector_);
+  nextFreeCluster_ = 2;
+  nextRootEntry_ = 0;
+
+  uint8_t *boot = storage_;
+  boot[0] = 0xeb;
+  boot[1] = 0x3c;
+  boot[2] = 0x90;
+  memcpy(boot + 3, "MSDOS5.0", 8);
+  put16le(boot + 11, 512);
+  boot[13] = 1;
+  put16le(boot + 14, 1);
+  boot[16] = 2;
+  put16le(boot + 17, rootEntryCount_);
+  put16le(boot + 19, static_cast<uint16_t>(blockCount_));
+  boot[21] = 0xf8;
+  put16le(boot + 22, sectorsPerFat_);
+  put16le(boot + 24, 1);
+  put16le(boot + 26, 1);
+  put32le(boot + 28, 0);
+  put32le(boot + 32, 0);
+  boot[36] = 0x80;
+  boot[38] = 0x29;
+  put32le(boot + 39, 0x45535055);
+  memset(boot + 43, ' ', 11);
+  if (volumeLabel)
+  {
+    for (uint8_t i = 0; i < 11 && volumeLabel[i]; ++i)
+    {
+      boot[43 + i] = static_cast<uint8_t>(toupper(static_cast<unsigned char>(volumeLabel[i])));
+    }
+  }
+  memcpy(boot + 54, "FAT12   ", 8);
+  boot[510] = 0x55;
+  boot[511] = 0xaa;
+
+  storage_[512] = 0xf8;
+  storage_[513] = 0xff;
+  storage_[514] = 0xff;
+  memcpy(storage_ + (1 + sectorsPerFat_) * 512, storage_ + 512, sectorsPerFat_ * 512);
+  return true;
+}
+
+bool EspUsbDeviceMscFatRamDisk::attach(EspUsbDeviceMsc &msc)
+{
+  if (!blocks_.valid())
+  {
+    return false;
+  }
+  msc.onStartStop([this](uint8_t powerCondition, bool start, bool loadEject)
+                  { return handleStartStop(powerCondition, start, loadEject); });
+  return blocks_.attach(msc);
+}
+
+void EspUsbDeviceMscFatRamDisk::onEject(EjectCallback callback)
+{
+  ejectCallback_ = callback;
+}
+
+bool EspUsbDeviceMscFatRamDisk::addFile(const char *name, const uint8_t *data, size_t size)
+{
+  char fatName[11];
+  if (!normalizeName(name, fatName) || !data)
+  {
+    return false;
+  }
+  if (exists(name) || nextRootEntry_ >= rootEntryCount_)
+  {
+    return false;
+  }
+
+  uint16_t firstCluster = 0;
+  size_t clusterTotal = 0;
+  if (!allocateClusters(size, &firstCluster, &clusterTotal))
+  {
+    return false;
+  }
+
+  size_t remaining = size;
+  const uint8_t *src = data;
+  uint16_t cluster = firstCluster;
+  for (size_t i = 0; i < clusterTotal; ++i)
+  {
+    uint8_t *dst = clusterPtr(cluster);
+    const size_t chunk = remaining > 512 ? 512 : remaining;
+    if (chunk > 0)
+    {
+      memcpy(dst, src, chunk);
+      src += chunk;
+      remaining -= chunk;
+    }
+    cluster = fatEntry(cluster);
+  }
+
+  uint8_t *entry = rootEntry(nextRootEntry_++);
+  memcpy(entry, fatName, 11);
+  entry[11] = 0x20;
+  put16le(entry + 26, firstCluster);
+  put32le(entry + 28, static_cast<uint32_t>(size));
+  return true;
+}
+
+bool EspUsbDeviceMscFatRamDisk::addTextFile(const char *name, const char *text)
+{
+  if (!text)
+  {
+    return false;
+  }
+  return addFile(name, reinterpret_cast<const uint8_t *>(text), strlen(text));
+}
+
+bool EspUsbDeviceMscFatRamDisk::exists(const char *name) const
+{
+  char fatName[11];
+  return normalizeName(name, fatName) && findFile(fatName, nullptr, nullptr);
+}
+
+size_t EspUsbDeviceMscFatRamDisk::fileSize(const char *name) const
+{
+  char fatName[11];
+  uint32_t size = 0;
+  if (!normalizeName(name, fatName) || !findFile(fatName, nullptr, &size))
+  {
+    return 0;
+  }
+  return size;
+}
+
+size_t EspUsbDeviceMscFatRamDisk::readFile(const char *name, uint8_t *buffer, size_t size) const
+{
+  char fatName[11];
+  uint32_t firstCluster = 0;
+  uint32_t storedSize = 0;
+  if (!normalizeName(name, fatName) || !findFile(fatName, &firstCluster, &storedSize) || !buffer)
+  {
+    return 0;
+  }
+  size_t copied = 0;
+  size_t remaining = storedSize < size ? storedSize : size;
+  uint16_t cluster = static_cast<uint16_t>(firstCluster);
+  while (remaining > 0 && cluster >= 2 && cluster < 0xff8)
+  {
+    const size_t chunk = remaining > 512 ? 512 : remaining;
+    memcpy(buffer + copied, clusterPtr(cluster), chunk);
+    copied += chunk;
+    remaining -= chunk;
+    cluster = fatEntry(cluster);
+  }
+  return copied;
+}
+
+uint32_t EspUsbDeviceMscFatRamDisk::blockCount() const
+{
+  return blockCount_;
+}
+
+uint16_t EspUsbDeviceMscFatRamDisk::blockSize() const
+{
+  return 512;
+}
+
+size_t EspUsbDeviceMscFatRamDisk::byteSize() const
+{
+  return blockCount_ * 512;
+}
+
+bool EspUsbDeviceMscFatRamDisk::normalizeName(const char *name, char out[11]) const
+{
+  if (!name || !name[0])
+  {
+    return false;
+  }
+  memset(out, ' ', 11);
+  uint8_t index = 0;
+  uint8_t extIndex = 8;
+  bool extension = false;
+  for (const char *p = name; *p; ++p)
+  {
+    if (*p == '.')
+    {
+      extension = true;
+      continue;
+    }
+    const uint8_t outIndex = extension ? extIndex++ : index++;
+    if ((!extension && outIndex >= 8) || (extension && outIndex >= 11))
+    {
+      return false;
+    }
+    const unsigned char c = static_cast<unsigned char>(*p);
+    if (!(isalnum(c) || c == '_' || c == '-' || c == '~'))
+    {
+      return false;
+    }
+    out[outIndex] = static_cast<char>(toupper(c));
+  }
+  return index > 0;
+}
+
+bool EspUsbDeviceMscFatRamDisk::findFile(const char name[11], uint32_t *firstCluster, uint32_t *size) const
+{
+  for (uint16_t i = 0; i < rootEntryCount_; ++i)
+  {
+    const uint8_t *entry = rootEntry(i);
+    if (entry[0] == 0x00)
+    {
+      return false;
+    }
+    if (entry[0] == 0xe5 || (entry[11] & 0x08))
+    {
+      continue;
+    }
+    if (memcmp(entry, name, 11) == 0)
+    {
+      if (firstCluster)
+      {
+        *firstCluster = entry[26] | (static_cast<uint32_t>(entry[27]) << 8);
+      }
+      if (size)
+      {
+        *size = entry[28] | (static_cast<uint32_t>(entry[29]) << 8) | (static_cast<uint32_t>(entry[30]) << 16) | (static_cast<uint32_t>(entry[31]) << 24);
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool EspUsbDeviceMscFatRamDisk::allocateClusters(size_t size, uint16_t *firstCluster, size_t *clusterTotal)
+{
+  const size_t needed = size == 0 ? 1 : ((size + 511) / 512);
+  if (nextFreeCluster_ + needed > static_cast<uint16_t>(clusterCount_ + 2))
+  {
+    return false;
+  }
+  *firstCluster = nextFreeCluster_;
+  *clusterTotal = needed;
+  for (size_t i = 0; i < needed; ++i)
+  {
+    const uint16_t cluster = static_cast<uint16_t>(nextFreeCluster_ + i);
+    const uint16_t value = (i + 1 == needed) ? 0xfff : static_cast<uint16_t>(cluster + 1);
+    setFatEntry(cluster, value);
+  }
+  nextFreeCluster_ = static_cast<uint16_t>(nextFreeCluster_ + needed);
+  return true;
+}
+
+void EspUsbDeviceMscFatRamDisk::setFatEntry(uint16_t cluster, uint16_t value)
+{
+  value &= 0x0fff;
+  for (uint8_t fat = 0; fat < 2; ++fat)
+  {
+    uint8_t *base = storage_ + (1 + fat * sectorsPerFat_) * 512;
+    const uint32_t offset = cluster + (cluster / 2);
+    if (cluster & 1)
+    {
+      base[offset] = static_cast<uint8_t>((base[offset] & 0x0f) | ((value << 4) & 0xf0));
+      base[offset + 1] = static_cast<uint8_t>((value >> 4) & 0xff);
+    }
+    else
+    {
+      base[offset] = static_cast<uint8_t>(value & 0xff);
+      base[offset + 1] = static_cast<uint8_t>((base[offset + 1] & 0xf0) | ((value >> 8) & 0x0f));
+    }
+  }
+}
+
+uint16_t EspUsbDeviceMscFatRamDisk::fatEntry(uint16_t cluster) const
+{
+  const uint8_t *base = storage_ + 512;
+  const uint32_t offset = cluster + (cluster / 2);
+  if (cluster & 1)
+  {
+    return static_cast<uint16_t>(((base[offset] >> 4) | (base[offset + 1] << 4)) & 0x0fff);
+  }
+  return static_cast<uint16_t>((base[offset] | ((base[offset + 1] & 0x0f) << 8)) & 0x0fff);
+}
+
+uint8_t *EspUsbDeviceMscFatRamDisk::clusterPtr(uint16_t cluster)
+{
+  return storage_ + static_cast<size_t>(dataStartSector_ + cluster - 2) * 512;
+}
+
+const uint8_t *EspUsbDeviceMscFatRamDisk::clusterPtr(uint16_t cluster) const
+{
+  return storage_ + static_cast<size_t>(dataStartSector_ + cluster - 2) * 512;
+}
+
+uint8_t *EspUsbDeviceMscFatRamDisk::rootEntry(uint16_t index)
+{
+  return storage_ + static_cast<size_t>(1 + 2 * sectorsPerFat_) * 512 + static_cast<size_t>(index) * 32;
+}
+
+const uint8_t *EspUsbDeviceMscFatRamDisk::rootEntry(uint16_t index) const
+{
+  return storage_ + static_cast<size_t>(1 + 2 * sectorsPerFat_) * 512 + static_cast<size_t>(index) * 32;
+}
+
+bool EspUsbDeviceMscFatRamDisk::handleStartStop(uint8_t powerCondition, bool start, bool loadEject)
+{
+  (void)powerCondition;
+  (void)loadEject;
+  if (!start && ejectCallback_)
+  {
+    ejectCallback_();
+  }
+  return true;
+}
+
+#if ESP_USB_DEVICE_HAS_ARDUINO_SD
+EspUsbDeviceMscSdCard::EspUsbDeviceMscSdCard(fs::SDFS &sd) : sd_(&sd)
+{
+}
+
+bool EspUsbDeviceMscSdCard::begin(uint8_t ssPin, SPIClass &spi, uint32_t frequency, const char *mountpoint, uint8_t maxFiles)
+{
+  if (!sd_ || !sd_->begin(ssPin, spi, frequency, mountpoint, maxFiles, false))
+  {
+    mounted_ = false;
+    blockCount_ = 0;
+    blockSize_ = 0;
+    return false;
+  }
+  blockCount_ = static_cast<uint32_t>(sd_->numSectors());
+  blockSize_ = static_cast<uint16_t>(sd_->sectorSize());
+  mounted_ = blockCount_ > 0 && blockSize_ == 512;
+  return mounted_;
+}
+
+bool EspUsbDeviceMscSdCard::attach(EspUsbDeviceMsc &msc)
+{
+  if (!mounted_ || blockSize_ != 512)
+  {
+    return false;
+  }
+  msc.onRead([this](uint32_t lba, uint32_t offset, void *buffer, uint32_t size)
+             { return read(lba, offset, buffer, size); });
+  msc.onWrite([this](uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t size)
+              { return write(lba, offset, buffer, size); });
+  msc.onStartStop([this](uint8_t powerCondition, bool start, bool loadEject)
+                  { return handleStartStop(powerCondition, start, loadEject); });
+  return msc.begin(blockCount_, blockSize_);
+}
+
+void EspUsbDeviceMscSdCard::onEject(EjectCallback callback)
+{
+  ejectCallback_ = callback;
+}
+
+void EspUsbDeviceMscSdCard::readOnly(bool value)
+{
+  readOnly_ = value;
+}
+
+bool EspUsbDeviceMscSdCard::readOnly() const
+{
+  return readOnly_;
+}
+
+uint32_t EspUsbDeviceMscSdCard::blockCount() const
+{
+  return blockCount_;
+}
+
+uint16_t EspUsbDeviceMscSdCard::blockSize() const
+{
+  return blockSize_;
+}
+
+bool EspUsbDeviceMscSdCard::mounted() const
+{
+  return mounted_;
+}
+
+int32_t EspUsbDeviceMscSdCard::read(uint32_t lba, uint32_t offset, void *buffer, uint32_t size)
+{
+  if (!mounted_ || !buffer || offset >= blockSize_ || lba >= blockCount_)
+  {
+    return -1;
+  }
+  const uint32_t end = lba + ((offset + size + blockSize_ - 1) / blockSize_);
+  if (end < lba || end > blockCount_)
+  {
+    return -1;
+  }
+
+  uint8_t sector[512];
+  uint8_t *dst = static_cast<uint8_t *>(buffer);
+  uint32_t remaining = size;
+  uint32_t sectorLba = lba;
+  uint32_t sectorOffset = offset;
+  while (remaining > 0)
+  {
+    if (!sd_->readRAW(sector, sectorLba))
+    {
+      return -1;
+    }
+    const uint32_t chunk = remaining < (blockSize_ - sectorOffset) ? remaining : (blockSize_ - sectorOffset);
+    memcpy(dst, sector + sectorOffset, chunk);
+    dst += chunk;
+    remaining -= chunk;
+    sectorOffset = 0;
+    sectorLba++;
+  }
+  return static_cast<int32_t>(size);
+}
+
+int32_t EspUsbDeviceMscSdCard::write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t size)
+{
+  if (readOnly_ || !mounted_ || !buffer || offset >= blockSize_ || lba >= blockCount_)
+  {
+    return -1;
+  }
+  const uint32_t end = lba + ((offset + size + blockSize_ - 1) / blockSize_);
+  if (end < lba || end > blockCount_)
+  {
+    return -1;
+  }
+
+  uint8_t sector[512];
+  uint8_t *src = buffer;
+  uint32_t remaining = size;
+  uint32_t sectorLba = lba;
+  uint32_t sectorOffset = offset;
+  while (remaining > 0)
+  {
+    const uint32_t chunk = remaining < (blockSize_ - sectorOffset) ? remaining : (blockSize_ - sectorOffset);
+    if (chunk != blockSize_)
+    {
+      if (!sd_->readRAW(sector, sectorLba))
+      {
+        return -1;
+      }
+    }
+    memcpy(sector + sectorOffset, src, chunk);
+    if (!sd_->writeRAW(sector, sectorLba))
+    {
+      return -1;
+    }
+    src += chunk;
+    remaining -= chunk;
+    sectorOffset = 0;
+    sectorLba++;
+  }
+  return static_cast<int32_t>(size);
+}
+
+bool EspUsbDeviceMscSdCard::handleStartStop(uint8_t powerCondition, bool start, bool loadEject)
+{
+  (void)powerCondition;
+  (void)loadEject;
+  if (!start && ejectCallback_)
+  {
+    ejectCallback_();
+  }
+  return true;
+}
+#endif
+
+// --- Firmware update -------------------------------------------------------
+
+#if ESP_USB_DEVICE_HAS_OTA
+static const esp_partition_t *firmwareTargetPartition()
+{
+  return esp_ota_get_next_update_partition(nullptr);
+}
+#endif
+
+EspUsbDeviceFirmwareUpdate::EspUsbDeviceFirmwareUpdate()
+{
+}
+
+EspUsbDeviceFirmwareUpdate::~EspUsbDeviceFirmwareUpdate()
+{
+  abort();
+}
+
+bool EspUsbDeviceFirmwareUpdate::available()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  return firmwareTargetPartition() != nullptr;
+#else
+  return false;
+#endif
+}
+
+size_t EspUsbDeviceFirmwareUpdate::capacity()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  const esp_partition_t *target = firmwareTargetPartition();
+  return target ? static_cast<size_t>(target->size) : 0;
+#else
+  return 0;
+#endif
+}
+
+const char *EspUsbDeviceFirmwareUpdate::targetLabel()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  const esp_partition_t *target = firmwareTargetPartition();
+  return target ? target->label : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::begin(size_t expectedSize)
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  abort();
+  written_ = 0;
+  expectedSize_ = 0;
+  randomAccess_ = false;
+  lastError_ = ESP_OK;
+
+  const esp_partition_t *target = firmwareTargetPartition();
+  if (!target)
+  {
+    // Single-app partition scheme: there is nowhere to put a new image. Worth
+    // saying plainly rather than failing on the first write, because the fix is
+    // a different partition scheme and not a different upload.
+    lastError_ = ESP_ERR_NOT_FOUND;
+    return false;
+  }
+  if (expectedSize > static_cast<size_t>(target->size))
+  {
+    lastError_ = ESP_ERR_INVALID_SIZE;
+    return false;
+  }
+
+  // OTA_WITH_SEQUENTIAL_WRITES rather than the real size on purpose: given a
+  // size, esp_ota_begin() erases that many bytes before returning, and erasing
+  // even a 1.25 MB partition takes seconds the caller is usually spending
+  // inside a USB callback. Sequential mode erases each sector as the write
+  // first reaches it, which spreads the same work across the transfer.
+  esp_ota_handle_t handle = 0;
+  const esp_err_t err = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &handle);
+  if (err != ESP_OK)
+  {
+    lastError_ = err;
+    return false;
+  }
+
+  handle_ = static_cast<uint32_t>(handle);
+  partition_ = target;
+  expectedSize_ = expectedSize;
+  active_ = true;
+  return true;
+#else
+  (void)expectedSize;
+  lastError_ = ESP_ERR_NOT_SUPPORTED;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::beginRandomAccess(size_t imageSize)
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  abort();
+  written_ = 0;
+  expectedSize_ = 0;
+  randomAccess_ = false;
+  lastError_ = ESP_OK;
+
+  if (imageSize == 0)
+  {
+    lastError_ = ESP_ERR_INVALID_ARG;
+    return false;
+  }
+  const esp_partition_t *target = firmwareTargetPartition();
+  if (!target)
+  {
+    lastError_ = ESP_ERR_NOT_FOUND;
+    return false;
+  }
+  if (imageSize > static_cast<size_t>(target->size))
+  {
+    lastError_ = ESP_ERR_INVALID_SIZE;
+    return false;
+  }
+
+  // The real size rather than OTA_WITH_SEQUENTIAL_WRITES: esp_ota_begin()
+  // erases exactly this much before returning, which is what makes a later
+  // write at an arbitrary offset land in erased flash. Erasing the whole
+  // partition instead would cost the caller a second it does not need to spend.
+  esp_ota_handle_t handle = 0;
+  const esp_err_t err = esp_ota_begin(target, imageSize, &handle);
+  if (err != ESP_OK)
+  {
+    lastError_ = err;
+    return false;
+  }
+
+  handle_ = static_cast<uint32_t>(handle);
+  partition_ = target;
+  expectedSize_ = imageSize;
+  randomAccess_ = true;
+  active_ = true;
+  return true;
+#else
+  (void)imageSize;
+  lastError_ = ESP_ERR_NOT_SUPPORTED;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::write(const void *data, size_t length)
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  if (!active_ || randomAccess_)
+  {
+    lastError_ = ESP_ERR_INVALID_STATE;
+    return false;
+  }
+  if (length == 0)
+  {
+    return true;
+  }
+  if (!data)
+  {
+    lastError_ = ESP_ERR_INVALID_ARG;
+    return false;
+  }
+
+  const esp_partition_t *target = static_cast<const esp_partition_t *>(partition_);
+  const size_t limit = expectedSize_ ? expectedSize_ : static_cast<size_t>(target->size);
+  if (written_ + length > limit)
+  {
+    // Overrunning the partition would be caught by esp_ota_write() too, but a
+    // host that keeps sending deserves to be stopped at the first byte past the
+    // end rather than at the end of a long upload.
+    lastError_ = ESP_ERR_INVALID_SIZE;
+    abort();
+    return false;
+  }
+
+  const esp_err_t err = esp_ota_write(static_cast<esp_ota_handle_t>(handle_), data, length);
+  if (err != ESP_OK)
+  {
+    lastError_ = err;
+    abort();
+    return false;
+  }
+  written_ += length;
+  return true;
+#else
+  (void)data;
+  (void)length;
+  lastError_ = ESP_ERR_NOT_SUPPORTED;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::writeAt(size_t offset, const void *data, size_t length)
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  if (!active_ || !randomAccess_)
+  {
+    lastError_ = ESP_ERR_INVALID_STATE;
+    return false;
+  }
+  if (length == 0)
+  {
+    return true;
+  }
+  if (!data)
+  {
+    lastError_ = ESP_ERR_INVALID_ARG;
+    return false;
+  }
+  if (offset + length > expectedSize_)
+  {
+    // Past the end of what beginRandomAccess() erased, so the write would land
+    // in flash nobody prepared.
+    lastError_ = ESP_ERR_INVALID_SIZE;
+    abort();
+    return false;
+  }
+
+  const esp_err_t err = esp_ota_write_with_offset(static_cast<esp_ota_handle_t>(handle_),
+                                                 data, length, offset);
+  if (err != ESP_OK)
+  {
+    lastError_ = err;
+    abort();
+    return false;
+  }
+  written_ += length;
+  return true;
+#else
+  (void)offset;
+  (void)data;
+  (void)length;
+  lastError_ = ESP_ERR_NOT_SUPPORTED;
+  return false;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::end()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  if (!active_)
+  {
+    lastError_ = ESP_ERR_INVALID_STATE;
+    return false;
+  }
+
+  // esp_ota_end() is the verification step: it checks the image header, the
+  // declared length and the checksum, so a truncated or corrupted upload fails
+  // here instead of at the next boot. Only after it passes is the boot
+  // partition moved.
+  const esp_err_t closed = esp_ota_end(static_cast<esp_ota_handle_t>(handle_));
+  active_ = false;
+  randomAccess_ = false;
+  handle_ = 0;
+  if (closed != ESP_OK)
+  {
+    lastError_ = closed;
+    return false;
+  }
+
+  const esp_partition_t *target = static_cast<const esp_partition_t *>(partition_);
+  const esp_err_t selected = esp_ota_set_boot_partition(target);
+  if (selected != ESP_OK)
+  {
+    lastError_ = selected;
+    return false;
+  }
+  lastError_ = ESP_OK;
+  return true;
+#else
+  lastError_ = ESP_ERR_NOT_SUPPORTED;
+  return false;
+#endif
+}
+
+void EspUsbDeviceFirmwareUpdate::abort()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  if (active_)
+  {
+    esp_ota_abort(static_cast<esp_ota_handle_t>(handle_));
+  }
+#endif
+  active_ = false;
+  randomAccess_ = false;
+  handle_ = 0;
+}
+
+bool EspUsbDeviceFirmwareUpdate::active() const
+{
+  return active_;
+}
+
+size_t EspUsbDeviceFirmwareUpdate::written() const
+{
+  return written_;
+}
+
+size_t EspUsbDeviceFirmwareUpdate::expectedSize() const
+{
+  return expectedSize_;
+}
+
+bool EspUsbDeviceFirmwareUpdate::randomAccess() const
+{
+  return randomAccess_;
+}
+
+esp_err_t EspUsbDeviceFirmwareUpdate::lastError() const
+{
+  return lastError_;
+}
+
+const char *EspUsbDeviceFirmwareUpdate::lastErrorName() const
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  return esp_err_to_name(lastError_);
+#else
+  return lastError_ == ESP_OK ? "ESP_OK" : "ESP_ERR_NOT_SUPPORTED";
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::markValid()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  return esp_ota_mark_app_valid_cancel_rollback() == ESP_OK;
+#else
+  return false;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::rollback()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  return esp_ota_mark_app_invalid_rollback_and_reboot() == ESP_OK;
+#else
+  return false;
+#endif
+}
+
+bool EspUsbDeviceFirmwareUpdate::cancelPendingBoot()
+{
+#if ESP_USB_DEVICE_HAS_OTA
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  return running && esp_ota_set_boot_partition(running) == ESP_OK;
+#else
+  return false;
+#endif
+}
+
+// --- Restarting into the ROM ----------------------------------------------
+
+#if ESP_USB_DEVICE_HAS_TINYUSB
+// A restart cannot be issued from the callback that decided to restart.
+//
+// Every class callback runs on the usbd task, and the host is mid-transfer when
+// it asks for one of these: DFU_DETACH still has a status stage to finish, and a
+// finished DFU download still owes the host one GETSTATUS. Restarting inline
+// cuts those off, and blocking the usbd task to wait for them is the same thing
+// - nothing answers the host while that task is asleep.
+//
+// So the decision is made on the usbd task and carried out on a throwaway one
+// at the lowest useful priority, which lets the usbd task finish the exchange
+// during the delay. The task never returns; the chip restarts underneath it.
+struct EspUsbDeviceDeferredRestart
+{
+  EspUsbDevice *device;
+  uint32_t delayMs;
+  bool toBootloader;
+};
+
+static void espUsbDeviceDeferredRestartTask(void *argument)
+{
+  EspUsbDeviceDeferredRestart *request =
+      static_cast<EspUsbDeviceDeferredRestart *>(argument);
+  const uint32_t delayMs = request->delayMs;
+  EspUsbDevice *device = request->device;
+  const bool toBootloader = request->toBootloader;
+  delete request;
+
+  vTaskDelay(pdMS_TO_TICKS(delayMs));
+  if (toBootloader && device)
+  {
+    device->rebootToBootloader();
+  }
+  tud_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(20));
+  esp_restart();
+  vTaskDelete(nullptr);
+}
+
+static bool espUsbDeviceScheduleRestart(EspUsbDevice *device, uint32_t delayMs,
+                                        bool toBootloader)
+{
+  EspUsbDeviceDeferredRestart *request = new (std::nothrow)
+      EspUsbDeviceDeferredRestart{device, delayMs, toBootloader};
+  if (!request)
+  {
+    return false;
+  }
+  if (xTaskCreate(espUsbDeviceDeferredRestartTask, "espusb-restart", 4096,
+                  request, tskIDLE_PRIORITY + 1, nullptr) != pdPASS)
+  {
+    delete request;
+    return false;
+  }
+  return true;
+}
+#endif
+
+bool EspUsbDevice::rebootToBootloader()
+{
+#if ESP_USB_DEVICE_HAS_DOWNLOAD_BOOT
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // Remove the pull-up so the host records a disconnect rather than a device
+  // that stopped answering. Safe from any task, unlike end(), which deletes the
+  // usbd task and would therefore never return when called from it.
+  if (tinyusbStarted_)
+  {
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+#endif
+#if ESP_USB_DEVICE_HAS_SHARED_PHY
+  // Hand the shared PHY back to USB-Serial-JTAG before restarting.
+  //
+  // On ESP32-S3 one internal PHY and one pin pair carry either USB-Serial-JTAG
+  // or USB-OTG, and begin() took them for OTG. The selection lives in
+  // RTC_CNTL_USB_CONF_REG, which is in the RTC domain and **survives a software
+  // reset** - so without this the ROM's serial loader comes up with the pads
+  // still routed to a controller nobody is driving, and the connector goes
+  // dark. Measured: an ESP32-S3 whose only cable is its native USB reached the
+  // download loader (esptool over UART connected with --before no-reset) while
+  // the USB port disappeared from the host entirely.
+  //
+  // Deliberately not done by rebootToRomDfu(): that one wants the ROM on
+  // USB-OTG, which is where the pads already are.
+  CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG,
+                      RTC_CNTL_SW_HW_USB_PHY_SEL | RTC_CNTL_SW_USB_PHY_SEL |
+                          RTC_CNTL_USB_PAD_ENABLE);
+  // And not through an external PHY either.
+  CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_PHY_SEL);
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  // RTC_CNTL_OPTION1_REG holds this one bit and nothing else, so a whole
+  // register write is safe here.
+  REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+#else
+  // LP_SYSTEM_REG_SYS_CTRL_REG also carries LP_SYSTEM_REG_SYS_SW_RST,
+  // LP_SYSTEM_REG_DIG_FIB and LP_SYSTEM_REG_IO_MUX_RESET_DISABLE. Set the bit;
+  // never write the register.
+  REG_SET_BIT(LP_SYSTEM_REG_SYS_CTRL_REG, LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT);
+#endif
+  esp_restart();
+  return true;
+#else
+  setLastError(ESP_ERR_NOT_SUPPORTED);
+  return false;
+#endif
+}
+
+bool EspUsbDevice::rebootToRomDfu()
+{
+#if ESP_USB_DEVICE_HAS_ROM_DFU
+#if ESP_USB_DEVICE_HAS_PHY_SEL_EFUSE
+  // The ROM's DFU device is on USB-OTG, and on ESP32-S3 the internal PHY
+  // reaches USB-OTG only when the USB_PHY_SEL eFuse is burned: the ROM routes
+  // the pads from that eFuse at boot, whatever the application left behind.
+  //
+  // Without it the chip does reach the download loader - esptool over a UART
+  // connects with --before no-reset - and the USB connector goes completely
+  // dark. Measured on an ESP32-S3 whose only cable is its native USB. On a
+  // board like that, restarting anyway is the difference between "this call
+  // did nothing" and "this board now needs someone to press BOOT", so it
+  // refuses instead.
+  //
+  // Burning USB_PHY_SEL is one-way and costs the board USB-Serial-JTAG for
+  // good, so the library will not do it for you. EspUsbDeviceDfu implements
+  // DFU in the application instead, which needs no eFuse and works the same on
+  // every target.
+  if (!esp_efuse_read_field_bit(ESP_EFUSE_USB_PHY_SEL))
+  {
+    setLastError(ESP_ERR_NOT_SUPPORTED);
+    return false;
+  }
+#endif
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (tinyusbStarted_)
+  {
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+#endif
+  // The persist flag is what makes the ROM come up as a DFU device on USB-OTG
+  // instead of as a serial loader, without burning the one-way USB_PHY_SEL
+  // eFuse that would cost this board USB Serial/JTAG for good.
+  chip_usb_set_persist_flags(USBDC_BOOT_DFU);
+  REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  esp_restart();
+  return true;
+#else
+  setLastError(ESP_ERR_NOT_SUPPORTED);
+  return false;
+#endif
+}
+
+// --- MSC firmware disk ------------------------------------------------------
+
+namespace
+{
+constexpr uint32_t kFirmwareDiskSectorSize = 512;
+// FAT12 addresses at most 4084 data clusters (0xFF5 is the first reserved
+// value). Beyond that the volume would have to be FAT16, and raising the
+// cluster size is both simpler and better here: 4 KiB clusters already line up
+// with the flash sector, so a cluster boundary is an erase boundary.
+constexpr uint32_t kFirmwareDiskMaxClusters = 4084;
+constexpr uint16_t kFirmwareDiskClusterOptions[] = {8, 16, 32, 64, 128};
+
+// UF2, as microsoft/uf2 defines it: 512-byte blocks, three magic words, and a
+// 476-byte payload window.
+constexpr uint32_t kUf2MagicStart0 = 0x0a324655; // "UF2\n"
+constexpr uint32_t kUf2MagicStart1 = 0x9e5d5157;
+constexpr uint32_t kUf2MagicEnd = 0x0ab16f30;
+constexpr uint32_t kUf2BlockSize = 512;
+constexpr uint32_t kUf2MaxPayload = 476;
+constexpr uint32_t kUf2FlagNotMainFlash = 0x00000001;
+constexpr uint32_t kUf2FlagFamilyIdPresent = 0x00002000;
+// A ceiling on what a header may claim, so a corrupt numBlocks cannot ask for
+// an absurd bitmap. 65536 blocks is 16 MiB even at the smallest useful payload.
+constexpr uint32_t kUf2MaxBlocks = 65536;
+
+void firmwareDiskPut16(uint8_t *dst, uint16_t value)
+{
+  dst[0] = static_cast<uint8_t>(value & 0xff);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+}
+
+void firmwareDiskPut32(uint8_t *dst, uint32_t value)
+{
+  dst[0] = static_cast<uint8_t>(value & 0xff);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+  dst[2] = static_cast<uint8_t>((value >> 16) & 0xff);
+  dst[3] = static_cast<uint8_t>((value >> 24) & 0xff);
+}
+
+uint32_t firmwareDiskRead32(const uint8_t *src)
+{
+  return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
+         (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
+}
+
+uint16_t firmwareDiskRead16(const uint8_t *src)
+{
+  return static_cast<uint16_t>(static_cast<uint16_t>(src[0]) |
+                               (static_cast<uint16_t>(src[1]) << 8));
+}
+
+uint32_t firmwareDiskReadLe32(const uint8_t *src)
+{
+  return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
+         (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
+}
+
+bool firmwareDiskIsUf2Block(const uint8_t *block)
+{
+  return firmwareDiskReadLe32(block) == kUf2MagicStart0 &&
+         firmwareDiskReadLe32(block + 4) == kUf2MagicStart1 &&
+         firmwareDiskReadLe32(block + kUf2BlockSize - 4) == kUf2MagicEnd;
+}
+
+// "README  TXT" from "README.TXT". False for anything 8.3 cannot hold, which is
+// the whole of what this volume needs to name.
+bool firmwareDiskNormalizeName(const char *name, char out[11])
+{
+  if (!name)
+  {
+    return false;
+  }
+  memset(out, ' ', 11);
+  size_t i = 0;
+  for (; name[i] && name[i] != '.'; i++)
+  {
+    if (i >= 8)
+    {
+      return false;
+    }
+    out[i] = static_cast<char>(toupper(static_cast<unsigned char>(name[i])));
+  }
+  if (i == 0)
+  {
+    return false;
+  }
+  if (name[i] == '.')
+  {
+    const char *extension = name + i + 1;
+    for (size_t j = 0; extension[j]; j++)
+    {
+      if (j >= 3)
+      {
+        return false;
+      }
+      out[8 + j] = static_cast<char>(toupper(static_cast<unsigned char>(extension[j])));
+    }
+  }
+  return true;
+}
+} // namespace
+
+EspUsbDeviceMscFirmwareDisk::EspUsbDeviceMscFirmwareDisk(uint8_t *storage, size_t size)
+    : storage_(storage), size_(size)
+{
+}
+
+uint32_t EspUsbDeviceMscFirmwareDisk::uf2FamilyId()
+{
+  // The registry in microsoft/uf2 (utils/uf2families.json).
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+  return 0xbfdd4eeeu;
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+  return 0xc47e5767u;
+#elif defined(CONFIG_IDF_TARGET_ESP32P4)
+  return 0x3d308e94u;
+#else
+  return 0;
+#endif
+}
+
+EspUsbDeviceMscFirmwareDisk::~EspUsbDeviceMscFirmwareDisk()
+{
+  if (updating_)
+  {
+    firmware_.abort();
+  }
+  releaseUf2State();
+}
+
+void EspUsbDeviceMscFirmwareDisk::releaseUf2State()
+{
+  free(uf2SeenBitmap_);
+  uf2SeenBitmap_ = nullptr;
+  uf2BaseAddress_ = 0;
+  uf2TotalBlocks_ = 0;
+  uf2BlocksSeen_ = 0;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::begin(const char *volumeLabel)
+{
+  formatted_ = false;
+  if (!storage_ || size_ < 8 * 1024)
+  {
+    return false;
+  }
+  const size_t capacity = EspUsbDeviceFirmwareUpdate::capacity();
+  if (capacity == 0)
+  {
+    // Single-app partition scheme: there is nothing for this drive to write to,
+    // and presenting one anyway would be a lie the host discovers late.
+    return false;
+  }
+
+  const uint32_t ramSectorsAvailable = static_cast<uint32_t>(size_ / kFirmwareDiskSectorSize);
+  bool laidOut = false;
+  for (uint16_t candidate : kFirmwareDiskClusterOptions)
+  {
+    const uint32_t clusterBytes = static_cast<uint32_t>(candidate) * kFirmwareDiskSectorSize;
+    const uint32_t firmwareClusters =
+        static_cast<uint32_t>((capacity + clusterBytes - 1) / clusterBytes);
+
+    // The FAT has to be big enough for every cluster, and how many clusters
+    // there are depends on how much RAM the FAT leaves for the scratch area.
+    // Three passes settle it; the loop guards against a layout that oscillates.
+    uint16_t fatSectors = 1;
+    uint32_t scratchClusters = 0;
+    bool converged = false;
+    for (int attempt = 0; attempt < 8; attempt++)
+    {
+      const uint32_t metadataSectors =
+          1 + (2 * static_cast<uint32_t>(fatSectors)) + rootDirSectors_;
+      if (ramSectorsAvailable <= metadataSectors)
+      {
+        break;
+      }
+      scratchClusters = (ramSectorsAvailable - metadataSectors) / candidate;
+      if (scratchClusters == 0)
+      {
+        break;
+      }
+      const uint32_t totalClusters = scratchClusters + firmwareClusters;
+      const uint32_t fatBytes = ((totalClusters + 2) * 3 + 1) / 2;
+      const uint16_t required =
+          static_cast<uint16_t>((fatBytes + kFirmwareDiskSectorSize - 1) / kFirmwareDiskSectorSize);
+      if (required == fatSectors)
+      {
+        converged = true;
+        break;
+      }
+      fatSectors = required;
+    }
+    if (!converged || scratchClusters + firmwareClusters > kFirmwareDiskMaxClusters)
+    {
+      continue;
+    }
+
+    sectorsPerCluster_ = candidate;
+    sectorsPerFat_ = fatSectors;
+    dataStartSector_ = 1 + (2u * fatSectors) + rootDirSectors_;
+    scratchSectors_ = scratchClusters * candidate;
+    ramSectors_ = dataStartSector_ + scratchSectors_;
+    firmwareSectors_ = firmwareClusters * candidate;
+    blockCount_ = ramSectors_ + firmwareSectors_;
+    laidOut = true;
+    break;
+  }
+  if (!laidOut)
+  {
+    return false;
+  }
+
+  memset(storage_, 0, ramSectors_ * kFirmwareDiskSectorSize);
+  nextScratchCluster_ = 2;
+  nextRootEntry_ = 0;
+  format_ = ImageFormat::Unknown;
+  releaseUf2State();
+
+  uint8_t *boot = storage_;
+  boot[0] = 0xeb;
+  boot[1] = 0x3c;
+  boot[2] = 0x90;
+  memcpy(boot + 3, "MSDOS5.0", 8);
+  firmwareDiskPut16(boot + 11, static_cast<uint16_t>(kFirmwareDiskSectorSize));
+  boot[13] = static_cast<uint8_t>(sectorsPerCluster_);
+  firmwareDiskPut16(boot + 14, 1); // reserved sectors
+  boot[16] = 2;                    // FAT copies
+  firmwareDiskPut16(boot + 17, rootEntryCount_);
+  // A volume larger than 65535 sectors has to use the 32-bit count instead, and
+  // the 16-bit one must then read zero.
+  if (blockCount_ < 0x10000)
+  {
+    firmwareDiskPut16(boot + 19, static_cast<uint16_t>(blockCount_));
+  }
+  else
+  {
+    firmwareDiskPut16(boot + 19, 0);
+    firmwareDiskPut32(boot + 32, blockCount_);
+  }
+  boot[21] = 0xf8; // fixed disk
+  firmwareDiskPut16(boot + 22, sectorsPerFat_);
+  firmwareDiskPut16(boot + 24, 1); // sectors per track
+  firmwareDiskPut16(boot + 26, 1); // heads
+  boot[36] = 0x80;
+  boot[38] = 0x29;
+  firmwareDiskPut32(boot + 39, 0x45535055);
+  memset(boot + 43, ' ', 11);
+  if (volumeLabel)
+  {
+    for (uint8_t i = 0; i < 11 && volumeLabel[i]; ++i)
+    {
+      boot[43 + i] = static_cast<uint8_t>(toupper(static_cast<unsigned char>(volumeLabel[i])));
+    }
+  }
+  memcpy(boot + 54, "FAT12   ", 8);
+  boot[510] = 0x55;
+  boot[511] = 0xaa;
+
+  // Cluster 0 and 1 are the media descriptor and the end-of-chain marker; every
+  // other cluster is free, including the ones that map onto the partition. The
+  // host allocates them itself when it copies the image.
+  uint8_t *fat = storage_ + kFirmwareDiskSectorSize;
+  fat[0] = 0xf8;
+  fat[1] = 0xff;
+  fat[2] = 0xff;
+  memcpy(storage_ + (1 + sectorsPerFat_) * kFirmwareDiskSectorSize, fat,
+         sectorsPerFat_ * kFirmwareDiskSectorSize);
+
+  formatted_ = true;
+  return true;
+}
+
+void EspUsbDeviceMscFirmwareDisk::setFatEntry(uint16_t cluster, uint16_t value)
+{
+  const uint32_t index = (static_cast<uint32_t>(cluster) * 3) / 2;
+  uint8_t *fat = storage_ + kFirmwareDiskSectorSize;
+  if (index + 1 >= static_cast<uint32_t>(sectorsPerFat_) * kFirmwareDiskSectorSize)
+  {
+    return;
+  }
+  if (cluster & 1)
+  {
+    fat[index] = static_cast<uint8_t>((fat[index] & 0x0f) | ((value & 0x0f) << 4));
+    fat[index + 1] = static_cast<uint8_t>((value >> 4) & 0xff);
+  }
+  else
+  {
+    fat[index] = static_cast<uint8_t>(value & 0xff);
+    fat[index + 1] = static_cast<uint8_t>((fat[index + 1] & 0xf0) | ((value >> 8) & 0x0f));
+  }
+  memcpy(storage_ + (1 + sectorsPerFat_) * kFirmwareDiskSectorSize, fat,
+         sectorsPerFat_ * kFirmwareDiskSectorSize);
+}
+
+uint8_t *EspUsbDeviceMscFirmwareDisk::rootEntry(uint16_t index)
+{
+  const uint32_t rootStart = 1 + (2u * sectorsPerFat_);
+  return storage_ + (rootStart * kFirmwareDiskSectorSize) + (index * 32);
+}
+
+const uint8_t *EspUsbDeviceMscFirmwareDisk::rootEntry(uint16_t index) const
+{
+  const uint32_t rootStart = 1 + (2u * sectorsPerFat_);
+  return storage_ + (rootStart * kFirmwareDiskSectorSize) + (index * 32);
+}
+
+bool EspUsbDeviceMscFirmwareDisk::allocateScratchFile(const char name[11], size_t size,
+                                                      uint16_t *firstCluster)
+{
+  const uint32_t clusterBytes =
+      static_cast<uint32_t>(sectorsPerCluster_) * kFirmwareDiskSectorSize;
+  const uint32_t needed = static_cast<uint32_t>((size + clusterBytes - 1) / clusterBytes);
+  const uint32_t scratchClusters = scratchSectors_ / sectorsPerCluster_;
+  if (needed == 0 || nextRootEntry_ >= rootEntryCount_ ||
+      nextScratchCluster_ - 2 + needed > scratchClusters)
+  {
+    return false;
+  }
+
+  *firstCluster = nextScratchCluster_;
+  for (uint32_t i = 0; i < needed; i++)
+  {
+    const uint16_t cluster = static_cast<uint16_t>(nextScratchCluster_ + i);
+    setFatEntry(cluster, i + 1 == needed ? 0xfff : static_cast<uint16_t>(cluster + 1));
+  }
+  nextScratchCluster_ = static_cast<uint16_t>(nextScratchCluster_ + needed);
+
+  uint8_t *entry = rootEntry(nextRootEntry_++);
+  memcpy(entry, name, 11);
+  entry[11] = 0x20; // archive
+  firmwareDiskPut16(entry + 26, *firstCluster);
+  firmwareDiskPut32(entry + 28, static_cast<uint32_t>(size));
+  return true;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::addTextFile(const char *name, const char *text)
+{
+  if (!formatted_ || !text)
+  {
+    return false;
+  }
+  char normalized[11];
+  if (!firmwareDiskNormalizeName(name, normalized))
+  {
+    return false;
+  }
+  const size_t length = strlen(text);
+  uint16_t firstCluster = 0;
+  if (!allocateScratchFile(normalized, length, &firstCluster))
+  {
+    return false;
+  }
+  const uint32_t clusterSector =
+      dataStartSector_ + (static_cast<uint32_t>(firstCluster - 2) * sectorsPerCluster_);
+  memcpy(storage_ + (clusterSector * kFirmwareDiskSectorSize), text, length);
+  return true;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::attach(EspUsbDeviceMsc &msc)
+{
+  if (!formatted_)
+  {
+    return false;
+  }
+  msc.onRead([this](uint32_t lba, uint32_t offset, void *buffer, uint32_t size)
+             { return read(lba, offset, buffer, size); });
+  msc.onWrite([this](uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t size)
+              { return write(lba, offset, buffer, size); });
+  msc.onStartStop([this](uint8_t powerCondition, bool start, bool loadEject)
+                  { return handleStartStop(powerCondition, start, loadEject); });
+  msc.mediaPresent(true);
+  msc.isWritable(true);
+  return msc.begin(blockCount_, static_cast<uint16_t>(kFirmwareDiskSectorSize));
+}
+
+void EspUsbDeviceMscFirmwareDisk::onProgress(ProgressCallback callback)
+{
+  progressCallback_ = callback;
+}
+
+void EspUsbDeviceMscFirmwareDisk::onComplete(CompleteCallback callback)
+{
+  completeCallback_ = callback;
+}
+
+void EspUsbDeviceMscFirmwareDisk::onError(ErrorCallback callback)
+{
+  errorCallback_ = callback;
+}
+
+void EspUsbDeviceMscFirmwareDisk::onEject(EjectCallback callback)
+{
+  ejectCallback_ = callback;
+}
+
+void EspUsbDeviceMscFirmwareDisk::restartWhenComplete(bool enable)
+{
+  restartWhenComplete_ = enable;
+}
+
+uint32_t EspUsbDeviceMscFirmwareDisk::blockCount() const
+{
+  return blockCount_;
+}
+
+uint16_t EspUsbDeviceMscFirmwareDisk::blockSize() const
+{
+  return static_cast<uint16_t>(kFirmwareDiskSectorSize);
+}
+
+uint32_t EspUsbDeviceMscFirmwareDisk::ramSectorCount() const
+{
+  return ramSectors_;
+}
+
+size_t EspUsbDeviceMscFirmwareDisk::written() const
+{
+  return firmware_.written();
+}
+
+bool EspUsbDeviceMscFirmwareDisk::updating() const
+{
+  return updating_;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::updatingUf2() const
+{
+  return format_ == ImageFormat::Uf2;
+}
+
+EspUsbDeviceFirmwareUpdate &EspUsbDeviceMscFirmwareDisk::firmware()
+{
+  return firmware_;
+}
+
+int32_t EspUsbDeviceMscFirmwareDisk::read(uint32_t lba, uint32_t offset, void *buffer, uint32_t size)
+{
+  if (!formatted_ || !buffer || lba >= blockCount_)
+  {
+    return -1;
+  }
+  const uint64_t address = (static_cast<uint64_t>(lba) * kFirmwareDiskSectorSize) + offset;
+  uint8_t *out = static_cast<uint8_t *>(buffer);
+  const uint64_t ramBytes = static_cast<uint64_t>(ramSectors_) * kFirmwareDiskSectorSize;
+
+  uint32_t done = 0;
+  if (address < ramBytes)
+  {
+    const uint32_t chunk =
+        static_cast<uint32_t>(ramBytes - address < size ? ramBytes - address : size);
+    memcpy(out, storage_ + address, chunk);
+    done = chunk;
+  }
+  if (done < size)
+  {
+#if ESP_USB_DEVICE_HAS_OTA
+    // Past the scratch area the volume is the partition itself. Reading it back
+    // rather than answering with zeros is what lets a host verify the file it
+    // just copied - and an untouched partition reads as erased flash, which is
+    // the truth about what is there.
+    const esp_partition_t *target = firmwareTargetPartition();
+    const uint64_t partitionOffset = (address + done) - ramBytes;
+    if (target && partitionOffset < target->size)
+    {
+      const uint32_t chunk = static_cast<uint32_t>(
+          target->size - partitionOffset < (size - done) ? target->size - partitionOffset
+                                                         : (size - done));
+      if (esp_partition_read(target, static_cast<size_t>(partitionOffset), out + done, chunk) != ESP_OK)
+      {
+        return -1;
+      }
+      done += chunk;
+    }
+#endif
+    if (done < size)
+    {
+      memset(out + done, 0, size - done);
+      done = size;
+    }
+  }
+  return static_cast<int32_t>(size);
+}
+
+bool EspUsbDeviceMscFirmwareDisk::writeFirmwareRegion(size_t regionOffset,
+                                                      const uint8_t *data, uint32_t size)
+{
+  if (size == 0)
+  {
+    return true;
+  }
+  if (format_ == ImageFormat::Unknown)
+  {
+    // What the host is copying is decided once, from the first bytes to land in
+    // this region. Anything that is neither format is left alone - it is a file
+    // dropped by mistake, or metadata that spilled out of the scratch area, and
+    // the next write gets the same chance.
+    if (size >= kUf2BlockSize && regionOffset % kUf2BlockSize == 0 &&
+        firmwareDiskIsUf2Block(data))
+    {
+      format_ = ImageFormat::Uf2;
+    }
+    else if (data[0] == 0xe9)
+    {
+      format_ = ImageFormat::Raw;
+    }
+    else
+    {
+      return true;
+    }
+  }
+
+  if (format_ == ImageFormat::Uf2)
+  {
+    return writeUf2Stream(regionOffset, data, size);
+  }
+  return writeRawImage(regionOffset, data, size);
+}
+
+bool EspUsbDeviceMscFirmwareDisk::writeRawImage(size_t regionOffset, const uint8_t *data,
+                                                uint32_t size)
+{
+  if (!updating_)
+  {
+    if (!firmware_.begin())
+    {
+      failUpdate(firmware_.lastError());
+      return false;
+    }
+    updating_ = true;
+    imageStartSector_ = static_cast<uint32_t>(regionOffset / kFirmwareDiskSectorSize);
+    regionOffset = 0;
+  }
+  else
+  {
+    const size_t imageBase =
+        static_cast<size_t>(imageStartSector_) * kFirmwareDiskSectorSize;
+    if (regionOffset < imageBase)
+    {
+      failUpdate(ESP_ERR_INVALID_STATE);
+      return false;
+    }
+    regionOffset -= imageBase;
+  }
+
+  // Sequential only, and loudly so. A raw image says nothing about where its
+  // bytes belong, so the write position is the only thing that can; a host that
+  // jumps backwards or leaves a hole would otherwise produce an image that
+  // looks written and is not. UF2 is the format that removes this restriction.
+  if (regionOffset != firmware_.written())
+  {
+    failUpdate(ESP_ERR_INVALID_STATE);
+    return false;
+  }
+  if (!firmware_.write(data, size))
+  {
+    failUpdate(firmware_.lastError());
+    return false;
+  }
+  if (progressCallback_)
+  {
+    progressCallback_(firmware_.written());
+  }
+  return true;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::writeUf2Stream(size_t regionOffset, const uint8_t *data,
+                                                 uint32_t size)
+{
+  if (regionOffset % kUf2BlockSize != 0)
+  {
+    // A UF2 file is a whole number of 512-byte blocks and a 512-byte-sector
+    // volume delivers it that way. Anything else is not a block boundary and
+    // cannot be parsed as one.
+    return true;
+  }
+  while (size >= kUf2BlockSize)
+  {
+    if (firmwareDiskIsUf2Block(data))
+    {
+      if (!writeUf2Block(data))
+      {
+        return false;
+      }
+    }
+    data += kUf2BlockSize;
+    size -= kUf2BlockSize;
+  }
+  return true;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::writeUf2Block(const uint8_t *block)
+{
+  const uint32_t flags = firmwareDiskReadLe32(block + 8);
+  const uint32_t targetAddress = firmwareDiskReadLe32(block + 12);
+  const uint32_t payloadSize = firmwareDiskReadLe32(block + 16);
+  const uint32_t blockNumber = firmwareDiskReadLe32(block + 20);
+  const uint32_t totalBlocks = firmwareDiskReadLe32(block + 24);
+  const uint32_t fileSizeOrFamily = firmwareDiskReadLe32(block + 28);
+
+  if (payloadSize > kUf2MaxPayload || totalBlocks == 0 || totalBlocks > kUf2MaxBlocks ||
+      blockNumber >= totalBlocks)
+  {
+    failUpdate(ESP_ERR_INVALID_SIZE);
+    return false;
+  }
+  if ((flags & kUf2FlagFamilyIdPresent) != 0 && fileSizeOrFamily != uf2FamilyId())
+  {
+    // An image for a different chip. Refusing it here is the whole reason the
+    // family ID exists, and it is the one mistake a raw `.bin` cannot catch.
+    failUpdate(ESP_ERR_INVALID_VERSION);
+    return false;
+  }
+
+  if (!updating_)
+  {
+    // Every block says where it goes, so the start of the image is derivable
+    // from any block - which is what makes the order the host writes in
+    // irrelevant.
+    uf2BaseAddress_ = targetAddress - (blockNumber * payloadSize);
+    uf2TotalBlocks_ = totalBlocks;
+    uf2BlocksSeen_ = 0;
+
+    const size_t imageSize = static_cast<size_t>(totalBlocks) * payloadSize;
+    uf2SeenBitmap_ = static_cast<uint8_t *>(calloc((totalBlocks + 7) / 8, 1));
+    if (!uf2SeenBitmap_)
+    {
+      failUpdate(ESP_ERR_NO_MEM);
+      return false;
+    }
+    if (!firmware_.beginRandomAccess(imageSize))
+    {
+      failUpdate(firmware_.lastError());
+      return false;
+    }
+    updating_ = true;
+  }
+  else if (totalBlocks != uf2TotalBlocks_)
+  {
+    // Two different files interleaved into one region.
+    failUpdate(ESP_ERR_INVALID_STATE);
+    return false;
+  }
+
+  const uint32_t byteIndex = blockNumber / 8;
+  const uint8_t bit = static_cast<uint8_t>(1u << (blockNumber % 8));
+  if ((uf2SeenBitmap_[byteIndex] & bit) != 0)
+  {
+    // Already had this one. Writing it again would be harmless; counting it
+    // again would commit the update before the rest of the image arrived.
+    return true;
+  }
+
+  if ((flags & kUf2FlagNotMainFlash) == 0)
+  {
+    if (targetAddress < uf2BaseAddress_)
+    {
+      failUpdate(ESP_ERR_INVALID_ARG);
+      return false;
+    }
+    if (!firmware_.writeAt(targetAddress - uf2BaseAddress_, block + 32, payloadSize))
+    {
+      failUpdate(firmware_.lastError());
+      return false;
+    }
+  }
+
+  uf2SeenBitmap_[byteIndex] = static_cast<uint8_t>(uf2SeenBitmap_[byteIndex] | bit);
+  uf2BlocksSeen_++;
+  if (progressCallback_)
+  {
+    progressCallback_(firmware_.written());
+  }
+  if (uf2BlocksSeen_ >= uf2TotalBlocks_)
+  {
+    // Exact, unlike the raw path: the header said how many blocks there are and
+    // every one of them has been seen.
+    commit();
+  }
+  return true;
+}
+
+int32_t EspUsbDeviceMscFirmwareDisk::write(uint32_t lba, uint32_t offset, uint8_t *buffer,
+                                           uint32_t size)
+{
+  if (!formatted_ || !buffer || lba >= blockCount_)
+  {
+    return -1;
+  }
+  const uint64_t address = (static_cast<uint64_t>(lba) * kFirmwareDiskSectorSize) + offset;
+  const uint64_t ramBytes = static_cast<uint64_t>(ramSectors_) * kFirmwareDiskSectorSize;
+
+  uint32_t done = 0;
+  if (address < ramBytes)
+  {
+    const uint32_t chunk =
+        static_cast<uint32_t>(ramBytes - address < size ? ramBytes - address : size);
+    memcpy(storage_ + address, buffer, chunk);
+    done = chunk;
+    // The directory entry is how the host says how long the file is, and it may
+    // write it before, during or after the data.
+    checkForCompletion();
+  }
+  if (done < size)
+  {
+    if (!writeFirmwareRegion(static_cast<size_t>((address + done) - ramBytes), buffer + done,
+                             size - done))
+    {
+      return -1;
+    }
+    checkForCompletion();
+  }
+  return static_cast<int32_t>(size);
+}
+
+size_t EspUsbDeviceMscFirmwareDisk::announcedImageSize() const
+{
+  const uint32_t scratchClusters = scratchSectors_ / sectorsPerCluster_;
+  for (uint16_t i = 0; i < rootEntryCount_; i++)
+  {
+    const uint8_t *entry = rootEntry(i);
+    if (entry[0] == 0x00)
+    {
+      break; // no entry has ever been used past here
+    }
+    if (entry[0] == 0xe5 || (entry[11] & 0x08) != 0 || (entry[11] & 0x10) != 0)
+    {
+      continue; // deleted, volume label, or directory
+    }
+    const uint16_t firstCluster = firmwareDiskRead16(entry + 26);
+    if (firstCluster < 2 || firstCluster - 2 < scratchClusters)
+    {
+      continue; // lives in the scratch area, so it is not the image
+    }
+    const uint32_t size = firmwareDiskRead32(entry + 28);
+    if (size > 0)
+    {
+      return size;
+    }
+  }
+  return 0;
+}
+
+void EspUsbDeviceMscFirmwareDisk::checkForCompletion()
+{
+  // UF2 knows exactly when it is finished - the header says how many blocks
+  // there are - so the directory-entry heuristic is the raw path's alone.
+  if (!updating_ || format_ != ImageFormat::Raw)
+  {
+    return;
+  }
+  const size_t announced = announcedImageSize();
+  if (announced == 0 || firmware_.written() < announced)
+  {
+    return;
+  }
+  commit();
+}
+
+void EspUsbDeviceMscFirmwareDisk::failUpdate(esp_err_t error)
+{
+  firmware_.abort();
+  updating_ = false;
+  imageStartSector_ = 0;
+  format_ = ImageFormat::Unknown;
+  releaseUf2State();
+  if (errorCallback_)
+  {
+    errorCallback_(error);
+  }
+}
+
+bool EspUsbDeviceMscFirmwareDisk::commit()
+{
+  if (!updating_)
+  {
+    return false;
+  }
+  updating_ = false;
+  imageStartSector_ = 0;
+  format_ = ImageFormat::Unknown;
+  releaseUf2State();
+
+  if (!firmware_.end())
+  {
+    if (errorCallback_)
+    {
+      errorCallback_(firmware_.lastError());
+    }
+    return false;
+  }
+  if (completeCallback_ && !completeCallback_())
+  {
+    EspUsbDeviceFirmwareUpdate::cancelPendingBoot();
+    return false;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (restartWhenComplete_)
+  {
+    // Long enough for the host to finish the command that carried the last
+    // block, short enough that the new firmware is up before anyone wonders.
+    espUsbDeviceScheduleRestart(nullptr, 500, false);
+  }
+#endif
+  return true;
+}
+
+bool EspUsbDeviceMscFirmwareDisk::handleStartStop(uint8_t powerCondition, bool start,
+                                                  bool loadEject)
+{
+  (void)powerCondition;
+  (void)loadEject;
+  if (!start)
+  {
+    // Ejecting is the second way an update finishes, and the only one when the
+    // host never wrote a directory entry this code could read.
+    if (updating_)
+    {
+      commit();
+    }
+    if (ejectCallback_)
+    {
+      ejectCallback_();
+    }
+  }
+  return true;
+}
+
+// --- DFU -------------------------------------------------------------------
+
+EspUsbDeviceDfu::EspUsbDeviceDfu(EspUsbDevice &device, EspUsbDeviceDfuMode mode,
+                                 const char *name)
+    : EspUsbDeviceClass(device), mode_(mode), name_(name)
+{
+}
+
+EspUsbDeviceDfu::~EspUsbDeviceDfu()
+{
+  end();
+}
+
+bool EspUsbDeviceDfu::begin()
+{
+  if (g_activeDfu && g_activeDfu != this)
+  {
+    // One DFU function per device. A second one would claim the same class
+    // driver, and the host would have two interfaces fighting over one state
+    // machine.
+    return false;
+  }
+  g_activeDfu = this;
+  return true;
+}
+
+void EspUsbDeviceDfu::end()
+{
+  if (downloadOpen_)
+  {
+    firmware_.abort();
+    downloadOpen_ = false;
+  }
+  if (g_activeDfu == this)
+  {
+    g_activeDfu = nullptr;
+  }
+}
+
+void EspUsbDeviceDfu::assignFunctionIds(uint8_t instance, uint8_t stringIndex)
+{
+  (void)instance;
+  stringIndex_ = stringIndex;
+}
+
+uint16_t EspUsbDeviceDfu::transferSize()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  return static_cast<uint16_t>(CFG_TUD_DFU_XFER_BUFSIZE);
+#else
+  return 1024;
+#endif
+}
+
+uint16_t EspUsbDeviceDfu::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber,
+                                                  uint8_t endpointNumber, uint16_t endpointSize)
+{
+  (void)endpointNumber;
+  (void)endpointSize;
+  if (!dst)
+  {
+    return 0;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (mode_ == EspUsbDeviceDfuMode::Runtime)
+  {
+    // bitWillDetach: this device restarts itself when it receives DETACH, so
+    // the host must not issue the USB reset the standard otherwise expects it
+    // to. The detach timeout is how long the host should wait for the device to
+    // go away before giving up.
+    const uint8_t descriptor[] = {
+        TUD_DFU_RT_DESCRIPTOR(interfaceNumber, stringIndex_,
+                              DFU_ATTR_CAN_DOWNLOAD | DFU_ATTR_WILL_DETACH,
+                              1000, transferSize()),
+    };
+    memcpy(dst, descriptor, sizeof(descriptor));
+    return sizeof(descriptor);
+  }
+
+  // Not manifestation tolerant: once the image is written this device restarts
+  // into it, so the host should expect the device to disappear rather than
+  // return to dfuIDLE. One alternate setting, which is the spare OTA partition.
+  const uint8_t descriptor[] = {
+      TUD_DFU_DESCRIPTOR(interfaceNumber, 1, stringIndex_,
+                         DFU_ATTR_CAN_DOWNLOAD, 1000, transferSize()),
+  };
+  memcpy(dst, descriptor, sizeof(descriptor));
+  return sizeof(descriptor);
+#else
+  (void)interfaceNumber;
+  return 0;
+#endif
+}
+
+void EspUsbDeviceDfu::onDetach(DetachCallback callback)
+{
+  detachCallback_ = callback;
+}
+
+void EspUsbDeviceDfu::onProgress(ProgressCallback callback)
+{
+  progressCallback_ = callback;
+}
+
+void EspUsbDeviceDfu::onComplete(CompleteCallback callback)
+{
+  completeCallback_ = callback;
+}
+
+void EspUsbDeviceDfu::onError(ErrorCallback callback)
+{
+  errorCallback_ = callback;
+}
+
+void EspUsbDeviceDfu::restartWhenComplete(bool enable)
+{
+  restartWhenComplete_ = enable;
+}
+
+size_t EspUsbDeviceDfu::written() const
+{
+  return firmware_.written();
+}
+
+EspUsbDeviceFirmwareUpdate &EspUsbDeviceDfu::firmware()
+{
+  return firmware_;
+}
+
+uint32_t EspUsbDeviceDfu::pollTimeout(uint8_t state) const
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // bwPollTimeout: how long the host waits before asking for status again.
+  //
+  // Both operations are synchronous here and both run on the usbd task, so the
+  // host physically cannot be served until they finish - which means these
+  // numbers cost latency and buy nothing but politeness. Keep the per-block one
+  // at one millisecond: at a thousand blocks, ten would add ten seconds to
+  // every update. Manifestation reads and hashes the whole written image once,
+  // so it gets a real figure.
+  if (state == DFU_MANIFEST)
+  {
+    return 250;
+  }
+#else
+  (void)state;
+#endif
+  return 1;
+}
+
+void EspUsbDeviceDfu::handleDetach()
+{
+  if (detachCallback_)
+  {
+    detachCallback_();
+    return;
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  // No callback means the default, which is to do what the host just asked for:
+  // leave the application and come up somewhere an image can be downloaded.
+  espUsbDeviceScheduleRestart(&device_, 100, true);
+#endif
+}
+
+void EspUsbDeviceDfu::failDownload(uint8_t status)
+{
+  firmware_.abort();
+  downloadOpen_ = false;
+  if (errorCallback_)
+  {
+    errorCallback_(status);
+  }
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  tud_dfu_finish_flashing(status);
+#endif
+}
+
+void EspUsbDeviceDfu::handleDownload(uint16_t blockNumber, const uint8_t *data, uint16_t length)
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (mode_ != EspUsbDeviceDfuMode::Download)
+  {
+    tud_dfu_finish_flashing(DFU_STATUS_ERR_TARGET);
+    return;
+  }
+
+  if (!downloadOpen_)
+  {
+    // Block 0 opens the update. DFU 1.1 never tells the device how long the
+    // image is, so begin() is given no size and the partition is the only bound
+    // write() has.
+    if (blockNumber != 0)
+    {
+      // Resuming mid-image is not something this can do: the partition would
+      // hold whatever the previous attempt left.
+      failDownload(DFU_STATUS_ERR_NOTDONE);
+      return;
+    }
+    if (!firmware_.begin())
+    {
+      failDownload(DFU_STATUS_ERR_TARGET);
+      return;
+    }
+    downloadOpen_ = true;
+  }
+
+  if (!firmware_.write(data, length))
+  {
+    failDownload(DFU_STATUS_ERR_WRITE);
+    return;
+  }
+  if (progressCallback_)
+  {
+    progressCallback_(firmware_.written());
+  }
+  tud_dfu_finish_flashing(DFU_STATUS_OK);
+#else
+  (void)blockNumber;
+  (void)data;
+  (void)length;
+#endif
+}
+
+void EspUsbDeviceDfu::handleManifest()
+{
+#if ESP_USB_DEVICE_HAS_TINYUSB
+  if (!downloadOpen_)
+  {
+    failDownload(DFU_STATUS_ERR_NOTDONE);
+    return;
+  }
+  downloadOpen_ = false;
+
+  if (!firmware_.end())
+  {
+    if (errorCallback_)
+    {
+      errorCallback_(DFU_STATUS_ERR_VERIFY);
+    }
+    tud_dfu_finish_flashing(DFU_STATUS_ERR_VERIFY);
+    return;
+  }
+  if (completeCallback_ && !completeCallback_())
+  {
+    // The sketch refused the image after it verified. end() has already moved
+    // the boot partition, so put it back before telling the host no.
+    EspUsbDeviceFirmwareUpdate::cancelPendingBoot();
+    if (errorCallback_)
+    {
+      errorCallback_(DFU_STATUS_ERR_FIRMWARE);
+    }
+    tud_dfu_finish_flashing(DFU_STATUS_ERR_FIRMWARE);
+    return;
+  }
+
+  tud_dfu_finish_flashing(DFU_STATUS_OK);
+  if (restartWhenComplete_)
+  {
+    // Long enough for the host's last GETSTATUS to be answered - it is the one
+    // that tells dfu-util the image was accepted - and short enough that the
+    // new firmware is up before anyone wonders.
+    espUsbDeviceScheduleRestart(&device_, 500, false);
+  }
+#endif
+}
+
+void EspUsbDeviceDfu::handleAbort()
+{
+  if (downloadOpen_)
+  {
+    firmware_.abort();
+    downloadOpen_ = false;
+  }
+}
+
+void EspUsbDeviceDfu::onBusDetached()
+{
+  // A download that loses the bus is a download that will not finish. Drop the
+  // OTA handle rather than leaving it open across a re-enumeration, where the
+  // host would start again from block 0 and begin() would find the previous
+  // handle still held.
+  handleAbort();
+}
+
+#if ESP_USB_DEVICE_HAS_TINYUSB
+extern "C" void tud_dfu_runtime_reboot_to_dfu_cb(void)
+{
+  if (g_activeDfu)
+  {
+    g_activeDfu->handleDetach();
+  }
+}
+
+extern "C" uint32_t tud_dfu_get_timeout_cb(uint8_t alt, uint8_t state)
+{
+  (void)alt;
+  return g_activeDfu ? g_activeDfu->pollTimeout(state) : 1;
+}
+
+extern "C" void tud_dfu_download_cb(uint8_t alt, uint16_t blockNumber,
+                                    uint8_t const *data, uint16_t length)
+{
+  (void)alt;
+  if (g_activeDfu)
+  {
+    g_activeDfu->handleDownload(blockNumber, data, length);
+    return;
+  }
+  tud_dfu_finish_flashing(DFU_STATUS_ERR_TARGET);
+}
+
+extern "C" void tud_dfu_manifest_cb(uint8_t alt)
+{
+  (void)alt;
+  if (g_activeDfu)
+  {
+    g_activeDfu->handleManifest();
+    return;
+  }
+  tud_dfu_finish_flashing(DFU_STATUS_ERR_TARGET);
+}
+
+extern "C" void tud_dfu_abort_cb(uint8_t alt)
+{
+  (void)alt;
+  if (g_activeDfu)
+  {
+    g_activeDfu->handleAbort();
+  }
+}
+#endif
+
+EspUsbDeviceHidKeyboard::EspUsbDeviceHidKeyboard(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+bool EspUsbDeviceHidKeyboard::begin()
+{
+  nkroState_.clear();
+  report_ = EspUsbDeviceBootKeyboardReport();
+  ledsRaw_.store(0, std::memory_order_relaxed);
+  busChangePending_.store(false, std::memory_order_relaxed);
+  return true;
+}
+
+bool EspUsbDeviceHidKeyboard::sendReport(const EspUsbDeviceBootKeyboardReport &report, uint32_t timeoutMs)
+{
+  applyPendingBusChange();
+  if (nkroEnabled_)
+  {
+    // Adopt the supplied 6-key report as the full held-key state, then emit it in
+    // whatever format the active protocol needs (NKRO bitmap or boot fallback).
+    nkroState_.clear();
+    nkroState_.modifiers = report.modifiers;
+    for (size_t i = 0; i < sizeof(report.keys); i++)
+    {
+      if (report.keys[i])
+      {
+        nkroState_.press(report.keys[i]);
+      }
+    }
+    return sendNkroReport(timeoutMs);
+  }
+  report_ = report;
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), device_.classReportId(hidInstance_), &report_, sizeof(report_), timeoutMs);
+}
+
+bool EspUsbDeviceHidKeyboard::sendReport(const EspUsbDeviceNkroKeyboardReport &report, uint32_t timeoutMs)
+{
+  applyPendingBusChange();
+  // Without enableNkro() the interface only ever declared the 6-key boot report,
+  // so this state cannot go out as-is. Fail instead of folding it down: unlike
+  // the boot-protocol path below, this is a setup mistake in the sketch, and
+  // quietly dropping the seventh key onwards would never be noticed. Callers can
+  // check nkroEnabled() beforehand.
+  if (!nkroEnabled_)
+  {
+    return false;
+  }
+  // Replace the incremental state so a later pressUsage() / releaseUsage() sees
+  // what the host was actually told.
+  nkroState_ = report;
+  return sendNkroReport(timeoutMs);
+}
+
+bool EspUsbDeviceHidKeyboard::pressUsage(uint8_t usage, uint8_t modifiers, uint32_t holdMs)
+{
+  (void)holdMs;
+  applyPendingBusChange();
+  if (nkroEnabled_)
+  {
+    // press() rejects usages this report cannot carry (above 0xDF and not a
+    // modifier); surface that instead of dropping the key silently.
+    if (!nkroState_.press(usage))
+    {
+      return false;
+    }
+    nkroState_.modifiers |= modifiers;
+    return sendNkroReport();
+  }
+  report_.modifiers = modifiers;
+  report_.keys[0] = usage;
+  return sendReport(report_);
+}
+
+bool EspUsbDeviceHidKeyboard::pressKey(char key, uint32_t timeoutMs)
+{
+  uint8_t usage = 0;
+  uint8_t modifiers = 0;
+  if (!asciiToUsage(key, usage, modifiers))
+  {
+    return false;
+  }
+  report_.modifiers = modifiers;
+  report_.keys[0] = usage;
+  return sendReport(report_, timeoutMs);
+}
+
+bool EspUsbDeviceHidKeyboard::tapUsage(uint8_t usage, uint8_t modifiers, uint32_t holdMs)
+{
+  if (!pressUsage(usage, modifiers))
+  {
+    return false;
+  }
+  delay(holdMs);
+  return releaseAll();
+}
+
+bool EspUsbDeviceHidKeyboard::tapKey(char key, uint32_t holdMs)
+{
+  uint8_t usage = 0;
+  uint8_t modifiers = 0;
+  if (!asciiToUsage(key, usage, modifiers))
+  {
+    return false;
+  }
+  return tapUsage(usage, modifiers, holdMs);
+}
+
+bool EspUsbDeviceHidKeyboard::write(const char *text, uint32_t interKeyDelayMs)
+{
+  if (!text)
+  {
+    return false;
+  }
+  for (const char *p = text; *p; p++)
+  {
+    if (!tapKey(*p))
+    {
+      return false;
+    }
+    if (interKeyDelayMs > 0)
+    {
+      delay(interKeyDelayMs);
+    }
+  }
+  return true;
+}
+
+bool EspUsbDeviceHidKeyboard::releaseUsage(uint8_t usage, uint32_t timeoutMs)
+{
+  applyPendingBusChange();
+  if (nkroEnabled_)
+  {
+    // release() clears modifier usages from `modifiers` too, so releasing a
+    // modifier actually lets go of it instead of leaving it held until
+    // releaseAll().
+    if (!nkroState_.release(usage))
+    {
+      return false;
+    }
+    return sendNkroReport(timeoutMs);
+  }
+  for (size_t i = 0; i < sizeof(report_.keys); i++)
+  {
+    if (report_.keys[i] == usage)
+    {
+      report_.keys[i] = 0;
+    }
+  }
+  return sendReport(report_, timeoutMs);
+}
+
+bool EspUsbDeviceHidKeyboard::releaseAll(uint32_t timeoutMs)
+{
+  applyPendingBusChange();
+  if (nkroEnabled_)
+  {
+    nkroState_.clear();
+    return sendNkroReport(timeoutMs);
+  }
+  report_ = EspUsbDeviceBootKeyboardReport();
+  return sendReport(report_, timeoutMs);
+}
+
+void EspUsbDeviceHidKeyboard::setLayout(EspUsbDeviceKeyboardLayout layout)
+{
+  layout_ = layout;
+}
+
+EspUsbDeviceKeyboardLayout EspUsbDeviceHidKeyboard::layout() const
+{
+  return layout_;
+}
+
+void EspUsbDeviceHidKeyboard::onOutputReport(OutputReportCallback callback)
+{
+  outputCallback_ = callback;
+}
+
+void EspUsbDeviceHidKeyboard::onProtocol(ProtocolCallback callback)
+{
+  protocolCallback_ = callback;
+}
+
+uint8_t EspUsbDeviceHidKeyboard::protocol() const
+{
+  return protocol_;
+}
+
+uint16_t EspUsbDeviceHidKeyboard::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  // NKRO needs a packet big enough for its bitmap report; honour that over the
+  // caller-supplied default when set.
+  const uint16_t hint = hidInEndpointSize();
+  if (hint > endpointSize)
+  {
+    endpointSize = hint;
+  }
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         endpointSize,
+                                         USB_SUBCLASS_BOOT,
+                                         USB_PROTOCOL_KEYBOARD,
+                                         hidReportDescriptorLength(),
+                                         true);
+}
+
+const uint8_t *EspUsbDeviceHidKeyboard::hidReportDescriptor() const
+{
+  return nkroEnabled_ ? NKRO_KEYBOARD_REPORT_DESCRIPTOR : KEYBOARD_REPORT_DESCRIPTOR;
+}
+
+uint16_t EspUsbDeviceHidKeyboard::hidReportDescriptorLength() const
+{
+  return nkroEnabled_ ? sizeof(NKRO_KEYBOARD_REPORT_DESCRIPTOR) : sizeof(KEYBOARD_REPORT_DESCRIPTOR);
+}
+
+uint16_t EspUsbDeviceHidKeyboard::hidInEndpointSize() const
+{
+  // 1 modifier byte + 28 bitmap bytes = 29 (+1 report-ID byte in composite mode).
+  // Round up to 32; well within CFG_TUD_HID_EP_BUFSIZE (64).
+  return nkroEnabled_ ? 32 : 0;
+}
+
+void EspUsbDeviceHidKeyboard::enableNkro(bool enable)
+{
+  nkroEnabled_ = enable;
+  if (!enable)
+  {
+    // Keep heldState() honest: the NKRO state means nothing in 6KRO mode, where
+    // report_ carries the held keys instead.
+    nkroState_.clear();
+  }
+}
+
+bool EspUsbDeviceHidKeyboard::nkroEnabled() const
+{
+  return nkroEnabled_;
+}
+
+bool EspUsbDeviceHidKeyboard::sendNkroReport(uint32_t timeoutMs)
+{
+  const uint8_t runtime = device_.classRuntimeInstance(hidInstance_);
+  const uint8_t reportId = device_.classReportId(hidInstance_);
+  // Boot protocol (BIOS) ignores the report descriptor and requires the fixed
+  // 6-key boot report, so fold the bitmap down to 6 held usages. These are the
+  // six lowest usage numbers, not the six pressed most recently, and no
+  // ErrorRollOver (0x01) is reported when more are held: identifying a 7-key
+  // chord in a BIOS is not a real requirement, and the host asked for boot
+  // protocol itself, so sending something valid beats failing.
+  if (protocol_ == 0)
+  {
+    EspUsbDeviceBootKeyboardReport boot;
+    boot.modifiers = nkroState_.modifiers;
+    size_t slot = 0;
+    for (uint16_t usage = 0; usage <= EspUsbDeviceNkroKeyboardReport::MaxBitmapUsage && slot < sizeof(boot.keys); usage++)
+    {
+      if (nkroState_.isDown(static_cast<uint8_t>(usage)))
+      {
+        boot.keys[slot++] = static_cast<uint8_t>(usage);
+      }
+    }
+    report_ = boot;
+    return device_.sendHidReport(runtime, reportId, &report_, sizeof(report_), timeoutMs);
+  }
+  uint8_t buffer[1 + EspUsbDeviceNkroKeyboardReport::BitmapSize];
+  buffer[0] = nkroState_.modifiers;
+  memcpy(&buffer[1], nkroState_.bitmap, sizeof(nkroState_.bitmap));
+  return device_.sendHidReport(runtime, reportId, buffer, sizeof(buffer), timeoutMs);
+}
+
+const EspUsbDeviceNkroKeyboardReport &EspUsbDeviceHidKeyboard::heldState() const
+{
+  applyPendingBusChange();
+  return nkroState_;
+}
+
+// Expand a raw LED byte into the public report. Both the callback path and
+// ledState() go through EspUsbDeviceHidKeyboardOutputReport::setLeds(), so the
+// two can never disagree about what a bit means.
+static EspUsbDeviceHidKeyboardOutputReport makeKeyboardOutputReport(uint8_t leds)
+{
+  EspUsbDeviceHidKeyboardOutputReport report;
+  report.setLeds(leds);
+  return report;
+}
+
+void EspUsbDeviceHidKeyboard::onHidSetReport(uint8_t reportId, uint8_t reportType, const uint8_t *data, uint16_t length)
+{
+  (void)reportId;
+  if (reportType != ESP_USB_DEVICE_HID_REPORT_TYPE_OUTPUT || !data || length < 1)
+  {
+    return;
+  }
+  // Record the raw byte before dispatching, so ledState() is readable even when
+  // nothing took the callback slot - or when the callback belongs to an
+  // integration layer and the sketch also wants to light an external LED. One
+  // atomic store, so a reader on another task cannot see it half-applied.
+  ledsRaw_.store(data[0], std::memory_order_relaxed);
+  if (!outputCallback_)
+  {
+    return;
+  }
+  outputCallback_(makeKeyboardOutputReport(data[0]));
+}
+
+EspUsbDeviceHidKeyboardOutputReport EspUsbDeviceHidKeyboard::ledState() const
+{
+  // Built from a single load, so the flags always describe one host report.
+  return makeKeyboardOutputReport(ledsRaw_.load(std::memory_order_relaxed));
+}
+
+// Both hooks run on the TinyUSB device task.
+void EspUsbDeviceHidKeyboard::onBusAttached()
+{
+  ledsRaw_.store(0, std::memory_order_relaxed);
+  busChangePending_.store(true, std::memory_order_relaxed);
+}
+
+void EspUsbDeviceHidKeyboard::onBusDetached()
+{
+  ledsRaw_.store(0, std::memory_order_relaxed);
+  busChangePending_.store(true, std::memory_order_relaxed);
+}
+
+void EspUsbDeviceHidKeyboard::applyPendingBusChange() const
+{
+  if (!busChangePending_.exchange(false, std::memory_order_relaxed))
+  {
+    return;
+  }
+  // The host knows nothing is held, so the previous session's keys must not be
+  // read back. This is not cosmetic: a state-based caller is told to suppress
+  // duplicate sends by comparing against heldState() (see the NKRO section of
+  // docs/DESIGN_NOTES.ja.md). If a chord survived a replug, that comparison would
+  // say "same as last time, skip the send" while the host holds nothing - a stuck
+  // key that never resolves. EspBle clears its equivalent state on disconnect for
+  // the same reason.
+  nkroState_.clear();
+}
+
+void EspUsbDeviceHidKeyboard::onHidSetProtocol(uint8_t protocol)
+{
+  protocol_ = protocol;
+  if (!protocolCallback_)
+  {
+    return;
+  }
+  EspUsbDeviceHidProtocolEvent event;
+  event.instance = hidInstance_;
+  event.protocol = protocol_;
+  protocolCallback_(event);
+}
+
+namespace
+{
+// Reverse lookup from an 8-bit character to a HID usage + modifier for the given
+// layout. Pure and layout-parameterized (rather than a member using layout_) so
+// the host unit test in tests/unit/keymap can exercise the real code without an
+// Arduino build. Kept in sync, by construction, with EspUsbHost's forward
+// keymap tables (src/keymap/*.h are byte-identical between the two libraries).
+//
+// The tables are uint16_t[N][4]: columns [0]=unshifted, [1]=Shift, [2]=AltGr
+// (Right Alt), [3]=AltGr+Shift, holding Unicode code points. Latin-1 characters
+// occupy the first 256 code points, so an 8-bit input can match columns whose
+// value is < 0x100; higher code points (e.g. EUR = U+20AC) are simply never
+// matched by a single-byte input (see KEYMAP_FIX_REQUEST.ja.md §5).
+bool espUsbDeviceAsciiToUsage(char key, EspUsbDeviceKeyboardLayout layout, uint8_t &usage, uint8_t &modifiers)
+{
+  const uint16_t(*table)[4] = KEYCODE_TO_UNICODE_EN_US;
+  size_t tableSize = 128;
+  switch (layout)
+  {
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_DA_DK:
+    table = KEYCODE_TO_UNICODE_DA_DK;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_DE_DE:
+    table = KEYCODE_TO_UNICODE_DE_DE;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_EN_GB:
+    table = KEYCODE_TO_UNICODE_EN_GB;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_ES_ES:
+    table = KEYCODE_TO_UNICODE_ES_ES;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_FI_FI:
+    table = KEYCODE_TO_UNICODE_FI_FI;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_FR_CH:
+    table = KEYCODE_TO_UNICODE_FR_CH;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_FR_FR:
+    table = KEYCODE_TO_UNICODE_FR_FR;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_HU_HU:
+    table = KEYCODE_TO_UNICODE_HU_HU;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_IT_IT:
+    table = KEYCODE_TO_UNICODE_IT_IT;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_JA_JP:
+    table = KEYCODE_TO_UNICODE_JA_JP;
+    tableSize = 0x90;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_NB_NO:
+    table = KEYCODE_TO_UNICODE_NB_NO;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_NL_NL:
+    table = KEYCODE_TO_UNICODE_NL_NL;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_PT_BR:
+    table = KEYCODE_TO_UNICODE_PT_BR;
+    // pt_BR carries International1 (/ and ?) at 0x87 and the numpad comma at
+    // 0x85, so the reverse lookup must scan the extended 0x90-entry table.
+    tableSize = 0x90;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_PT_PT:
+    table = KEYCODE_TO_UNICODE_PT_PT;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_SV_SE:
+    table = KEYCODE_TO_UNICODE_SV_SE;
+    break;
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_KO_KR:
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_ZH_CN:
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_ZH_TW:
+  case ESP_USB_DEVICE_KEYBOARD_LAYOUT_EN_US:
+  default:
+    break;
+  }
+
+  usage = 0;
+  modifiers = 0;
+  const uint16_t c = static_cast<uint8_t>(key);
+
+  // Pass 1: base / Shift. This preserves the pre-AltGr behaviour exactly (same
+  // per-keycode base-then-Shift precedence), so existing single-level layouts
+  // are unaffected.
+  for (size_t keycode = 0; keycode < tableSize; keycode++)
+  {
+    if (table[keycode][0] == c)
+    {
+      usage = static_cast<uint8_t>(keycode);
+      return true;
+    }
+    if (table[keycode][1] == c)
+    {
+      usage = static_cast<uint8_t>(keycode);
+      modifiers = ESP_USB_DEVICE_MOD_LEFT_SHIFT;
+      return true;
+    }
+  }
+
+  // Pass 2: AltGr (Right Alt) fallback, only for characters not reachable on
+  // the base / Shift levels. This is what makes e.g. '@' typeable on de_DE
+  // (AltGr+Q) or '/' on pt_BR without breaking any base-level mapping.
+  for (size_t keycode = 0; keycode < tableSize; keycode++)
+  {
+    if (table[keycode][2] == c)
+    {
+      usage = static_cast<uint8_t>(keycode);
+      modifiers = ESP_USB_DEVICE_MOD_RIGHT_ALT;
+      return true;
+    }
+    if (table[keycode][3] == c)
+    {
+      usage = static_cast<uint8_t>(keycode);
+      modifiers = ESP_USB_DEVICE_MOD_RIGHT_ALT | ESP_USB_DEVICE_MOD_LEFT_SHIFT;
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
+bool EspUsbDeviceHidKeyboard::asciiToUsage(char key, uint8_t &usage, uint8_t &modifiers) const
+{
+  return espUsbDeviceAsciiToUsage(key, layout_, usage, modifiers);
+}
+
+EspUsbDeviceHidMouse::EspUsbDeviceHidMouse(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+bool EspUsbDeviceHidMouse::begin()
+{
+  return true;
+}
+
+bool EspUsbDeviceHidMouse::sendReport(const EspUsbDeviceBootMouseReport &report, uint32_t timeoutMs)
+{
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), device_.classReportId(hidInstance_), &report, sizeof(report), timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::sendState(uint32_t timeoutMs)
+{
+  EspUsbDeviceBootMouseReport report;
+  report.buttons = buttons_;
+  return sendReport(report, timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::move(int8_t x, int8_t y, int8_t wheel, uint8_t buttons, uint32_t timeoutMs)
+{
+  buttons_ = buttons;
+  EspUsbDeviceBootMouseReport report;
+  report.buttons = buttons_;
+  report.x = x;
+  report.y = y;
+  report.wheel = wheel;
+  return sendReport(report, timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::wheel(int8_t wheel, uint32_t timeoutMs)
+{
+  return move(0, 0, wheel, buttons_, timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::press(uint8_t buttons, uint32_t timeoutMs)
+{
+  buttons_ |= buttons;
+  return sendState(timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::release(uint8_t buttons, uint32_t timeoutMs)
+{
+  buttons_ &= static_cast<uint8_t>(~buttons);
+  return sendState(timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::releaseAll(uint32_t timeoutMs)
+{
+  buttons_ = 0;
+  return sendState(timeoutMs);
+}
+
+bool EspUsbDeviceHidMouse::click(uint8_t button, uint32_t holdMs)
+{
+  if (!press(button))
+  {
+    return false;
+  }
+  delay(holdMs);
+  return release(button);
+}
+
+uint8_t EspUsbDeviceHidMouse::buttons() const
+{
+  return buttons_;
+}
+
+uint16_t EspUsbDeviceHidMouse::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         endpointSize,
+                                         USB_SUBCLASS_BOOT,
+                                         USB_PROTOCOL_MOUSE,
+                                         hidReportDescriptorLength(),
+                                         false);
+}
+
+const uint8_t *EspUsbDeviceHidMouse::hidReportDescriptor() const
+{
+  return MOUSE_REPORT_DESCRIPTOR;
+}
+
+uint16_t EspUsbDeviceHidMouse::hidReportDescriptorLength() const
+{
+  return sizeof(MOUSE_REPORT_DESCRIPTOR);
+}
+
+EspUsbDeviceHidCustom::EspUsbDeviceHidCustom(EspUsbDevice &device, const uint8_t *reportDescriptor, uint16_t reportDescriptorLength, uint16_t inputReportSize)
+    : EspUsbDeviceClass(device), reportDescriptor_(reportDescriptor), reportDescriptorLength_(reportDescriptorLength), inputReportSize_(inputReportSize)
+{
+}
+
+bool EspUsbDeviceHidCustom::begin()
+{
+  return reportDescriptor_ && reportDescriptorLength_ > 0 && inputReportSize_ > 0;
+}
+
+bool EspUsbDeviceHidCustom::sendReport(const void *data, size_t length, uint8_t reportId, uint32_t timeoutMs)
+{
+  if (!data || length == 0)
+  {
+    return false;
+  }
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), reportId, data, length, timeoutMs);
+}
+
+uint16_t EspUsbDeviceHidCustom::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  const uint16_t mps = inputReportSize_ < endpointSize ? inputReportSize_ : endpointSize;
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         mps,
+                                         0,
+                                         0,
+                                         reportDescriptorLength_,
+                                         false);
+}
+
+const uint8_t *EspUsbDeviceHidCustom::hidReportDescriptor() const
+{
+  return reportDescriptor_;
+}
+
+uint16_t EspUsbDeviceHidCustom::hidReportDescriptorLength() const
+{
+  return reportDescriptorLength_;
+}
+
+EspUsbDeviceHidVendor::EspUsbDeviceHidVendor(EspUsbDevice &device, uint16_t reportSize)
+    : EspUsbDeviceClass(device), reportSize_(reportSize)
+{
+  buildReportDescriptor();
+}
+
+uint16_t EspUsbDeviceHidVendor::maxReportSize()
+{
+  // tud_hid_n_report() puts the report ID in byte 0 of the endpoint buffer and
+  // copies the payload behind it, so one byte of the packet is never payload.
+  return static_cast<uint16_t>(ESP_USB_DEVICE_HID_EP_BUFSIZE - 1);
+}
+
+void EspUsbDeviceHidVendor::buildReportDescriptor()
+{
+  uint8_t *dst = reportDescriptor_;
+  const uint8_t head[] = {
+      0x06, 0x00, 0xff, // Usage Page (Vendor Defined 0xff00)
+      0x09, 0x01,       // Usage (1)
+      0xa1, 0x01,       // Collection (Application)
+      0x85, ESP_USB_DEVICE_HID_REPORT_ID_VENDOR, //   Report ID
+      0x15, 0x00,       //   Logical Minimum (0)
+      0x26, 0xff, 0x00, //   Logical Maximum (255)
+      0x75, 0x08,       //   Report Size (8 bits)
+  };
+  memcpy(dst, head, sizeof(head));
+  size_t offset = sizeof(head);
+  if (reportSize_ > 0xff)
+  {
+    // Report Count with a two-byte payload. Anything above 255 needs it, and a
+    // high-speed interrupt endpoint makes those sizes reachable.
+    dst[offset++] = 0x96;
+    dst[offset++] = static_cast<uint8_t>(reportSize_ & 0xff);
+    dst[offset++] = static_cast<uint8_t>((reportSize_ >> 8) & 0xff);
+  }
+  else
+  {
+    dst[offset++] = 0x95;
+    dst[offset++] = static_cast<uint8_t>(reportSize_ & 0xff);
+  }
+  const uint8_t tail[] = {
+      0x09, 0x01, //   Usage (1)
+      0x81, 0x02, //   Input (Data,Var,Abs)
+      0x09, 0x01, //   Usage (1)
+      0x91, 0x02, //   Output (Data,Var,Abs)
+      0x09, 0x01, //   Usage (1)
+      0xb1, 0x02, //   Feature (Data,Var,Abs)
+      0xc0,       // End Collection
+  };
+  memcpy(dst + offset, tail, sizeof(tail));
+  offset += sizeof(tail);
+  reportDescriptorLength_ = static_cast<uint8_t>(offset);
+}
+
+bool EspUsbDeviceHidVendor::begin()
+{
+  // The old ceiling was a literal 63, which is maxReportSize() for a 64-byte
+  // endpoint buffer and nothing more: at high speed the endpoint may be up to
+  // 1024 bytes, and refusing anything past 63 there capped the class at an
+  // eighth of what the bus carries for no reason on the device side.
+  return reportSize_ > 0 && reportSize_ <= maxReportSize();
+}
+
+bool EspUsbDeviceHidVendor::sendInput(const void *data, size_t length, uint32_t timeoutMs)
+{
+  if (!data || length == 0)
+  {
+    return false;
+  }
+  if (length > reportSize_)
+  {
+    length = reportSize_;
+  }
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), ESP_USB_DEVICE_HID_REPORT_ID_VENDOR, data, length, timeoutMs);
+}
+
+void EspUsbDeviceHidVendor::onOutputReport(ReportCallback callback)
+{
+  outputCallback_ = callback;
+}
+
+void EspUsbDeviceHidVendor::onFeatureReport(ReportCallback callback)
+{
+  featureCallback_ = callback;
+}
+
+uint16_t EspUsbDeviceHidVendor::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  // This writes the full-speed configuration, where 64 is the hard ceiling.
+  // buildDescriptors() raises the high-speed copy to hidHighSpeedEndpointSize()
+  // afterwards; a report larger than one full-speed packet is still delivered
+  // there, just split over several packets of the same transfer.
+  uint16_t mps = static_cast<uint16_t>(reportSize_ + 1);
+  if (mps < endpointSize)
+  {
+    mps = endpointSize;
+  }
+  if (mps > ESP_USB_DEVICE_FS_INTERRUPT_MAX_PACKET)
+  {
+    mps = ESP_USB_DEVICE_FS_INTERRUPT_MAX_PACKET;
+  }
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         mps,
+                                         0,
+                                         0,
+                                         hidReportDescriptorLength(),
+                                         true);
+}
+
+const uint8_t *EspUsbDeviceHidVendor::hidReportDescriptor() const
+{
+  return reportDescriptor_;
+}
+
+uint16_t EspUsbDeviceHidVendor::hidReportDescriptorLength() const
+{
+  return reportDescriptorLength_;
+}
+
+uint16_t EspUsbDeviceHidVendor::hidHighSpeedEndpointSize() const
+{
+  const uint16_t wanted = static_cast<uint16_t>(reportSize_ + 1);
+  if (wanted <= ESP_USB_DEVICE_FS_INTERRUPT_MAX_PACKET)
+  {
+    return 0; // one full-speed packet is already enough; both speeds agree
+  }
+  return wanted > ESP_USB_DEVICE_HID_EP_BUFSIZE ? ESP_USB_DEVICE_HID_EP_BUFSIZE : wanted;
+}
+
+void EspUsbDeviceHidVendor::onHidSetReport(uint8_t reportId, uint8_t reportType, const uint8_t *data, uint16_t length)
+{
+  EspUsbDeviceHidReport report;
+  report.reportId = reportId;
+  report.reportType = reportType;
+  report.data = data;
+  report.length = length;
+  if (reportType == ESP_USB_DEVICE_HID_REPORT_TYPE_OUTPUT && outputCallback_)
+  {
+    outputCallback_(report);
+  }
+  else if (reportType == ESP_USB_DEVICE_HID_REPORT_TYPE_FEATURE && featureCallback_)
+  {
+    featureCallback_(report);
+  }
+}
+
+EspUsbDeviceHidGamepad::EspUsbDeviceHidGamepad(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+bool EspUsbDeviceHidGamepad::begin()
+{
+  return true;
+}
+
+bool EspUsbDeviceHidGamepad::sendReport(const EspUsbDeviceGamepadReport &report, uint32_t timeoutMs)
+{
+  report_ = report;
+  uint8_t data[11] = {
+      static_cast<uint8_t>(report_.x),
+      static_cast<uint8_t>(report_.y),
+      static_cast<uint8_t>(report_.z),
+      static_cast<uint8_t>(report_.rz),
+      static_cast<uint8_t>(report_.rx),
+      static_cast<uint8_t>(report_.ry),
+      report_.hat,
+      static_cast<uint8_t>(report_.buttons & 0xff),
+      static_cast<uint8_t>((report_.buttons >> 8) & 0xff),
+      static_cast<uint8_t>((report_.buttons >> 16) & 0xff),
+      static_cast<uint8_t>((report_.buttons >> 24) & 0xff),
+  };
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), hidReportId(), data, sizeof(data), timeoutMs);
+}
+
+bool EspUsbDeviceHidGamepad::send(int8_t x,
+                                  int8_t y,
+                                  int8_t z,
+                                  int8_t rz,
+                                  int8_t rx,
+                                  int8_t ry,
+                                  uint8_t hat,
+                                  uint32_t buttons,
+                                  uint32_t timeoutMs)
+{
+  EspUsbDeviceGamepadReport report;
+  report.x = x;
+  report.y = y;
+  report.z = z;
+  report.rz = rz;
+  report.rx = rx;
+  report.ry = ry;
+  report.hat = hat;
+  report.buttons = buttons;
+  return sendReport(report, timeoutMs);
+}
+
+bool EspUsbDeviceHidGamepad::releaseAll(uint32_t timeoutMs)
+{
+  return sendReport(EspUsbDeviceGamepadReport(), timeoutMs);
+}
+
+uint16_t EspUsbDeviceHidGamepad::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  const uint16_t mps = endpointSize < 12 ? 12 : endpointSize;
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         mps,
+                                         0,
+                                         0,
+                                         hidReportDescriptorLength(),
+                                         false);
+}
+
+const uint8_t *EspUsbDeviceHidGamepad::hidReportDescriptor() const
+{
+  return GAMEPAD_REPORT_DESCRIPTOR;
+}
+
+uint16_t EspUsbDeviceHidGamepad::hidReportDescriptorLength() const
+{
+  return sizeof(GAMEPAD_REPORT_DESCRIPTOR);
+}
+
+EspUsbDeviceHidConsumerControl::EspUsbDeviceHidConsumerControl(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+bool EspUsbDeviceHidConsumerControl::begin()
+{
+  return true;
+}
+
+bool EspUsbDeviceHidConsumerControl::sendUsage(uint16_t usage, uint32_t timeoutMs)
+{
+  usage_ = usage;
+  uint8_t report[2] = {
+      static_cast<uint8_t>(usage & 0xff),
+      static_cast<uint8_t>((usage >> 8) & 0xff),
+  };
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), hidReportId(), report, sizeof(report), timeoutMs);
+}
+
+bool EspUsbDeviceHidConsumerControl::press(uint16_t usage, uint32_t timeoutMs)
+{
+  return sendUsage(usage, timeoutMs);
+}
+
+bool EspUsbDeviceHidConsumerControl::release(uint32_t timeoutMs)
+{
+  return sendUsage(0, timeoutMs);
+}
+
+bool EspUsbDeviceHidConsumerControl::click(uint16_t usage, uint32_t holdMs)
+{
+  if (!press(usage))
+  {
+    return false;
+  }
+  delay(holdMs);
+  return release();
+}
+
+uint16_t EspUsbDeviceHidConsumerControl::usage() const
+{
+  return usage_;
+}
+
+uint16_t EspUsbDeviceHidConsumerControl::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         endpointSize,
+                                         0,
+                                         0,
+                                         hidReportDescriptorLength(),
+                                         false);
+}
+
+const uint8_t *EspUsbDeviceHidConsumerControl::hidReportDescriptor() const
+{
+  return CONSUMER_CONTROL_REPORT_DESCRIPTOR;
+}
+
+uint16_t EspUsbDeviceHidConsumerControl::hidReportDescriptorLength() const
+{
+  return sizeof(CONSUMER_CONTROL_REPORT_DESCRIPTOR);
+}
+
+EspUsbDeviceHidSystemControl::EspUsbDeviceHidSystemControl(EspUsbDevice &device) : EspUsbDeviceClass(device)
+{
+}
+
+bool EspUsbDeviceHidSystemControl::begin()
+{
+  return true;
+}
+
+bool EspUsbDeviceHidSystemControl::sendUsage(uint8_t usage, uint32_t timeoutMs)
+{
+  usage_ = usage;
+  return device_.sendHidReport(device_.classRuntimeInstance(hidInstance_), hidReportId(), &usage_, sizeof(usage_), timeoutMs);
+}
+
+bool EspUsbDeviceHidSystemControl::press(uint8_t usage, uint32_t timeoutMs)
+{
+  return sendUsage(usage, timeoutMs);
+}
+
+bool EspUsbDeviceHidSystemControl::release(uint32_t timeoutMs)
+{
+  return sendUsage(0, timeoutMs);
+}
+
+bool EspUsbDeviceHidSystemControl::click(uint8_t usage, uint32_t holdMs)
+{
+  if (!press(usage))
+  {
+    return false;
+  }
+  delay(holdMs);
+  return release();
+}
+
+uint8_t EspUsbDeviceHidSystemControl::usage() const
+{
+  return usage_;
+}
+
+uint16_t EspUsbDeviceHidSystemControl::configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize)
+{
+  return writeHidConfigurationDescriptor(dst,
+                                         interfaceNumber,
+                                         endpointNumber,
+                                         endpointSize,
+                                         0,
+                                         0,
+                                         hidReportDescriptorLength(),
+                                         false);
+}
+
+const uint8_t *EspUsbDeviceHidSystemControl::hidReportDescriptor() const
+{
+  return SYSTEM_CONTROL_REPORT_DESCRIPTOR;
+}
+
+uint16_t EspUsbDeviceHidSystemControl::hidReportDescriptorLength() const
+{
+  return sizeof(SYSTEM_CONTROL_REPORT_DESCRIPTOR);
+}
