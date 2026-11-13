@@ -1,578 +1,440 @@
 # EspUsbDevice
 
-> 日本語版: [README.ja.md](README.ja.md)
+> 日本語: [README.ja.md](README.ja.md)
 
-EspUsbDevice is a new ESP32 Arduino USB Device library.
+EspUsbDevice is a USB Device library for ESP32 Arduino in which you state what
+the device is. Attach the Functions you need to a Device, set their capacities,
+and call `begin()`. The library runs its own USB worker, so the sketch never
+polls a USB task, and only the Functions you use are linked.
 
-The goal is not compatibility with Arduino-ESP32's `USB`, `USBHIDKeyboard`, or
-`USBHIDMouse` APIs. The goal is a better, small, explicit USB device library
-where port, speed, descriptors, endpoint packet sizes, and raw class reports are
-controlled by the sketch. Coming from those APIs? The
-[migration guide](docs/migrating-from-arduino-esp32-usb.md) maps each one.
+```cpp
+#include <EspUsbDevice.h>
 
-The first implementation targets `EspUsbHost` peer and loopback tests because
-those tests give concrete hardware coverage and expose the low-level behavior
-the library must control. Test-oriented features are the starting point, not the
-final boundary of the project.
+EspUsbDevice device;
+EspUsbDeviceCdcSerial console(device);   // a USB serial port
+EspUsbDeviceHidKeyboard keyboard(device); // and a keyboard, in one device
 
-## Requirements
+void setup() {
+  EspUsbBulkStreamConfig buffers;
+  buffers.rxCapacity = 256;
+  buffers.txCapacity = 1024;
+  console.configure(buffers);
+  if (!device.begin()) {
+    // device.lastErrorName() says why, e.g. "ESP_ERR_INVALID_SIZE"
+  }
+}
 
-Minimum Arduino-ESP32 core (board package) version:
+void loop() {
+  if (device.ready() && console.available()) {
+    const int c = console.read();
+    console.write(uint8_t(c));
+    if (c == '!') keyboard.tapKey('a');
+  }
+  delay(1);
+}
+```
 
-| Target | Minimum arduino-esp32 |
-| --- | --- |
-| ESP32-S2 / ESP32-S3 / ESP32-P4 | 3.3.9 |
+New to the library? Start with the [example workflow](docs/example-workflow.md);
+to find an example by goal, see the [example list](examples/README.md). When
+something does not work, run the bring-up check in [Info](examples/Info/) first.
 
-Older cores are not officially supported. Per-library-version build results
-across core versions are published under [`docs/`](docs/) as
-`COMPATIBILITY.<version>.md`; current-worktree runs use the stable draft name
-`COMPATIBILITY.WORKTREE.md`.
-The automatic matrix observes releases from 3.3.0 onward, but results below
-3.3.9 are informational and do not indicate official support.
+Compatibility with the Arduino-ESP32 `USB`, `USBHIDKeyboard`, `USBCDC`, `USBMSC`
+classes is not a goal. Coming from those, the
+[migration guide](docs/migrating-from-arduino-esp32-usb.md) maps one to the other.
 
 ## Supported chips and classes
 
-| Chip | Max speed | [HID](examples/Keyboard/) | [CDC serial](examples/Serial/) | [MSC](examples/MSC/) | [MIDI](examples/MIDI/) | [Audio](examples/AudioSpeaker/) | [Video](examples/VideoCamera/) | [Vendor / WebUSB](examples/USBVendor/) | [NCM network](examples/UsbNetwork/) | [CCID](examples/SmartCardReader/) | [DFU](examples/FirmwareDFU/) |
-|------|-----------|-----|------------|-----|------|-------|-------|-----------------|-------------|------|-----|
-| ESP32-S2 | FS (12 Mbps) | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Chip | Speed | [HID](docs/classes/hid.md) | [CDC](docs/classes/cdc.md) | [Vendor](docs/classes/vendor.md) | [MIDI](docs/classes/midi.md) | [MSC](docs/classes/msc.md) | [Audio](docs/classes/audio.md) | [Video](docs/classes/video.md) | [NCM](docs/classes/ncm.md) | [CCID](docs/classes/ccid.md) | [DFU](docs/classes/dfu.md) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | ESP32-S3 | FS (12 Mbps) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| ESP32-P4 | FS + HS (480 Mbps) | ✅ | ✅ | ✅ | ✅ | ○ | ○ | ✅ | ○ | ○ | ○ |
+| ESP32-P4 v1.x and P4X (v3.1+) | HS (480 Mbps) and FS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ESP32-S2 | FS (12 Mbps) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-✅ = verified by the automated hardware tests (two-board peer rig for the S3,
-loopback/manual rigs for the P4; see [tests/TEST_PLAN.md](tests/TEST_PLAN.md)).
-○ = supported and build-verified on every release per core version
-(the `COMPATIBILITY` files above); hardware verification is pending for these
-cells. Up to four classes combine into one composite device within the
-controller's endpoint budget - see the
-[guide, section 3.3](docs/usb-device-guide.md#33-the-endpoint-budget). DFU is
-the exception: it costs no endpoint, so it fits beside any of the others.
+✅ = transfers checked on hardware by the `tests/` probes: two ESP32-S3
+boards at full speed; an ESP32-S2 and an S3 linked at full speed in both
+directions; a P4 and a P4X linked at high speed in both directions and one P4
+linking its own HS and FS controllers; a P4X and an S2 each against a Linux PC.
+ESP32-S31 is not supported yet.
 
-## Library-owned TinyUSB stack
+Classes:
 
-Version 2 no longer uses Arduino-ESP32's prebuilt TinyUSB configuration,
-initializer, task, endpoint allocator, or descriptor loader. EspUsbDevice builds
-a pinned, selected TinyUSB source set with its own `tusb_config.h`, initializes
-the ESP-IDF PHY/controller directly, runs the device task, and serves its own
-device, configuration, string, BOS, and class descriptors.
+- **HID:** keyboard (6-key or NKRO, layout conversion, LED state), mouse,
+  gamepad, Consumer Control (media keys), System Control, vendor-defined
+  reports, and a report descriptor written by the sketch
+- **CDC ACM:** USB serial ports; an Arduino `Stream`, several per device
+- **Vendor:** bulk transfers and vendor control requests, with generated WebUSB
+  and Microsoft OS 2.0 (WinUSB) descriptors
+- **MIDI 1.0:** up to 16 cables per direction
+- **MSC:** RAM, FAT12 RAM, SD card and firmware disks through helpers
+- **Audio:** UAC1 and UAC2 playback and capture
+- **Video:** a UVC camera (MJPEG or YUY2, isochronous or bulk)
+- **NCM:** a CDC-NCM USB network, with optional lwIP and DHCP
+- **CCID:** a smart card reader whose card is written in the sketch
+- **DFU 1.1:** firmware update with `dfu-util`, and runtime DETACH
 
-Arduino-ESP32 remains the platform dependency for ESP-IDF SoC, PHY, FreeRTOS,
-and board support. This removes the Arduino USB Device integration dependency;
-it does not fork the whole core. The selected files, pin, license, update policy,
-and byte-for-byte verification procedure are documented in
-[TinyUSB provenance](third_party/tinyusb/PROVENANCE.md).
+They combine freely into one composite device; the only limits are the
+controller's endpoints and FIFO, and a configuration that does not fit fails
+`begin()`.
 
-Owning this boundary makes the following possible:
+## Requirements
 
-- Select the ESP32-P4 FullSpeed or HighSpeed controller at runtime.
-- Return negotiated-speed descriptors with correct FS/HS endpoint packet sizes,
-  device qualifier, and other-speed configuration.
-- Allocate composite interfaces/endpoints consistently and reject impossible
-  controller-specific endpoint combinations before starting the PHY.
-- Generate WebUSB and Microsoft OS 2.0 descriptors for the actual allocated
-  vendor interface.
-- Configure enabled classes and TinyUSB buffers independently of
-  Arduino-ESP32's prebuilt `CFG_TUD_*` values.
-- Add a class TinyUSB itself does not implement - CCID - through its
-  application class-driver hook, without patching the vendored sources.
-- Tear down and reinitialize the runtime without falling back to `USB.begin()`
-  or `esp32-hal-tinyusb`.
+- Arduino-ESP32 **3.3.12** (the examples pin it in `sketch.yaml`).
+- ESP32-S3 and ESP32-S2: set **Tools > USB Mode** to **USB-OTG (TinyUSB)**
+  (`USBMode=default`); the ESP32-S3 default is Hardware CDC and JTAG.
+- ESP32-P4: choose the chip revision in **Tools > Chip Variant**: v1.x is
+  `prev3`, v3.1 or later (P4X) is `postv3`.
+- Do not enable the core's own USB CDC, MSC or DFU on boot, and do not call
+  `USB.begin()`: this library owns the USB OTG controller.
 
-## Release Scope
+## What changed in 3.0
 
-This release covers HID keyboard / mouse / gamepad / consumer / system / custom /
-vendor HID, CDC ACM, USB MIDI, MSC, USBVendor, USB Audio (speaker / microphone),
-a USB Video camera, a CDC-NCM network device, a CCID smart card reader, USB DFU
-firmware update, and multi-function composite devices.
+3.0 is a major version and 2.x sketches need changes; the steps are in
+[Migrating from v2](docs/migrating-from-v2.md).
 
-Typical use cases:
+### From TinyUSB to the library's own USB stack
 
-- Send layout-aware keyboard input, raw HID usages, mouse, gamepad, and media keys.
-- Communicate with a PC or EspUsbHost over CDC ACM serial or USB MIDI.
-- Expose RAM disks, FAT RAM disks, or SD cards as USB MSC devices.
-- Build non-HID vendor-specific bulk/control interfaces.
-- Read and write validated UAC1 Playback/Capture PCM through bounded FIFOs.
-  UAC2 is selectable and is covered end to end by the `peer/usb_audio_uac2`
-  two-board test against an EspUsbHost 2.7.1 UAC2 host.
-- Present the board as a UVC camera the host needs no driver for, streaming
-  MJPEG or uncompressed frames the sketch supplies. Isochronous bandwidth is
-  the constraint, not the API: a full-speed part carries about 1 MB/s.
-- Present the board as a USB network adapter (CDC-NCM), with optional lwIP/DHCP
-  so a PC can reach a page or API on the device over USB.
-- Present the board as a USB smart card reader (CCID) whose card is implemented
-  by the sketch, and answer APDUs from a PC/SC host.
-- Update the board's own firmware over USB - with `dfu-util`, with a browser
-  over the USB network interface, or by handing the chip to its ROM loader.
-- Combine several of the above as one composite device.
+2.x built a bundled TinyUSB with the library's own `tusb_config.h`. Class
+buffer sizes were `CFG_TUD_*` build flags: changing one meant writing a
+`build_opt.h` and rebuilding everything, and buffers for unused classes were
+still reserved at link time.
 
-## Design Goals
+3.0 uses neither TinyUSB's classes nor its common stack. All USB handling is
+the library's own code.
 
-- Share direction, PCM-format, and control-value terminology with EspUsbHost
-  and use explicit configuration. High-rate I/O uses bounded polling when a
-  callback execution context would be unsafe.
-- Own USB descriptors in this library instead of relying on Arduino USB class
-  descriptors.
-- Treat HID usage IDs and raw reports as the primary API.
-- Support ESP32-S3 two-board peer tests and ESP32-P4 one-board loopback tests as
-  early validation targets.
-- Keep Arduino-ESP32's standard USB device stack mutually exclusive. Sketches
-  using this library must not call `USB.begin()`.
+```text
+Sketch
+  ↓
+EspUsbDevice and Functions (HID, CDC, Vendor, MIDI, MSC, Audio, Video, NCM, CCID, DFU)
+  ↓
+Descriptor building, endpoint allocation, transfer contracts
+  ↓
+Core (EP0, standard requests, event queue) and runtime (PHY, controller choice, USB worker task)
+  ↓
+DWC2 driver (registers, FIFO, DMA, interrupts, cache)
+  ↓
+ESP-IDF (PHY, FreeRTOS, heap)
+```
 
-## Current Scope
+- The class drivers and the common core are new code written to USB 2.0 and
+  the class specifications.
+- Only the DWC2 controller driver derives from TinyUSB (MIT) and ST
+  (BSD-3-Clause) code, maintained as part of the library; its origin and the
+  scope of changes are in [third_party/tinyusb](third_party/tinyusb/PROVENANCE.md).
+- `#include <tusb.h>`, `tud_*()` calls and `CFG_TUD_*` flags are gone. Defining
+  an old flag is a compile error that names the replacement API.
+- Arduino-ESP32 remains the platform for the SoC, PHY and FreeRTOS. The core's
+  own USB Device implementation (`USB.h` and friends) cannot run alongside.
 
-The first milestone is replacing existing EspUsbHost peer devices and validating
-the core API on real hardware. The project started with the HID MVP and now
-covers CDC ACM, USB MIDI, and MSC through peer and loopback tests where
-available:
+### How usage changed
 
-- Device port/speed/VID/PID/string/power configuration.
-- Speed-aware descriptor generation and endpoint MPS selection.
-- HID boot keyboard raw report sending.
-- HID keyboard output report callback for LED state.
-- HID boot mouse raw report sending.
-- HID consumer / system / gamepad / custom / vendor reports.
-- CDC ACM serial.
-- USB MIDI event packets and note/control-change helpers.
-- USB MSC block device and SCSI callbacks.
-- USBVendor bulk IN/OUT, control requests, and WebUSB landing URL.
-- UAC1-default Audio Playback/Capture polling I/O, per-channel mute/volume
-  state, control events, and stream stats. UAC2 is available by explicit
-  selection, with Clock Source rate control, the UAC2 Feature Unit layout, and
-  both streaming directions covered by a peer test.
-- CDC-NCM network device with raw-frame API and optional lwIP/esp_netif
-  integration (DHCP server / client / static address).
-- CCID smart card reader with one slot: sketch-supplied ATR, APDU and escape
-  callbacks, and slot change notifications.
-- USB DFU: a device-implemented download into the OTA partition, a runtime
-  interface that answers `dfu-util -e`, and an OTA writer any transport can use.
-- Restarting into the chip's ROM download loader from a running sketch.
-- Multi-function composite devices (e.g. HID + CDC + MSC on one device).
-- Serial command sketches for pytest-embedded peer and loopback tests.
+| Topic | 2.x | 3.0 |
+| --- | --- | --- |
+| Buffer sizes | `CFG_TUD_*` in `build_opt.h`; rebuild everything | Each Function's `configure()` at run time; may differ per instance |
+| Memory | Reserved statically at link time, unused classes included | `begin()` allocates for the Functions in use, `end()` frees |
+| Changing a size | Rebuild | `end()` → `configure()` → `begin()` |
+| USB task | Call `device.task()` from `loop()` | The library's worker task runs; `device.task()` is gone |
+| Starting a Function | `keyboard.begin()` and friends could be called | `device.begin()` only; Function `begin()` is not public |
+| Registering callbacks | Any time | Before `device.begin()` only; registration returns `esp_err_t` |
+| State | `ready()` | `started()`, `ready()`, `suspended()`, `speed()` |
+| Learning about failure | An enumeration failure on the host | `begin()` checks before touching USB; `lastErrorName()` and each Function's `startError()` name the reason |
+| Number of Functions | Up to 6 | No fixed limit; the controller's endpoints and FIFO decide |
+| ESP32-P4 | Mind the FS and HS port numbers | Choose with `config.controller`; `Auto` is HS; revisions v1.x and P4X |
+| Large transfers | Up to 65535 bytes | Borrowed DMA transfers (`writeDirect` / `readDirect`); completion reported exactly once |
+| Where rings live | Fixed internal RAM | The sketch can supply them, PSRAM included |
 
-This library owns the USB Audio class and PCM FIFO boundary only. Applications can
-forward PCM to PCMFlow, PCMFlowDevice, or another processing/output layer.
-Volume and mute are not applied to PCM implicitly.
-`hasMute()` / `getMute()` / `setMute()` and the corresponding volume APIs use
-the same Master/Left/Right control state exposed to the USB host. Volume values
-use the USB Audio wire unit of 1/256 dB.
+Measured on ESP32-S3 with examples of the same function, static RAM went from
+about 59.5 KB to about 22 KB and flash shrank by 1.6-10 %. 3.0 allocates its
+buffers from the heap in `begin()`, so check the free heap after `begin()` too.
 
-- PCMFlow: https://github.com/tanakamasayuki/PCMFlow
-- PCMFlowDevice: https://github.com/tanakamasayuki/PCMFlowDevice
+### Changes that still compile
 
-## Minimal Examples
+These compile unchanged and only behave differently; most are fixes toward the
+specifications.
 
-Keyboard:
+- A callback registered after `device.begin()` is never called (registration
+  returns `ESP_ERR_INVALID_STATE`).
+- Keyboard `pressUsage()` adds to the keys held (up to six); `tapKey()`
+  releases only what it added.
+- `mouse.move()` keeps held buttons.
+- System Control takes the standard usages 0x81-0x83; out-of-range MIDI or
+  Consumer values are refused rather than clamped.
+- CDC `write()` / `flush()` wait up to 1000 ms to send (`setTxTimeoutMs()`).
+- Re-inserting MSC media reports UNIT ATTENTION once on the next command; the
+  default staging is 512 bytes.
+- UAC2 full-speed feedback is 3 bytes (10.14); a WebUSB URL without a scheme is
+  sent as written.
+
+The full list is in
+[Migrating from v2, "Changes the compiler will not catch"](docs/migrating-from-v2.md).
+
+## The basic shape
 
 ```cpp
-#include "EspUsbDevice.h"
+#include <EspUsbDevice.h>
 
-EspUsbDevice device;
-EspUsbDeviceHidKeyboard keyboard(device);
+EspUsbDevice device;                       // declare the Device first
+EspUsbDeviceVendor vendor(device);         // a Function registers itself with it
 
-void setup()
-{
+void setup() {
+  Serial.begin(115200);
+
+  EspUsbVendorConfig buffers = vendor.configuration();   // start from the current settings
+  buffers.rxCapacity = 4096;
+  if (vendor.configure(buffers) != ESP_OK) return;       // succeeds only while stopped
+
+  vendor.onRx([](size_t) { /* runs on the USB worker; keep it short */ });   // before begin
+
   EspUsbDeviceConfig config;
   config.vid = 0x303a;
-  config.pid = 0x4001;
-  config.product = "EspUsbDevice Keyboard";
-  device.begin(config);
-}
-
-void loop()
-{
-  if (device.ready())
-  {
-    keyboard.write("hello");
-    delay(1000);
+  config.pid = 0x4002;
+  config.product = "My device";
+  if (!device.begin(config)) {
+    Serial.printf("begin: %s (vendor: %s)\n", device.lastErrorName(),
+                  esp_err_to_name(vendor.startError()));
   }
 }
-```
 
-CDC ACM serial:
-
-```cpp
-#include "EspUsbDevice.h"
-
-EspUsbDevice device;
-EspUsbDeviceCdcSerial SerialUSB(device);
-
-void setup()
-{
-  EspUsbDeviceConfig config;
-  config.product = "EspUsbDevice Serial";
-  device.begin(config);
-}
-
-void loop()
-{
-  if (SerialUSB.connected())
-  {
-    SerialUSB.println("hello");
-    delay(1000);
-  }
+void loop() {
+  if (!device.ready() || device.suspended()) return;   // wait until the host configures it
+  uint8_t data[64];
+  const size_t n = vendor.read(data, sizeof(data));
+  if (n) vendor.write(data, n);                        // returns the bytes accepted
 }
 ```
 
-## Examples
+- **Order:** declare → `configure()` → register callbacks → `device.begin()`.
+  To change anything, `device.end()` first.
+- **State:** `started()` is true from a successful `begin()` until `end()`,
+  `ready()` once the host has configured the device (SET_CONFIGURATION), and
+  `suspended()` while the bus is suspended. `speed()` returns the negotiated speed.
+- **Callbacks** all run on the USB worker task. Do not wait, print at length or
+  call `begin()` / `end()` there: set a flag or copy the data and do the work
+  in `loop()`. The worker's stack is `config.taskStackBytes` (4096 by default).
+- **Errors:** `begin()` returns `bool`; `device.lastError()` /
+  `lastErrorName()` give the reason. `ESP_ERR_INVALID_SIZE` means the
+  configuration does not fit the endpoints or FIFO, `ESP_ERR_INVALID_ARG` a
+  wrong setting, `ESP_ERR_INVALID_STATE` a call at the wrong time.
+  [Troubleshooting](docs/troubleshooting.md) is indexed by symptom.
+- **Checking ahead:** with `config.startMode =
+  EspUsbDeviceStartMode::DescriptorsOnly` the descriptors are built and the
+  configuration checked without starting USB; DescriptorDump in
+  [Info](examples/Info/) uses it.
+- **Remote wakeup:** advertise it with `config.remoteWakeupSupported = true`;
+  if the host enables it, `device.remoteWakeup()` wakes the host.
 
-User-facing sketches are documented in [examples/README.md](examples/README.md).
+## The classes in brief
 
-Diagnostic sketches live in `examples/Info/` - start there when something does
-not work. How to use them, and the whole bring-up procedure, is in
-[docs/usb-device-guide.md](docs/usb-device-guide.md).
+Every setting, the behaviour and host OS notes for each class are in the
+[class guides](docs/classes/).
 
-- `Info/EspUsbDeviceBringUpCheck`: start, enumeration, speed, and host -> device traffic, in that order. **Run this first.**
-- `Info/EspUsbDeviceDescriptorDump`: every descriptor the library built, plus the endpoint budget (no host needed).
-- `Info/EspUsbDeviceConsole`: type HID reports and vendor transfers over serial, and watch every request from the host.
-
-By feature:
-
-- `Keyboard`: boot keyboard that sends layout-aware ASCII strings and HID usage IDs.
-- `KeyboardNKRO`: N-key rollover keyboard that holds any number of keys at once.
-- `Mouse`: boot mouse that sends movement, wheel, and buttons.
-- `KeyboardMouse`: composite keyboard + mouse HID.
-- `Gamepad`: HID gamepad that sends axes, hat, and buttons.
-- `MediaKeys`: HID media keys for volume, playback, and system control usages.
-- `VendorHID`: vendor-defined HID for custom report exchange (up to 63 bytes
-  per report, or 511 on ESP32-P4).
-- `USBVendor`: vendor-specific interface with bulk IN/OUT and control requests.
-- `CustomHID`: custom HID with a sketch-defined HID report descriptor.
-- `Serial`: CDC ACM serial for text communication with a PC or host.
-- `MIDI`: USB MIDI device for note / control-change send and receive.
-- `MIDIController`: controller that turns ADC / button input into MIDI CC / notes.
-- `MIDIInterface`: bridge between UART MIDI 1.0 and USB MIDI 1.0.
-- `MSC`: Mass Storage Class device that exposes a RAM buffer as a block device.
-- `MSCFatRamDisk`: Mass Storage Class device that exchanges files through a RAM
-  FAT12 disk.
-- `MSCSdCard`: Mass Storage Class device that exposes an SPI SD card as USB
-  storage.
-- `UsbNetwork`: CDC-NCM network device with a DHCP server and a web page at
-  `http://192.168.7.1/` reachable over USB.
-- `SmartCardReader`: CCID smart card reader with an emulated card that answers
-  Get UID and an echo instruction.
-- `CompositeHidCdcMsc`: HID keyboard + CDC serial + MSC FAT RAM disk as one
-  composite device.
-
-## HID Keyboard / Mouse APIs
-
-Keyboard:
-
-- `keyboard.setLayout(layout)` uses the same layout IDs and keymap tables as
-  EspUsbHost, reversed for device-side ASCII-to-usage conversion.
-- `keyboard.write(text)`, `tapKey(key)`, and `pressKey(key)` are the high-level
-  text helpers.
-- `keyboard.tapUsage()`, `pressUsage()`, `releaseUsage()`, `releaseAll()`, and
-  `sendReport()` keep raw HID usage/report control available.
-- `keyboard.onOutputReport(callback)` receives host LED output reports.
-- `keyboard.ledState()` returns the latest host LED state
-  (`EspUsbDeviceHidKeyboardOutputReport`) **by value**. It is updated whether or not
-  a callback is installed, so a sketch can read Lock state even when an integration
-  layer owns the single `onOutputReport()` slot - lighting an external Caps Lock LED,
-  say. LEDs are state rather than an event, so polling is enough and the callback
-  stays single-slot. Everything reads false until the host sends its first output
-  report, and the state is cleared on bus reset / unplug.
-  By value rather than by reference because the TinyUSB device task writes it while
-  the sketch reads it from its own task: a reference would hand out an object another
-  task mutates. The raw LED byte is stored atomically and the report is built from
-  one read, so a torn combination of fields is impossible. EspBle's `ledState()`
-  returns by value for the same reason.
-- `keyboard.enableNkro()` (before `begin()`) switches to N-key rollover: a bitmap
-  report covering usages `0x00`-`0xDF` (International/LANG keys included, so JIS
-  layouts work) that holds any number of keys at once, with automatic 6-key boot
-  fallback for BIOS. Off by default.
-- `keyboard.sendReport(EspUsbDeviceNkroKeyboardReport)` sends the **whole
-  held-key state as one report**. Use it to hold seven or more keys, or to write
-  the complete state every cycle - the incremental `pressUsage()` /
-  `releaseUsage()` API emits one report per changed key, which splits a chord into
-  separate presses. Fails unless `enableNkro()` was called.
-- `EspUsbDeviceNkroKeyboardReport` carries `modifiers` plus a 28-byte `bitmap` of
-  usages `0x00`-`MaxBitmapUsage` (`0xDF`), operated with `clear()` / `press()` /
-  `release()` / `isDown()`. Modifier usages `0xE0`-`0xE7` sit outside the bitmap,
-  so `press()` / `release()` route them into `modifiers` and callers never have to
-  tell the two apart. They return false only for a usage this report cannot
-  represent (above `0xDF` and not a modifier).
-- Naming rule: **a member holding a bitmap is `bitmap`, a member holding an array
-  of usages is `keys`**. The 6KRO `EspUsbDeviceBootKeyboardReport::keys[6]` is a
-  usage array, and `keys[0] = 0x04` would mean something different against each
-  type while still compiling, so the two names are kept apart. Sibling libraries
-  `EspUsbHost` and `EspBle` follow the same rule. Bitmap sizes are deliberately
-  **asymmetric**: the host side covers usages `0x00`-`0xFF` (32 bytes) while a
-  device is bounded by its own report descriptor (`0x00`-`0xDF`, 28 bytes).
-- `keyboard.heldState()` returns the NKRO state the host was last told about, for
-  suppressing duplicate sends and for resynchronising without a `releaseAll()`
-  (the library never suppresses repeats itself). While the host selected boot
-  protocol this is the requested state, not the bytes on the wire, which are
-  folded down to 6 keys.
-
-Mouse:
-
-- `mouse.move(x, y)`, `wheel(delta)`, and `sendReport(report)` send movement and
-  raw reports.
-- `mouse.press(buttons)`, `release(buttons)`, `releaseAll()`, `click(button)`,
-  and `buttons()` maintain device-side button state.
-
-## CDC / MIDI / MSC APIs
-
-CDC ACM:
-
-- `EspUsbDeviceCdcSerial` provides USB serial read/write callbacks and helpers.
-- It supports Arduino-style `available()`, `read()`, `write()`, and `print()`
-  usage as well as raw callbacks.
-- **It can be registered more than once.** Register named ports -
-  `EspUsbDeviceCdcSerial(device, "Console")` - and the host sees several serial
-  ports. How many fit is decided by IN endpoints (two per port): two on S2/S3,
-  three on the ESP32-P4 high-speed controller, fewer alongside HID or Vendor.
-  `EspUsbDevice::maxCdcPorts()` reports the capacity.
-
-USB MIDI:
-
-- `EspUsbDeviceMidi` sends 4-byte USB-MIDI event packets.
-- Use helpers such as `noteOn()`, `noteOff()`, and `controlChange()` together
-  with raw `writePacket()`.
-- `EspUsbDeviceMidi(device, cableCount)` exposes up to 16 cables, each of which
-  the host sees as a separate MIDI port. The default is 1. Cables share one pair
-  of bulk endpoints and are addressed by the 0-based `cable` argument on every
-  helper, or by the high nibble of `EspUsbDeviceMidiPacket::header`.
-- `EspUsbDeviceMidi(device, inCableCount, outCableCount)` gives the two directions
-  different cable counts, as many real MIDI interfaces have. Both names are
-  host-view, like USB endpoint directions and EspUsbHost's `EspUsbHostMidiPortInfo`:
-  IN is device to host (what the device sends), OUT is host to device. `noteOn()`
-  and the other send helpers are bounded by `inCableCount()`, so a cable that
-  exists only for receiving is refused rather than landing on another port.
-- Per-cable names are not implemented; the host names the ports itself.
-- Pairing with an ESP-IDF USB host (EspUsbHost) caps the cable count at **5**.
-  That host refuses a configuration descriptor longer than its enumeration control
-  transfer, and `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE` is 256 in the
-  precompiled Arduino libraries with no way to raise it from a sketch. 5 cables is
-  229 bytes including the configuration header and enumerates; 6 is 261 and fails
-  with `CHECK_SHORT_CONFIG_DESC FAILED`, measured in
-  `tests/peer/usb_midi_cables`. All 16 are legal USB and a PC host takes them; the
-  limit is the host stack, not this library.
-
-MSC:
-
-- `EspUsbDeviceMsc` handles inquiry strings, media state, capacity, and
-  read/write callbacks.
-- `EspUsbDeviceMscRamDisk` wraps an external RAM buffer as a block device.
-- `EspUsbDeviceMscFatRamDisk` creates a small FAT12 image in RAM for temporary
-  host/device file handoff.
-- `EspUsbDeviceMscSdCard` connects Arduino `SD` raw sector I/O to MSC.
-- MSC separates the block device from the filesystem. To make a drive mountable
-  by an OS, provide a valid FAT image or connect the read/write callbacks to
-  real storage such as an SD card.
-- Direct flash / SPIFFS / LittleFS exposure is not the standard direction.
-  Persistent storage should use SD card first, and temporary file handoff should
-  use RAM disk plus a FAT helper.
-
-## USB Audio APIs
-
-The former card-shaped `EspUsbDeviceAudio` implementation has been removed.
-Audio is now one function with independent Playback (host to device) and Capture
-(device to host) streams:
+### HID
 
 ```cpp
-EspUsbDevice device;
-EspUsbAudioFunction audio(device); // UAC1 by default
-
-auto &playback = audio.addPlaybackStream();
-playback.addFormat({48000, 2, 2, 16});
-
-auto &capture = audio.addCaptureStream();
-capture.addFormat({48000, 1, 2, 16});
+EspUsbDeviceHidKeyboard keyboard(device);
+EspUsbDeviceHidMouse mouse(device);
+// in loop()
+keyboard.write("hello\n");   // type a string (choose the layout with setLayout())
+keyboard.tapUsage(0x28);     // send by usage ID (Enter)
+mouse.move(10, 0);
 ```
 
-- `EspUsbAudioPlaybackStream::available()` / `read()` consume speaker PCM.
-- `EspUsbAudioCaptureStream::write()` supplies microphone PCM.
-- Format fields are `sampleRate`, `channels`, `bytesPerSample`, and
-  `bitsPerSample`, matching EspUsbHost terminology.
-- `pollEvent()` delivers stream-state, sample-rate, mute, and volume changes
-  from a bounded queue. PCM uses polling so high-rate application work, I2S
-  writes, and user callbacks never run on or block the TinyUSB task.
-- `stats()`, `resetStats()`, and `clearBuffer()` expose transfer, overrun, and
-  underrun behavior instead of hiding it inside an audio-card receive task.
-- Master/Left/Right state is shared with USB Feature Unit requests through the
-  mute/volume APIs. Volume uses signed 1/256 dB wire units.
-- The library never applies mute, volume, downmixing, or other DSP implicitly.
-  I2S, codecs, microphones, speakers, and DSP remain application or optional
-  PCMFlow/PCMFlowDevice responsibilities.
+- Character helpers (`write`, `tapKey`, `pressKey`) sit beside usage-ID and raw
+  report APIs.
+- `keyboard.enableNkro(true)` (before `begin()`) turns on N-key rollover. While
+  the host has selected the boot protocol (a BIOS, for example) reports go out
+  in the six-key format.
+- `keyboard.ledState()` returns, by value, the LED state the host sent (Num /
+  Caps / Scroll Lock and so on).
+- Gamepad, Consumer Control, System Control, vendor-defined reports
+  (`EspUsbDeviceHidVendor`) and your own report descriptor
+  (`EspUsbDeviceHidCustom`) sit side by side in one device. At high speed on
+  the ESP32-P4, interrupt packets can be up to 1024 bytes.
 
-UAC1 is the default and is covered by S3 speaker, microphone, and duplex peer
-streaming tests, including control changes and 16/24/32-bit
-descriptor/transfer coverage. UAC2 is selected with
-`EspUsbAudioFunction(device, EspUsbAudioProtocol::Uac2)`. Its descriptors, Clock
-Source sample-rate control, Feature Unit mute/volume (master and per logical
-channel), and both isochronous directions - including the asynchronous playback
-interface's explicit feedback endpoint - are covered by the `peer/usb_audio_uac2`
-two-board test against an EspUsbHost UAC2 host. A UAC2 function declares one
-sample rate per direction: the descriptor builder emits a single alternate
-setting, so the Clock Source has one rate to report.
+### CDC (USB serial)
 
-The new Audio source was independently designed from USB Audio specifications
-and TinyUSB's public driver API. The old Espressif USBAudioCard-derived source
-was deleted rather than carried forward. See
-[Audio source provenance](docs/V2_AUDIO_PROVENANCE.ja.md) (Japanese).
+- `EspUsbDeviceCdcSerial` is an Arduino `Stream`: `print()`, `readBytes()`,
+  `setTimeout()` all work.
+- Several can be registered, each with a name
+  (`EspUsbDeviceCdcSerial(device, "Console")`); each port uses two IN endpoints.
+- Line coding, DTR / RTS and break arrive through callbacks and queries.
 
-## CCID (Smart Card Reader) APIs
+### Vendor, WebUSB, WinUSB
 
-- `EspUsbDeviceCcid` presents the board as a USB CCID reader with one slot
-  (`bInterfaceClass` 0x0b, bulk IN/OUT plus an interrupt IN for slot changes).
-  The card behind the slot is the sketch's.
-- `insertCard(atr, length)` / `removeCard()` decide whether a card is present
-  and what ATR `IccPowerOn` answers with; both notify the host over the
-  interrupt endpoint. `cardPresent()` / `cardPowered()` report the slot state.
-- `onApdu(callback)` answers each exchange: the callback receives the APDU and
-  writes the answer including SW1SW2, so the sketch decides what the card is.
-  Without a callback the device answers 6D00 like a card that does not know the
-  instruction. `onEscape(callback)` is the same for vendor-specific
-  `PC_to_RDR_Escape` traffic, and `onPower(callback)` reports activation.
-- The device answers the slot-status, activation, parameter, and abort messages
-  itself, so a conforming host needs no help from the sketch for them.
-- Callbacks run in the TinyUSB device task: return promptly and do not call back
-  into USB from them.
+- Bulk data moves by copy (`read` / `write`), by callback (`onRxData`) or by
+  borrowed DMA (`writeDirect` / `readDirect`).
+- Borrowed DMA hands the sketch's buffer to DMA without copying. Completion
+  comes back exactly once as an `EspUsbTransferResult`, and the buffer always
+  returns, on cancel, bus reset and `end()` too.
+- The sketch can answer vendor control requests. The library generates the
+  WebUSB landing page and the Microsoft OS 2.0 descriptors that let Windows
+  bind a driver automatically, matched to the interfaces actually allocated.
 
-## Firmware update APIs
+### MIDI
 
-- `EspUsbDeviceDfu` adds a USB DFU function. It costs one interface and **no
-  endpoints** - every DFU transfer travels on EP0 - so it fits on a device whose
-  endpoint budget is already spent.
-  - `EspUsbDeviceDfuMode::Download` implements the update itself:
-    `dfu-util -D firmware.bin` writes the image into the spare OTA partition,
-    the device verifies it and restarts into it. The ROM is not involved, so it
-    behaves identically on ESP32-S2, ESP32-S3 and ESP32-P4.
-  - `EspUsbDeviceDfuMode::Runtime` answers only `DFU_DETACH` (`dfu-util -e`) and
-    by default restarts into the chip's ROM download loader.
-  - `onProgress()` / `onComplete()` / `onError()` / `onDetach()` and
-    `restartWhenComplete(false)` are the hooks; all of them run on the usbd task.
-- `EspUsbDeviceMscFirmwareDisk` presents a small FAT volume whose data region
-  **is** the OTA partition: the host drops a firmware `.bin` on the drive and
-  the device streams it into flash, verifies it and restarts into it. The image
-  is never held in RAM - only the volume metadata and a scratch area for
-  whatever the host's file manager leaves behind. Writes into the firmware
-  region must ascend; one that does not is refused rather than half-applied.
-  Feed it a **UF2** instead and that restriction goes away - each block carries
-  its own target address, so any write order works, completion is exact, and a
-  family ID refuses an image built for another chip before flash is touched.
-- `EspUsbDeviceFirmwareUpdate` writes an image into the OTA partition that is not
-  running, verifies it, and switches the boot partition. Transport-independent:
-  the DFU class drives it, and so can a sketch receiving bytes over CDC, vendor
-  bulk, MSC, or an HTTP upload across the NCM interface.
-  - `available()` / `capacity()` / `targetLabel()` answer before an upload starts
-    whether one can work at all - a single-app partition scheme (`huge_app`) has
-    nowhere to put a new image.
-  - `begin()` / `write()` / `end()` / `abort()` stream it in; the flash is erased
-    as the write advances, not up front. `beginRandomAccess()` / `writeAt()` are
-    the pair for a transport that knows the length and delivers out of order.
-  - `markValid()` confirms the running image, cancelling a pending bootloader
-    rollback; `rollback()` and `cancelPendingBoot()` are the ways back.
-- `EspUsbDevice::rebootToBootloader()` restarts into the chip's ROM download
-  loader so `esptool` can rewrite the whole flash, and
-  `rebootToRomDfu()` asks the S2/S3 ROM for DFU instead - though on an ESP32-S3
-  that needs the one-way `USB_PHY_SEL` eFuse, and the call refuses rather than
-  restarting into a dark connector when it is not burned. The download-boot flag
-  lives in a different register per target - and on ESP32-P4 shares one with the
-  software-reset bit - which is why this is a library call. Arduino-ESP32's
-  `usb_persist_restart()` cannot be linked from a sketch that uses this library.
+```cpp
+EspUsbDeviceMidi midi(device);              // one cable
+midi.noteOn(0, 60, 100);                     // channel 0-15, note, velocity
+EspUsbDeviceMidiPacket packet;
+while (midi.readPacket(packet)) { /* received */ }
+```
 
-Boot mode per chip, which connector the ROM answers on, and the full route
-comparison are in [docs/ota-over-usb.md](docs/ota-over-usb.md).
+- `EspUsbDeviceMidi(device, inCables, outCables)` shows the host up to 16
+  cables per direction.
 
-## Network / Composite APIs
+### MSC (USB drive)
 
-USB network (CDC-NCM):
+```cpp
+EspUsbDeviceMsc msc(device);
+uint8_t storage[32 * 512];
+EspUsbDeviceMscRamDisk volume(storage, 32);
+// in setup()
+volume.attach(msc);
+msc.mediaPresent(true);
+```
 
-- `EspUsbDeviceNet` presents the board as a USB network adapter. Modern Windows /
-  macOS / Linux bind their native NCM driver with no install.
-- `onFrame()` / `sendFrame()` expose raw Ethernet frames; skip `beginNetwork()`
-  to stay a pure frame transport (useful for PC-side bridging).
-- `beginNetwork()` brings up an lwIP/esp_netif interface. Choose the addressing:
-  `dhcpServer(true)` (device is the gateway, hands the host an address),
-  `dhcpClient(true)` (get an address from a PC-bridged LAN), or `ipConfig(...)`
-  for a static address. DHCP is opt-in. The subnet defaults to `192.168.7.0/24`
-  (device at `192.168.7.1`); pass `ipConfig(local, gateway, subnet)` before
-  `beginNetwork()` to change it — the DHCP server pool follows the configured
-  IP/mask automatically.
-- The DHCP server does not advertise a gateway/DNS by default (so it never
-  black-holes the host's real internet path). `dhcpAdvertiseGateway(true)` /
-  `dhcpDns(ip)` opt in when the device actually forwards or has a reachable DNS.
-- The USB netif uses a low route priority so a coexisting Wi-Fi STA stays the
-  ESP's default route. `defaultRoute(true)` makes the USB host the ESP's uplink
-  instead (for a PC that bridges/NATs to the device, with `dhcpClient(true)`).
-- The MAC reported to the host defaults to this chip's per-device Ethernet MAC
-  (`esp_read_mac` / `ESP_MAC_ETH`), which is unique per board and distinct from
-  the Wi-Fi STA/AP and BT MACs, so it never collides with the ESP's own Wi-Fi.
-  A single device per host is always fine; connecting two identical boards to the
-  same host works because each has a different MAC. Call `macAddress(mac)` before
-  `begin()` to pin a specific address (note: two boards forced to the same MAC on
-  one host will conflict, and two `dhcpServer(true)` devices default to the same
-  `192.168.7.0/24` subnet — give each a different `ipConfig(...)` subnet to run
-  several on one host).
+- The library handles BOT and SCSI; block reads and writes go to callbacks or
+  a helper.
+- Helpers: `EspUsbDeviceMscRamDisk` (raw blocks), `EspUsbDeviceMscFatRamDisk`
+  (FAT12 with files you place; the cluster size follows the capacity),
+  `EspUsbDeviceMscSdCard` (an SD card), `EspUsbDeviceMscFirmwareDisk` (writing
+  a file updates the firmware).
+- Storage can live in PSRAM. Media removal and change are reported to the host
+  correctly.
 
-Composite:
+### Audio
 
-- Register several classes with one `EspUsbDevice` and call `begin()` once; the
-  library assigns interface numbers and endpoints and builds the composite
-  descriptor. See `CompositeHidCdcMsc`.
+```cpp
+EspUsbAudioFunction audio(device, EspUsbAudioProtocol::Uac2);   // UAC1 when omitted
+EspUsbAudioPlaybackStream &playback = audio.addPlaybackStream();
+// in setup()
+playback.addFormat({48000, 2, 2, 16});   // rate, channels, bytes/sample, bits/sample
+// in loop()
+size_t n = playback.read(pcm, sizeof(pcm));
+```
+
+- One Function can hold Playback (PC → ESP32) and Capture (ESP32 → PC).
+- Volume, mute and rate changes are reported through `pollEvent()` and never
+  applied to the PCM. I2S and codecs are the application's job.
+
+### Video
+
+- `EspUsbDeviceVideo` is a UVC camera. Hand it MJPEG or YUY2 frames with
+  `submitFrame()`; it does not encode JPEG.
+- Isochronous or bulk transport is chosen at run time. High speed on the
+  ESP32-P4 gives far more bandwidth.
+
+### NCM (USB networking)
+
+- `EspUsbDeviceNet` appears to the PC as a USB network adapter. Recent Windows,
+  macOS and Linux need no driver installation.
+- `beginNetwork()` creates an lwIP netif, and `dhcpServer(true)` hands the PC
+  an address: the shape of a web settings page or API reachable over USB.
+- Without IP, raw Ethernet frames can be handled directly (`onFrame()` /
+  `sendFrame()`).
+
+### CCID (smart card reader)
+
+- A one-slot, T=1, short-APDU reader. The sketch writes the card's ATR and its
+  APDU replies (`insertCard()`, `onApdu()`).
+- PC/SC applications on the PC see a reader with a card inserted.
+
+### DFU and firmware update
+
+- `EspUsbDeviceDfu` in Download mode takes `dfu-util -D firmware.bin`, writes
+  the spare OTA partition, verifies it and restarts. It uses no endpoints, so
+  it fits any configuration. Runtime mode answers only `dfu-util -e` (DETACH).
+- `EspUsbDeviceFirmwareUpdate` is a transport-independent OTA writer, usable
+  from CDC, Vendor or HTTP over NCM.
+- `device.rebootToBootloader()` enters the ROM download loader from a running
+  sketch.
+- Boot modes per chip and a comparison of the routes are in
+  [OTA over USB](docs/ota-over-usb.md).
+
+## Composite devices and endpoints
+
+Declare as many Functions as you need and call `device.begin()` once: the
+library numbers the interfaces, allocates endpoints and builds the composite
+descriptors. The limit is the controller's resources.
+
+| Controller | Non-control IN endpoints | Endpoint numbers |
+| --- | --- | --- |
+| ESP32-S2 / S3 | 4 | 1-6 |
+| ESP32-P4 FS controller | 4 | 1-6 |
+| ESP32-P4 HS controller | 7 | 1-15; bulk up to 512 bytes, interrupt up to 1024 |
+
+- IN endpoints used: CDC and NCM 2, CCID 2 (1 when the card is fixed), Vendor,
+  MIDI, MSC and Video 1 each, all HID Functions together 1, DFU 0. Audio
+  capture uses 1, and UAC2 playback 1 for its feedback. On an S3, for example,
+  HID + CDC + MSC (1 + 2 + 1) uses all four.
+- `begin()` checks the endpoint count and the TX FIFO before touching USB and
+  returns `ESP_ERR_INVALID_SIZE` if they do not fit. DescriptorDump in
+  [Info](examples/Info/) shows the descriptors and the budget without a host.
+- Example: [CompositeHidCdcMsc](examples/CompositeHidCdcMsc/) (keyboard +
+  serial + FAT disk).
+
+## ESP32-P4 and high speed
+
+- The P4 has an HS controller (480 Mbps, UTMI PHY) and an FS controller.
+  `config.controller = Auto` picks HS.
+- At HS bulk packets are 512 bytes: MSC `transferBytes` and `readDirect()`
+  capacities must be multiples of 512. A configuration that worked at FS can
+  fail `begin()` at HS.
+- `device.speed()` gives the negotiated speed. The HS controller runs at FS
+  behind an FS host or hub.
+- At HS the device answers USB 2.0 TEST_MODE.
+- Examples: [P4HighSpeedDevice](examples/P4HighSpeedDevice/),
+  [P4FullSpeedDevice](examples/P4FullSpeedDevice/).
+
+## Memory and PSRAM
+
+- Buffers are allocated from the heap in `begin()` and freed in `end()`; a
+  failure leaves nothing behind.
+- Rings and MSC storage that the CPU accesses can be supplied by the sketch,
+  in PSRAM if you like.
+- What the USB DMA touches (staging, borrowed transfer buffers) is internal
+  RAM. A PSRAM buffer passed to a borrowed transfer is refused with
+  `NotDmaCapable`.
+- See the DMA and PSRAM chapter of the [advanced guide](docs/usb-device-advanced.md).
 
 ## Limitations
 
-- Do not use this library together with Arduino-ESP32's standard `USB.begin()`,
-  `USBHIDKeyboard`, `USBHIDMouse`, or other built-in USB device classes.
-- USB Audio uses `EspUsbAudioFunction` for Playback/Capture. UAC1 is the
-  compatibility-oriented default; select UAC2 explicitly with
-  `EspUsbAudioFunction(device, EspUsbAudioProtocol::Uac2)`. A UAC2 function
-  declares exactly one sample rate and one alternate setting per direction, so a
-  host cannot switch rates on it. I2S, codecs, DACs, and other audio hardware
-  are outside this library's responsibility.
-- The network device is CDC-NCM only. CDC-ECM is not enabled in the Arduino-ESP32
-  core (it would need a core rebuild); NCM is supported natively by modern hosts.
-  A device reaching the internet through the PC needs host-side bridging/NAT and
-  is out of scope; use the ESP's own Wi-Fi for that.
-- The CCID reader is one slot, T=1, short APDU level exchange. Chaining,
-  extended APDUs, PIN pad / secure entry, mechanical slots, and clock / data-rate
-  negotiation are out of scope - the class descriptor declares none of them, so a
-  conforming host never asks. The largest CCID message is 271 bytes
-  (`ESP_USB_DEVICE_CCID_BUFFER_SIZE` raises it).
-- Composite devices are bounded by the ESP32-S3 endpoint budget and the
-  configuration-descriptor capacity. Audio composite constraints are still
-  being validated on the Device side.
-- MSC keeps block devices and filesystems separate. Use the FAT RAM disk helper
-  or SD card support when the host should mount a normal drive.
-- Direct flash / SPIFFS / LittleFS exposure as USB MSC is not a standard goal.
-- When an SD card is exposed to the host as MSC, do not use ESP32-side file APIs
-  for the same card while the host owns it.
-- WebUSB and Microsoft OS 2.0 descriptors are owned by this library. Windows
-  receives a fixed WinUSB compatible ID for every interface no in-box driver
-  claims - the vendor interface and DFU - plus a device-interface GUID for the
-  vendor one, so neither needs Zadig. Custom vendor-code, GUID, and descriptor
-  replacement APIs are not implemented yet.
-- Bulk IN endpoints get a two-packet controller transmit FIFO when the
-  controller's FIFO can hold it (`config.bulkInBuffering`), which measured
-  22.98 -> 28.93 MB/s one way on an ESP32-P4 high-speed link. It is all or
-  nothing per device, and on the P4 high-speed controller three bulk IN
-  endpoints do not fit - see the
-  [advanced guide, 5.5](docs/usb-device-advanced.md#55-the-transmit-fifo-per-endpoint).
+- Cannot run alongside the Arduino-ESP32 `USB.begin()`, `USBHIDKeyboard`,
+  `USBCDC` and friends.
+- Networking is CDC-NCM only (no CDC-ECM or RNDIS). For the ESP32 to reach the
+  internet through the PC, the PC must bridge or share its connection.
+- CCID is one slot, T=1, short APDUs. Extended APDUs, chaining, PIN pads and
+  T=0 are not handled.
+- Video offers one format, resolution and frame rate per Function, and declares
+  no still image or camera controls.
+- MSC exposes LUN 0 only per Function. While an SD card is exposed, do not use
+  the same card through the ESP32's file API.
+- Audio never applies volume or mute to the PCM, and does not follow an
+  external codec's clock drift (absorb it in the application by watching the
+  ring level).
+- Calls from an ISR are not supported.
 
-USB device fundamentals, the ESP32-specific constraints, and how to diagnose a
-device the host will not accept are covered in
-[docs/usb-device-guide.md](docs/usb-device-guide.md).
-The relationship with TinyUSB, descriptors byte by byte, callback context, and
-implementing your own class are covered in
-[docs/usb-device-advanced.md](docs/usb-device-advanced.md).
-Symptom-first fixes are collected in
-[docs/troubleshooting.md](docs/troubleshooting.md).
-Boot-mode entry per chip, entering it from a running sketch, and the USB
-firmware-update routes are covered in
-[docs/ota-over-usb.md](docs/ota-over-usb.md).
-Porting a sketch from the core's USB API is covered in
-[docs/migrating-from-arduino-esp32-usb.md](docs/migrating-from-arduino-esp32-usb.md).
-See [tests/TEST_PLAN.md](tests/TEST_PLAN.md) for the test structure and staged
-coverage plan.
-Answers to the change requests raised against this library from the ESP32-P4
-high-speed measurements in
-[ch32-riscv-ug/wch-protocols](https://github.com/ch32-riscv-ug/wch-protocols) -
-what was adopted, what was measured and then not adopted, and why - are in
-[docs/CHANGE_REQUESTS.ja.md](docs/CHANGE_REQUESTS.ja.md) (Japanese).
-Design background and migration notes from existing EspUsbHost tests are in
-[docs/DESIGN_NOTES.ja.md](docs/DESIGN_NOTES.ja.md) (Japanese).
-Current development policy and remaining work are in
-[docs/DEVELOPMENT_PLAN.ja.md](docs/DEVELOPMENT_PLAN.ja.md) (Japanese).
-See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) before cutting a release.
+## Documentation
+
+| Read | For |
+| --- | --- |
+| [USB device guide](docs/usb-device-guide.md) | USB basics, power and connectors, ESP32 specifics, bring-up |
+| [Class guides](docs/classes/) | One per class: usage, every setting, behaviour, host OS notes |
+| [Advanced guide](docs/usb-device-advanced.md) | Task model, descriptors byte by byte, control transfers, FIFO, DMA and PSRAM, your own Function |
+| [Examples](examples/README.md) | 40+ complete sketches, every 2.x example included |
+| [Troubleshooting](docs/troubleshooting.md) | `begin()` errors, enumeration problems, per-OS and per-class issues |
+| [OTA over USB](docs/ota-over-usb.md) | Firmware update routes: ROM loader, DFU, drive, serial, vendor, browser |
+| [Migrating from v2](docs/migrating-from-v2.md) | Moving an EspUsbDevice 2.x sketch to 3.0 |
+| [Migrating from Arduino-ESP32 USB](docs/migrating-from-arduino-esp32-usb.md) | Moving from `USBHIDKeyboard`, `USBCDC`, `USBMSC` and friends |
+| [Tests](tests/README.md) | How the hardware tests are organised, and what they cover ([TEST_PLAN](tests/TEST_PLAN.md)) |
+| [Changelog](CHANGELOG.md) | What changed in each version |
+
+## Not yet verified
+
+Windows and macOS hosts, real SD cards and OTA writes on hardware, the ESP32-S2
+entering its ROM DFU, and Arduino-ESP32 4.x. The library is tested against
+ESP32 hosts and a Linux PC; see the [TEST_PLAN](tests/TEST_PLAN.md).
+
+## License
+
+MIT; see [LICENSE](LICENSE). The DWC2 controller driver is derived from TinyUSB
+(MIT) and ST code (BSD-3-Clause); see [third_party/tinyusb](third_party/tinyusb/PROVENANCE.md).

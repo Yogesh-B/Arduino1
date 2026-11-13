@@ -2,46 +2,32 @@
 #include <M5Unified.h>
 #include <PCMFlowDeviceM5.h>
 
-static constexpr uint32_t kSampleRate = 48000;
-static constexpr size_t kMaxPlayFrames = (kSampleRate * 80u) / 1000u;
+constexpr uint32_t sampleRate = 48000;
+constexpr size_t maxPlayFrames = (sampleRate * 80u) / 1000u; // 80 ms player queue.
 
 EspUsbDevice device;
-EspUsbAudioFunction audio(device);
+EspUsbAudioFunction audio(device); // UAC1. Pass EspUsbAudioProtocol::Uac2 for UAC2.
 EspUsbAudioPlaybackStream &playback = audio.addPlaybackStream();
+M5SpeakerBufferedPlayer<maxPlayFrames> player;
 
-M5SpeakerBufferedPlayer<kMaxPlayFrames> player;
+uint8_t pcm[384];
+uint32_t chunks = 0, usbBytes = 0, speakerBytes = 0, unsupported = 0, lastReport = 0;
+int rateLineY = 0;
+uint32_t shownRate = 0xffffffffu;
 
-static uint32_t audioChunks = 0;
-static uint32_t audioBytes = 0;
-static uint32_t speakerBytes = 0;
-static uint32_t unsupportedChunks = 0;
-static uint32_t lastLogMs = 0;
-
-static int rateLineY = 0;
-static uint32_t shownRate = 0xFFFFFFFFu;
-
-// Draw the current USB Audio sample rate on a fixed screen line, repainting only
-// when it changes (the host can change it at runtime via the sampling-freq
-// control). The fixed-width field overwrites any previous digits.
-static void showSampleRate(uint32_t rate)
-{
-  if (rate == shownRate)
-  {
-    return;
-  }
+// Redraw the rate line only when the host changes it; the fixed-width field
+// overwrites the previous digits.
+void showSampleRate(uint32_t rate) {
+  if (rate == shownRate) return;
   shownRate = rate;
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setCursor(0, rateLineY);
   M5.Display.printf("Rate:%6lu Hz", static_cast<unsigned long>(rate));
 }
 
-void setup()
-{
-  auto cfg = M5.config();
-  M5.begin(cfg);
-  Serial.begin(115200);
-  delay(1500);
-
+void setup() {
+  M5.begin(M5.config());
+  Serial.begin(115200); // Separate debug connection.
   M5.Display.setTextSize(2);
   M5.Display.setCursor(0, 0);
   M5.Display.println("EspUsbDevice");
@@ -49,96 +35,76 @@ void setup()
 
   M5.Speaker.begin();
   M5.Speaker.setVolume(128);
-
-  if (!player.begin({kSampleRate, 1, 16},
-                    M5SpeakerBufferedPlayer<kMaxPlayFrames>::stableProfile()))
-  {
-    Serial.println("PLAYER_BEGIN_FAILED");
+  if (!player.begin({sampleRate, 1, 16}, M5SpeakerBufferedPlayer<maxPlayFrames>::stableProfile())) {
+    Serial.println("Player start failed");
     M5.Display.println("Player failed");
     return;
   }
 
-  playback.addFormat({kSampleRate, 2, 2, 16});
-
-  EspUsbDeviceConfig usb;
-  usb.vid = 0x303a;
-  usb.pid = 0x4021;
-  usb.manufacturer = "EspUsb";
-  usb.product = "EspUsbDevice M5 Speaker";
-  usb.serialNumber = "espusb-m5-speaker";
-
-  if (!device.begin(usb))
-  {
-    Serial.printf("USB_BEGIN_FAILED %s\n", device.lastErrorName());
+  // {sampleRate, channels, bytesPerSample, bitsPerSample}
+  if (!playback.addFormat({sampleRate, 2, 2, 16})) {
+    Serial.printf("Audio format failed: %s\n", device.lastErrorName());
+    return;
+  }
+  EspUsbAudioConfig config;
+  config.eventCapacity = 8;
+  config.playbackBufferFrames = 480; // 10 ms: 480 * 4 bytes = 1920 bytes.
+  const esp_err_t configured = audio.configure(config);
+  if (configured != ESP_OK) {
+    Serial.printf("Audio configuration failed: %d\n", int(configured));
+    return;
+  }
+  EspUsbDeviceConfig identity;
+  identity.pid = 0x4021;
+  identity.manufacturer = "EspUsb";
+  identity.product = "EspUsbDevice M5 Speaker";
+  identity.serialNumber = "espusb-m5-speaker";
+  if (!device.begin(identity)) {
+    Serial.printf("USB start failed: %s\n", device.lastErrorName());
     M5.Display.println("USB failed");
     return;
   }
-
   Serial.println("AudioSpeakerM5 ready");
   M5.Display.println("USB audio ready");
   rateLineY = M5.Display.getCursorY();
   showSampleRate(audio.currentSampleRate());
 }
 
-void loop()
-{
+void loop() {
   M5.update();
   showSampleRate(audio.currentSampleRate());
 
-  uint8_t pcm[384];
   const size_t received = playback.read(pcm, sizeof(pcm));
-  if (received)
-  {
-    audioChunks++;
-    audioBytes += received;
-    const PCMFormat format{kSampleRate, 2, 16};
-    const size_t written = player.writePcm(pcm, received, format);
-    if (written)
-    {
-      speakerBytes += written;
-    }
-    else
-    {
-      unsupportedChunks++;
-    }
+  if (received) {
+    ++chunks;
+    usbBytes += received;
+    // Pass the USB format with the PCM; 0 means the player did not accept it.
+    const size_t queued = player.writePcm(pcm, received, PCMFormat{sampleRate, 2, 16});
+    if (queued) speakerBytes += queued;
+    else ++unsupported;
   }
 
   EspUsbAudioEvent event;
-  while (audio.pollEvent(event))
-  {
+  while (audio.pollEvent(event)) {
     if (event.type == EspUsbAudioEventType::StreamStateChanged &&
-        event.target == EspUsbAudioEventTarget::Playback)
-    {
-      Serial.printf("AUDIO_INTERFACE speaker %u\n",
-                    event.enabled ? 1 : 0);
-      if (!event.enabled)
-      {
-        player.stop();
-      }
+        event.target == EspUsbAudioEventTarget::Playback) {
+      Serial.printf("speaker %u\n", unsigned(event.enabled));
+      if (!event.enabled) player.stop();
     }
   }
 
   const uint32_t now = millis();
-  if (now - lastLogMs >= 1000)
-  {
-    lastLogMs = now;
-    const uint32_t chunks = audioChunks;
-    const uint32_t bytes = audioBytes;
-    const uint32_t speaker = speakerBytes;
-    const uint32_t unsupported = unsupportedChunks;
-    audioChunks = 0;
-    audioBytes = 0;
-    speakerBytes = 0;
-    unsupportedChunks = 0;
-    Serial.printf("AUDIO_M5 chunks=%lu bytes=%lu speaker_bytes=%lu unsupported=%lu play_chunks=%lu waits=%lu gaps=%lu drops=%lu\n",
-                  static_cast<unsigned long>(chunks),
-                  static_cast<unsigned long>(bytes),
-                  static_cast<unsigned long>(speaker),
-                  static_cast<unsigned long>(unsupported),
-                  static_cast<unsigned long>(player.chunks()),
-                  static_cast<unsigned long>(player.waits()),
-                  static_cast<unsigned long>(player.gapRisks()),
-                  static_cast<unsigned long>(player.overflowDrops()));
+  if (uint32_t(now - lastReport) >= 1000) {
+    const EspUsbAudioStreamStats stats = playback.stats();
+    Serial.printf("chunks=%lu bytes=%lu speaker=%lu unsupported=%lu usb overruns=%lu "
+        "play_chunks=%lu waits=%lu gaps=%lu drops=%lu\n",
+        static_cast<unsigned long>(chunks), static_cast<unsigned long>(usbBytes),
+        static_cast<unsigned long>(speakerBytes), static_cast<unsigned long>(unsupported),
+        static_cast<unsigned long>(stats.overrunCount),
+        static_cast<unsigned long>(player.chunks()), static_cast<unsigned long>(player.waits()),
+        static_cast<unsigned long>(player.gapRisks()), static_cast<unsigned long>(player.overflowDrops()));
+    chunks = usbBytes = speakerBytes = unsupported = 0;
+    lastReport = now;
   }
   delay(1);
 }

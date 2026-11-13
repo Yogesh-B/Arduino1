@@ -19,30 +19,12 @@ void AudioControlState::reset()
   currentSampleRate_ = 0;
   sampleRateCount_ = 0;
   featureCount_ = 0;
-  for (size_t i = 0; i < MAX_SAMPLE_RATES; ++i)
-  {
-    sampleRates_[i] = 0;
-  }
+  rateSource_ = nullptr;
   for (size_t i = 0; i < 2; ++i)
   {
     features_[i] = FeatureState{};
   }
   error_ = AudioControlError::NotConfigured;
-}
-
-bool AudioControlState::addSampleRate(uint32_t rate)
-{
-  if (sampleRateSupported(rate))
-  {
-    return true;
-  }
-  if (sampleRateCount_ == MAX_SAMPLE_RATES)
-  {
-    setError(AudioControlError::RateCapacity);
-    return false;
-  }
-  sampleRates_[sampleRateCount_++] = rate;
-  return true;
 }
 
 bool AudioControlState::configure(const AudioFunctionModel &function,
@@ -56,26 +38,16 @@ bool AudioControlState::configure(const AudioFunctionModel &function,
   }
   clockEntityId_ = graph.clockSourceId;
 
-  const AudioStreamModel *streams[] = {
-      &function.playback(),
-      &function.capture(),
-  };
-  for (const AudioStreamModel *stream : streams)
-  {
-    for (size_t i = 0; i < stream->formatCount(); ++i)
-    {
-      if (!addSampleRate(stream->format(i)->sampleRate))
-      {
-        return false;
-      }
-    }
-  }
+  // A valid graph has identical rate sets in both directions. Borrow one
+  // stream rather than storing another fixed-capacity copy of its rates.
+  rateSource_ = function.playback().formatCount() ? &function.playback() : &function.capture();
+  sampleRateCount_ = rateSource_->alternateRateCount(1);
   if (sampleRateCount_ == 0)
   {
     setError(AudioControlError::InvalidValue);
     return false;
   }
-  currentSampleRate_ = sampleRates_[0];
+  currentSampleRate_ = sampleRate(0);
 
   for (size_t i = 0; i < graph.entityCount; ++i)
   {
@@ -128,13 +100,8 @@ AudioControlState::feature(uint8_t entityId) const
 
 bool AudioControlState::sampleRateSupported(uint32_t rate) const
 {
-  for (size_t i = 0; i < sampleRateCount_; ++i)
-  {
-    if (sampleRates_[i] == rate)
-    {
-      return true;
-    }
-  }
+  for (size_t i = 0; rateSource_ && i < sampleRateCount_; ++i)
+    if (rateSource_->format(i)->sampleRate == rate) return true;
   return false;
 }
 
@@ -320,8 +287,8 @@ bool AudioControlState::range(uint8_t entityId,
       setError(AudioControlError::UnsupportedControl);
       return false;
     }
-    value.minimum = static_cast<int32_t>(sampleRates_[0]);
-    value.maximum = static_cast<int32_t>(sampleRates_[0]);
+    value.minimum = static_cast<int32_t>(sampleRate(0));
+    value.maximum = static_cast<int32_t>(sampleRate(0));
     value.resolution = 0;
     setError(AudioControlError::None);
     return true;
@@ -351,7 +318,8 @@ bool AudioControlState::range(uint8_t entityId,
 
 uint32_t AudioControlState::sampleRate(size_t index) const
 {
-  return index < sampleRateCount_ ? sampleRates_[index] : 0;
+  if (!rateSource_ || index >= sampleRateCount_) return 0;
+  return rateSource_->format(index)->sampleRate;
 }
 
 AudioControlEntityKind

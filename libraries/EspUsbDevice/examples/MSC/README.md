@@ -2,101 +2,153 @@
 
 > 日本語版: [README.ja.md](README.ja.md)
 
-Creates a USB Mass Storage Class device and exposes a small RAM-backed block
-device to a USB host.
+Creates a USB Mass Storage Class (MSC) device and exposes a small RAM-backed
+block device to a USB host.
 
-This example is for SCSI / READ(10) / WRITE(10) bring-up. `EspUsbDeviceMscRamDisk`
-handles read/write callbacks and block range checks, so the minimal sketch does
-not need to implement every MSC callback manually.
+This example is for SCSI / READ(10) / WRITE(10) bring-up.
+`EspUsbDeviceMscRamDisk` provides the read/write callbacks and the block range
+checks, so the sketch does not implement every MSC callback by hand. For
+callbacks written directly against `msc.onRead()` / `onWrite()`, see
+[MscCdcBlocks](../MscCdcBlocks/MscCdcBlocks.ino).
 
 ## Hardware
 
-- ESP32-S3 or another Arduino-ESP32 board with USB device support
+- ESP32-S3, ESP32-S2 or ESP32-P4 board, connected to the host through its
+  **native USB OTG** port
 - A USB host such as a PC, another ESP32 running EspUsbHost, or a test fixture
-- A separate Serial monitor connection for logs when available
+- A separate Serial connection (USB-UART or the board's debug port) for logs
 
 ## What It Does
 
-- Starts `EspUsbDevice` as a full-speed MSC device
-- Exposes a 16 block x 512 byte RAM disk
-- Configures SCSI inquiry vendor / product / revision strings
-- Handles `TEST UNIT READY`, `READ CAPACITY(10)`, `READ(10)`, and `WRITE(10)`
-- Logs `START STOP UNIT` requests to Serial
+- Starts `EspUsbDevice` as an MSC device (full speed on S2/S3, high speed on P4)
+- Exposes a 16 block x 512 byte RAM disk, zero-filled, with `55 AA` at the end
+  of block 0
+- Sets the SCSI INQUIRY vendor / product / revision strings
+- Handles `INQUIRY`, `TEST UNIT READY`, `READ CAPACITY(10)`, `READ(10)`,
+  `WRITE(10)` and the rest of the command set listed in the
+  [MSC guide](../../docs/classes/msc.md)
+- Logs `START STOP UNIT` requests (eject) to Serial
+
+## Usage
+
+1. Flash the sketch (`arduino-cli compile --profile esp32s3` etc.) and open the
+   Serial monitor at 115200.
+2. Connect the native USB port to the host. `USB MSC RAM disk ready` appears.
+3. On a PC the 8 KiB disk shows up as an unformatted removable drive. Read it
+   with a raw tool, e.g. on Linux
+   `sudo dd if=/dev/sdX bs=512 count=1 | xxd | tail -2` (find `sdX` with
+   `lsblk`); the last two bytes are `55 aa`.
+4. Ejecting the drive (`eject /dev/sdX`, or "Eject" in the file manager) prints
+   `MSC_START_STOP ...`.
 
 ## Important Limitation and Direction
 
-The RAM disk in this example is not formatted as FAT. When connected to a PC,
-the OS may ask to initialize or format it. This sketch validates MSC transport;
-it is not a normal USB flash drive example for file-level reads and writes.
+The RAM disk is not formatted. When connected to a PC, the OS may offer to
+initialize or format it; that is a property of the content, not a failed USB
+connection. This sketch validates MSC transport, not file-level use. Everything
+is lost on reset.
 
 MSC separates the block device from the filesystem. To make host-mountable
-storage, use one of these approaches:
+storage, either:
 
-- Put a valid FAT image in the RAM buffer.
-- Back `onRead()` / `onWrite()` with block storage such as an SD card.
+- put a valid FAT image in RAM - [MSCFatRamDisk](../MSCFatRamDisk/), or
+- back `onRead()` / `onWrite()` with block storage such as an SD card -
+  [MSCSdCard](../MSCSdCard/).
 
-This library first provides a block device helper to reduce MSC setup overhead.
-A FAT image helper is a possible next layer.
+Do not expose internal flash, SPIFFS or LittleFS directly as MSC. MSC hands the
+host raw sectors, while SPIFFS and LittleFS are filesystems the ESP32 mounts;
+internal flash also has firmware partitions, erase blocks and write endurance
+to worry about. The one deliberate exception is
+[FirmwareMSC](../FirmwareMSC/), whose data region is the OTA partition and
+which only accepts firmware images.
 
-This project should avoid exposing internal flash, SPIFFS, or LittleFS directly
-as USB MSC. USB MSC exposes sector-level block devices to the host, while
-SPIFFS and LittleFS are filesystem APIs mounted by the ESP32. Internal flash also
-has firmware partition, erase block, and write endurance concerns, so it is not a
-good user-facing example target.
-
-For practical persistent storage examples, SD card support should come first.
-SD is already a block device and works naturally with FAT and USB MSC. The key
-rule is exclusive ownership: while the USB host owns the SD card through MSC, the
-ESP32 side should not mount or write the same filesystem. Hand ownership back to
-the ESP32 side after eject or `START STOP UNIT`.
+The rule for every MSC medium is exclusive ownership: while the host owns it,
+the sketch must not mount or write the same filesystem. Hand ownership back
+after eject / `START STOP UNIT`.
 
 ## Practical RAM Disk Uses
 
-RAM disk is not only for tests. With a FAT image helper, it can become a small
-temporary USB drive for host-to-device file handoff.
+A RAM disk is not only for tests. With the FAT helper it becomes a small
+temporary drive for host-to-device file handoff:
 
-- Drop a firmware image from a PC, then apply a firmware update after eject.
-- Drop a configuration file and read it on the ESP32 side.
-- Receive a file from a PC and forward it over Wi-Fi.
-- Place logs or diagnostic data in a RAM FAT image and expose it to the host.
+- drop a configuration file and read it on the ESP32 side,
+- receive a file from a PC and forward it over Wi-Fi,
+- expose logs or diagnostic data to the host.
 
-To keep this safe, the ESP32 side should not parse the FAT image while the host
-may still be writing it. File listing and reads should happen after host sync,
-eject, or stop has been observed.
+Parse the FAT image only after the host has synced, ejected or stopped the
+drive, never while it may still be writing.
 
-Planned helpers should be split like this:
-
-- `EspUsbDeviceMscRamDisk`: raw block I/O, tests, and temporary buffers.
-- `EspUsbDeviceMscFatRamDisk`: small FAT image in RAM for file handoff.
-- `EspUsbDeviceMscSdCard`: expose an SD card as a USB MSC block device.
-- Direct flash / SPIFFS / LittleFS exposure: not part of standard examples.
+| Helper | Use |
+|---|---|
+| `EspUsbDeviceMscRamDisk` | raw block I/O, tests, temporary buffers (this example) |
+| `EspUsbDeviceMscFatRamDisk` | small FAT image in RAM for file handoff |
+| `EspUsbDeviceMscSdCard` | an SPI SD card as an MSC block device |
+| `EspUsbDeviceMscFirmwareDisk` | drag-and-drop firmware update |
 
 ## Key APIs
 
 - `EspUsbDeviceMsc msc(device)` registers the MSC function.
-- `msc.vendorID()`, `productID()`, and `productRevision()` configure SCSI inquiry
-  strings.
-- `msc.mediaPresent(true)` reports inserted media to the host.
-- `msc.isWritable(true)` allows host writes.
-- `msc.onStartStop(callback)` receives eject / start / stop requests.
+- `msc.configure(EspUsbMscConfig)` sets the function name and the DMA staging
+  size (`transferBytes`, default 512). Call while stopped; it returns
+  `esp_err_t`.
+- `msc.vendorID()`, `productID()`, `productRevision()` set the INQUIRY strings
+  (8 / 16 / 4 characters).
+- `msc.mediaPresent(true)` reports the medium as inserted. The RAM disk helper
+  does **not** do this for you.
+- `msc.isWritable(true)` allows host writes; `false` makes the medium
+  write-protected.
+- `msc.onStartStop(callback)` receives eject / start / stop requests. It runs
+  on the USB worker; return quickly.
 - `EspUsbDeviceMscRamDisk disk(storage, blocks, blockSize)` wraps an external
-  buffer as a block device.
-- `disk.attach(msc)` installs MSC read/write callbacks and calls
-  `msc.begin(blocks, blockSize)`.
-- `disk.clear()`, `readBlock()`, `writeBlock()`, and `writeByte()` are useful for
+  buffer (internal RAM or PSRAM) as a block device.
+- `disk.attach(msc)` installs the read/write callbacks and calls
+  `msc.begin(blocks, blockSize)`, which only sets the geometry. The staging
+  buffer is allocated by `device.begin()`.
+- `disk.clear()`, `readBlock()`, `writeBlock()`, `writeByte()` are handy for
   small test initializers.
+- After a failed `device.begin()`, `device.lastErrorName()` and
+  `msc.startError()` give the reason.
 
 ## Expected Serial Output
 
 ```text
-USB MSC RAM disk ready blocks=16 block_size=512 bytes=8192
+USB MSC RAM disk ready blocks=16 block_size=512 bytes=8192 staging=512
 MSC_START_STOP pc=0 start=0 eject=1
 ```
 
-The second line depends on the host or OS and may not appear.
+The second line depends on the host and may not appear.
+
+## Checks
+
+- Run the unchanged sketch first and compare its log with the steps above.
+  Note which stage succeeds - enumeration, capacity, a raw read - instead of
+  expecting a mounted filesystem.
+- A block is addressed by LBA and sized by the medium; a file needs a
+  filesystem on top. Neither a USB connection nor a boot signature means a
+  valid filesystem.
+- At high speed (ESP32-P4) `transferBytes` must be a multiple of 512; anything
+  else makes `device.begin()` fail with `ESP_ERR_INVALID_SIZE`.
+- The error logging here is a demonstration, not a retry or recovery policy.
+
+## Changes from v2
+
+- The staging buffer is set per function with `msc.configure()`
+  (`transferBytes`), not with `CFG_TUD_MSC_EP_BUFSIZE`; the old macros are a
+  compile error.
+- `onStartStop()`, `vendorID()` and the other setters return `esp_err_t` and
+  succeed only while stopped.
+- Startup failures report `msc.startError()` as well as
+  `device.lastErrorName()`; the ready line also prints the allocated staging
+  size (`msc.transferCapacity()`).
+- Re-inserting a medium (`mediaPresent(false)` then `true`) now reports a
+  UNIT ATTENTION (06/28/00) to the host once.
+- The sketch otherwise behaves as in v2 (same VID/PID 303a:4007, same disk).
 
 ## See Also
 
-- [Keyboard](../Keyboard/) - HID keyboard device
-- [Mouse](../Mouse/) - HID mouse device
-- [KeyboardMouse](../KeyboardMouse/) - composite keyboard and mouse device
+- [MSCFatRamDisk](../MSCFatRamDisk/) - file handoff through a RAM FAT image
+- [MSCSdCard](../MSCSdCard/) - SD card as USB storage
+- [MscCdcBlocks](../MscCdcBlocks/MscCdcBlocks.ino) - hand-written callbacks plus CDC
+- [MSC API guide](../../docs/classes/msc.md)
+- [Sketch](MSC.ino) / [All examples](../README.md) /
+  [Example workflow](../../docs/example-workflow.md)

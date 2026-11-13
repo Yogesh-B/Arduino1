@@ -2,520 +2,362 @@
 
 > English: [README.md](README.md)
 
-EspUsbDevice は、新しい ESP32 Arduino USB Device ライブラリです。
-
-Arduino-ESP32 標準の `USB`、`USBHIDKeyboard`、`USBHIDMouse` API との互換は
-目標にしません。port、speed、descriptor、endpoint packet size、raw class
-report をスケッチから明示的に制御できる、よりよい小さな USB Device ライブラリを
-目指します。標準 API から乗り換える場合は
-[移行ガイド](docs/migrating-from-arduino-esp32-usb.ja.md) が対応表になっています。
-
-最初の実装対象は `EspUsbHost` の peer / loopback テストです。これは実ハードウェアで
-具体的に検証でき、ライブラリが制御すべき低レベル挙動を明確にできるためです。
-テスト向けの機能を先に実装しますが、それはプロジェクトの最終的な範囲ではありません。
-
-## 対応環境
-
-対応する Arduino-ESP32 コア（ボードパッケージ）の最低バージョン:
-
-| ターゲット | 最低 arduino-esp32 |
-| --- | --- |
-| ESP32-S2 / ESP32-S3 / ESP32-P4 | 3.3.9 |
-
-これより古いCoreは公式対応外です。ライブラリ各versionのCore別build結果は
-[`docs/`](docs/)に`COMPATIBILITY.<version>.md`として公開し、現在のworktreeを
-実行したdraftは固定名`COMPATIBILITY.WORKTREE.md`を使用します。
-自動matrixは3.3.0以降を観測しますが、3.3.9未満の結果は参考情報であり、公式対応を意味しません。
-
-## 対応チップとクラス
-
-| チップ | 最大速度 | [HID](examples/Keyboard/) | [CDC serial](examples/Serial/) | [MSC](examples/MSC/) | [MIDI](examples/MIDI/) | [Audio](examples/AudioSpeaker/) | [Video](examples/VideoCamera/) | [Vendor / WebUSB](examples/USBVendor/) | [NCMネットワーク](examples/UsbNetwork/) | [CCID](examples/SmartCardReader/) | [DFU](examples/FirmwareDFU/) |
-|--------|----------|-----|------------|-----|------|-------|-------|-----------------|--------------|------|-----|
-| ESP32-S2 | FS (12 Mbps) | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| ESP32-S3 | FS (12 Mbps) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| ESP32-P4 | FS + HS (480 Mbps) | ✅ | ✅ | ✅ | ✅ | ○ | ○ | ✅ | ○ | ○ | ○ |
-
-✅ = 自動実機テストで検証済み（S3は2台peer構成、P4はloopback/手動構成。
-[tests/TEST_PLAN.ja.md](tests/TEST_PLAN.ja.md)参照）。
-○ = 対応済みで、リリースごとにCore version別のbuild検証を実施
-（上記`COMPATIBILITY`ファイル）。これらのセルの実機検証は今後の課題です。
-最大4クラスをcontrollerのendpoint予算内で1つの複合デバイスに組み合わせられます
-（[ガイド3.3](docs/usb-device-guide.ja.md#33-endpoint予算)参照）。DFUは例外で、
-endpointを消費しないため他のどれの隣にも載ります。
-
-## ライブラリ所有のTinyUSB stack
-
-v2ではArduino-ESP32がprebuildしたTinyUSB configuration、initializer、task、endpoint
-allocator、descriptor loaderを使用しません。EspUsbDevice自身の`tusb_config.h`で固定・
-選択したTinyUSB sourceをbuildし、ESP-IDFのPHY/controllerを直接初期化してdevice taskを
-実行し、device/configuration/string/BOS/class descriptorを返します。
-
-Arduino-ESP32はESP-IDFのSoC、PHY、FreeRTOS、board supportを得るplatform dependencyとして
-引き続き使用します。切ったのはArduino USB Device integrationへの依存であり、Core全体を
-forkしたわけではありません。選択したfile、pin、license、更新方針、byte-for-byte検証は
-[TinyUSBの由来と管理方法](third_party/tinyusb/PROVENANCE.ja.md)に記録しています。
-
-この境界をライブラリで所有した結果、次が可能になりました。
-
-- ESP32-P4のFullSpeed/HighSpeed controllerをruntimeに選ぶ。
-- negotiated speedに合わせたFS/HS endpoint packet size、device qualifier、
-  other-speed configurationを返す。
-- compositeのinterface/endpointを一括採番し、controllerごとに不可能な構成をPHY開始前に拒否する。
-- 実際に割り当てたvendor interface用のWebUSB / Microsoft OS 2.0 descriptorを生成する。
-- enableするclassとTinyUSB bufferをArduino-ESP32 prebuiltの`CFG_TUD_*`値から独立して設定する。
-- TinyUSB自身が実装していないclass（CCID）を、同梱sourceに手を入れずapplication
-  class driver hookから追加する。
-- `USB.begin()`や`esp32-hal-tinyusb`へfallbackせずruntimeを終了・再初期化する。
-
-## リリース範囲
-
-このリリースでは、HID keyboard / mouse / gamepad / consumer / system / custom / vendor HID、
-CDC ACM、USB MIDI、MSC、USBVendor、USB Audio（speaker / microphone）、USB Video
-カメラ、CDC-NCM ネットワークデバイス、CCID スマートカードリーダー、USB DFU
-ファームウェア更新、多機能な複合デバイスを扱えます。
-
-代表的な用途:
-
-- layout 対応 keyboard、raw HID usage、mouse / gamepad / media key を送る。
-- PC や `EspUsbHost` と CDC ACM serial / USB MIDI で通信する。
-- RAM disk、FAT RAM disk、SD card を USB MSC として公開する。
-- HID ではない vendor-specific bulk/control interface を作る。
-- ボード自身のファームウェアを USB 経由で更新する（`dfu-util`、USB ネットワーク
-  インターフェース越しのブラウザ、またはチップを ROM loader へ渡す方法）。
-- 実転送を検証済みのUAC1 Audio Playback/Capture PCMをbounded FIFO経由で読み書きする。
-  UAC2は明示選択でき、EspUsbHost 2.7.1のUAC2 hostに対する2台テスト `peer/usb_audio_uac2` でend-to-endにカバー。
-- ホストにドライバを入れさせずに UVC カメラとして見せ、スケッチが用意した MJPEG
-  または非圧縮フレームを流します。制約は API ではなく isochronous の帯域で、
-  full speed なら約 1 MB/s です。
-- ボードを USB ネットワークアダプタ（CDC-NCM）として見せ、任意で lwIP/DHCP を有効にして
-  PC が USB 経由でデバイス上のページや API にアクセスできるようにする。
-- ボードを USB スマートカードリーダー（CCID）として見せ、カードの中身をスケッチで実装して
-  PC/SC ホストからの APDU に応答する。
-- 上記を組み合わせて 1 つの複合デバイスにする。
-
-## 設計目標
-
-- `EspUsbHost` と方向・PCM format・control値の語彙を揃え、明示設定を基本にする。
-  callbackの実行contextが適切でない高頻度I/Oはbounded polling APIにする。
-- Arduino USB class descriptor に依存せず、descriptor はこのライブラリで所有する。
-- HID は文字入力ではなく usage ID と raw report を第一級 API にする。
-- ESP32-S3 2台構成の peer テストと、ESP32-P4 1台構成の loopback テストを
-  初期検証ターゲットとして支える。
-- Arduino-ESP32 標準 USB Device stack とは排他利用にする。このライブラリを使う
-  スケッチでは `USB.begin()` を呼ばない。
-
-## 現在のスコープ
-
-最初のマイルストーンは、既存 `EspUsbHost` peer device を置き換え、実ハードウェアで
-コア API を検証することです。HID MVP から始め、CDC ACM、USB MIDI、MSC まで peer /
-loopback テストで確認できる範囲を広げています。
-
-- device port / speed / VID / PID / string / power 設定。
-- speed に応じた descriptor 生成と endpoint MPS 選択。
-- HID boot keyboard の raw report 送信。
-- HID keyboard output report callback による LED 状態受信。
-- HID boot mouse の raw report 送信。
-- HID consumer / system / gamepad / custom / vendor report。
-- CDC ACM serial。
-- USB MIDI event packet と note / control change helper。
-- USB MSC block device と SCSI callback。
-- USBVendor bulk IN/OUT、control request、WebUSB landing URL。
-- UAC1 defaultのAudio Playback/Capture polling I/O、チャンネル別mute/volume state、
-  control event、stream stats。UAC2は明示選択でき、Clock Sourceによるrate制御、
-  UAC2のFeature Unit layout、双方向streamingをpeer testで検証済みです。
-- CDC-NCM ネットワークデバイス（生フレーム API と、任意の lwIP/esp_netif 統合＝DHCP
-  サーバ / クライアント / 静的アドレス）。
-- CCID スマートカードリーダー（1 slot、スケッチが与える ATR、APDU / escape callback、
-  カード挿抜通知）。
-- USB DFU: デバイス自身が OTA partition へ書き込む download、`dfu-util -e` に応える
-  runtime interface、どの転送路からでも使える OTA writer。
-- 動作中のスケッチからチップの ROM download loader へ再起動する。
-- 多機能な複合デバイス（例: HID + CDC + MSC を 1 台に）。
-- pytest-embedded peer / loopback テスト用の serial command sketch。
-
-USB Audioの責務はAudio classとPCM FIFO境界までです。受け取ったPCMはアプリケーション、
-PCMFlow、PCMFlowDeviceなど任意の処理系へ渡します。volume/muteをPCMへ暗黙適用しません。
-`hasMute()` / `getMute()` / `setMute()`と対応するvolume APIは、USB Hostへ公開する
-Master/Left/Rightのcontrol stateを共有します。volume値はUSB Audio wire形式と同じ
-1/256 dB単位です。
-
-- PCMFlow: https://github.com/tanakamasayuki/PCMFlow
-- PCMFlowDevice: https://github.com/tanakamasayuki/PCMFlowDevice
-
-## 最小例
-
-Keyboard:
+EspUsbDevice は、どんな USB device にするかをスケッチで明示する、ESP32 Arduino 向けの
+USB Device ライブラリです。使う Function を Device に付け、容量を決めて `begin()` します。
+USB の処理はライブラリの worker が行うので、スケッチから USB の task を呼ぶ必要はありません。
+リンクされるのは、使う Function だけです。
 
 ```cpp
-#include "EspUsbDevice.h"
+#include <EspUsbDevice.h>
 
 EspUsbDevice device;
-EspUsbDeviceHidKeyboard keyboard(device);
+EspUsbDeviceCdcSerial console(device);   // USB serial port と
+EspUsbDeviceHidKeyboard keyboard(device); // keyboard を 1 つの device に
 
-void setup()
-{
+void setup() {
+  EspUsbBulkStreamConfig buffers;
+  buffers.rxCapacity = 256;
+  buffers.txCapacity = 1024;
+  console.configure(buffers);
+  if (!device.begin()) {
+    // 理由は device.lastErrorName() で分かる（例："ESP_ERR_INVALID_SIZE"）
+  }
+}
+
+void loop() {
+  if (device.ready() && console.available()) {
+    const int c = console.read();
+    console.write(uint8_t(c));
+    if (c == '!') keyboard.tapKey('a');
+  }
+  delay(1);
+}
+```
+
+はじめて使うときは[サンプルの進め方](docs/example-workflow.ja.md)、目的から探すときは
+[サンプル一覧](examples/README.ja.md)を見てください。動かないときは、まず
+[Info](examples/Info/) の bring-up check を動かします。
+
+Arduino-ESP32 標準の `USB`、`USBHIDKeyboard`、`USBCDC`、`USBMSC` などとの互換は目標にしません。
+標準 API から移る場合は[移行ガイド](docs/migrating-from-arduino-esp32-usb.ja.md)が対応表になっています。
+
+## 対応 chip と class
+
+| chip | 速度 | [HID](docs/classes/hid.ja.md) | [CDC](docs/classes/cdc.ja.md) | [Vendor](docs/classes/vendor.ja.md) | [MIDI](docs/classes/midi.ja.md) | [MSC](docs/classes/msc.ja.md) | [Audio](docs/classes/audio.ja.md) | [Video](docs/classes/video.ja.md) | [NCM](docs/classes/ncm.ja.md) | [CCID](docs/classes/ccid.ja.md) | [DFU](docs/classes/dfu.ja.md) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ESP32-S3 | FS（12 Mbps） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ESP32-P4 v1.x と P4X（v3.1 以降） | HS（480 Mbps）と FS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ESP32-S2 | FS（12 Mbps） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+✅ = `tests/` の試験で、実機の転送を確かめています。ESP32-S3 二台の FS、ESP32-S2 と S3 を FS で
+直結した両方向、P4 と P4X を HS で直結した両方向、P4 一台の HS と FS controller の結線、P4X と S2 の
+それぞれと Linux PC です。ESP32-S31 にはまだ対応していません。
+
+class の一覧：
+
+- **HID：** keyboard（6 キーか NKRO、配列の変換、LED 状態）、mouse、gamepad、Consumer Control（メディアキー）、
+  System Control、vendor 定義の report、スケッチが書く report descriptor
+- **CDC ACM：** USB serial port。Arduino の `Stream` で、複数の port を置ける
+- **Vendor：** bulk の送受信と vendor の control 要求。WebUSB と Microsoft OS 2.0（WinUSB）の descriptor を生成する
+- **MIDI 1.0：** 方向ごとに最大 16 cable
+- **MSC：** RAM・FAT12 RAM・SD card・firmware の disk を helper で公開する
+- **Audio：** UAC1 と UAC2 の再生と録音
+- **Video：** UVC のカメラ（MJPEG か YUY2、Isochronous か Bulk）
+- **NCM：** CDC-NCM の USB ネットワーク。任意で lwIP と DHCP
+- **CCID：** スマートカードリーダー。カードの中身をスケッチで書く
+- **DFU 1.1：** `dfu-util` での firmware 更新と runtime の DETACH
+
+自由に組み合わせて 1 つの複合 device にできます。上限は controller の endpoint と FIFO だけで、
+収まらない構成は `begin()` が拒否します。
+
+## 必要なもの
+
+- Arduino-ESP32 **3.3.12**（例の `sketch.yaml` で固定しています）。
+- ESP32-S3 と ESP32-S2：**ツール > USB Mode** を **USB-OTG (TinyUSB)**（`USBMode=default`）にします。
+  ESP32-S3 の既定は Hardware CDC and JTAG です。
+- ESP32-P4：**ツール > Chip Variant** で revision を選びます。v1.x は `prev3`、v3.1 以降（P4X）は `postv3` です。
+- core 自身の USB CDC・MSC・DFU を起動時に有効にしたり、`USB.begin()` を呼んだりしないでください。
+  USB OTG controller はこのライブラリが使います。
+
+## 3.0 で変わったこと
+
+3.0 はメジャー版です。2.x のスケッチには変更が要ります。手順は [v2 からの移行](docs/migrating-from-v2.ja.md)にあります。
+
+### TinyUSB から、ライブラリ自身の USB スタックへ
+
+2.x は、ライブラリが同梱した TinyUSB を、ライブラリの `tusb_config.h` で build していました。
+class の buffer の大きさは `CFG_TUD_*` の build flag で決まり、変えるには `build_opt.h` を書いて
+全体を build し直す必要がありました。使わない class の buffer もリンク時に確保されていました。
+
+3.0 は TinyUSB の class と共通 stack を使いません。USB の処理はすべてライブラリ自身のコードです。
+
+```text
+スケッチ
+  ↓
+EspUsbDevice と Function（HID, CDC, Vendor, MIDI, MSC, Audio, Video, NCM, CCID, DFU）
+  ↓
+descriptor の生成、endpoint の割当て、転送の契約
+  ↓
+core（EP0、標準要求、event queue）と runtime（PHY、controller の選択、USB worker task）
+  ↓
+DWC2 driver（register、FIFO、DMA、割込み、cache）
+  ↓
+ESP-IDF（PHY、FreeRTOS、heap）
+```
+
+- class driver と共通 core は、USB 2.0 と各 class の規格に合わせて新しく書いたものです。
+- controller の DWC2 driver だけは TinyUSB（MIT）と ST（BSD-3-Clause）のコードに由来し、ライブラリの一部として保守しています。
+  由来と変更の範囲は [third_party/tinyusb](third_party/tinyusb/PROVENANCE.ja.md) にあります。
+- `#include <tusb.h>`、`tud_*()` の呼出し、`CFG_TUD_*` の flag は使えません。旧 flag を定義すると compile error になり、代わりの API を示します。
+- Arduino-ESP32 は、SoC・PHY・FreeRTOS を使うための platform として引き続き使います。core の USB Device 実装（`USB.h` 系）とは同時に使えません。
+
+### 使い方の変化
+
+| 項目 | 2.x | 3.0 |
+| --- | --- | --- |
+| buffer の大きさ | `build_opt.h` の `CFG_TUD_*`。全体を build し直す | 各 Function の `configure()` で実行時に決める。instance ごとに違ってよい |
+| メモリの確保 | 使わない class の分もリンク時に静的に確保 | `begin()` が使う Function の分だけ確保し、`end()` が解放する |
+| 大きさの変更 | build し直す | `end()` → `configure()` → `begin()` |
+| USB の task | `device.task()` を `loop()` で呼ぶ | ライブラリの worker task が動く。`device.task()` は廃止 |
+| Function の開始 | `keyboard.begin()` などを個別に呼べた | `device.begin()` だけ。Function の `begin()` は非公開 |
+| callback の登録 | いつでも | `device.begin()` の前だけ。登録関数は `esp_err_t` を返す |
+| 状態 | `ready()` | `started()`、`ready()`、`suspended()`、`speed()` |
+| 失敗の知り方 | Host での列挙の失敗として現れる | `begin()` が USB を動かす前に検査し、`lastErrorName()` と各 Function の `startError()` が理由を示す |
+| Function の数 | 6 個まで | 上限なし。controller の endpoint と FIFO で決まる |
+| ESP32-P4 | FS と HS の port 番号を意識する | `config.controller` で選ぶ。`Auto` は HS。revision v1.x と P4X の両方 |
+| 大きなデータの転送 | 65535 byte まで | 借用 DMA 転送（`writeDirect` / `readDirect`）。完了は一度だけ通知される |
+| ring の置き場所 | 内部 RAM の固定領域 | スケッチが渡せる。PSRAM も可 |
+
+実測（ESP32-S3、同じ機能の例どうし）では、静的 RAM が約 59.5 KB から約 22 KB に減り、flash は 1.6〜10 % 減りました。
+3.0 の buffer は `begin()` で heap から確保するので、`begin()` の後の空き heap も確かめてください。
+
+### compile は通るが動作が変わるもの
+
+次のものはそのまま compile でき、動作だけが変わります。多くは規格に合わせた修正です。
+
+- `device.begin()` の後に登録した callback は呼ばれません（登録関数が `ESP_ERR_INVALID_STATE` を返す）。
+- Keyboard の `pressUsage()` は押下中のキーに足します（6 個まで）。`tapKey()` は自分が足したキーだけを離します。
+- `mouse.move()` は押しているボタンを保ちます。
+- System Control は標準の usage 0x81〜0x83 で指定します。範囲外の MIDI や Consumer の値は丸めずに拒否します。
+- CDC の `write()` / `flush()` は、送れるまで最大 1000 ms 待ちます（`setTxTimeoutMs()`）。
+- MSC の媒体を挿し直すと、次の command に UNIT ATTENTION を一度返します。既定の staging は 512 byte です。
+- UAC2 の FS feedback は 3 byte（10.14）です。scheme のない WebUSB の URL は、書いたとおりの文字列として送ります。
+
+全体の一覧は [v2 からの移行の「コンパイルでは分からない変更」](docs/migrating-from-v2.ja.md#コンパイルでは分からない変更)にあります。
+
+## 基本の形
+
+```cpp
+#include <EspUsbDevice.h>
+
+EspUsbDevice device;                       // Device を先に宣言する
+EspUsbDeviceVendor vendor(device);         // Function は Device に自分を登録する
+
+void setup() {
+  Serial.begin(115200);
+
+  EspUsbVendorConfig buffers = vendor.configuration();   // 今の設定から始める
+  buffers.rxCapacity = 4096;
+  if (vendor.configure(buffers) != ESP_OK) return;       // 停止中だけ成功する
+
+  vendor.onRx([](size_t) { /* USB worker で呼ばれる。短く */ });   // callback は begin の前に
+
   EspUsbDeviceConfig config;
   config.vid = 0x303a;
-  config.pid = 0x4001;
-  config.product = "EspUsbDevice Keyboard";
-  device.begin(config);
-}
-
-void loop()
-{
-  if (device.ready())
-  {
-    keyboard.write("hello");
-    delay(1000);
+  config.pid = 0x4002;
+  config.product = "My device";
+  if (!device.begin(config)) {
+    Serial.printf("begin: %s (vendor: %s)\n", device.lastErrorName(),
+                  esp_err_to_name(vendor.startError()));
   }
 }
-```
 
-CDC ACM serial:
-
-```cpp
-#include "EspUsbDevice.h"
-
-EspUsbDevice device;
-EspUsbDeviceCdcSerial SerialUSB(device);
-
-void setup()
-{
-  EspUsbDeviceConfig config;
-  config.product = "EspUsbDevice Serial";
-  device.begin(config);
-}
-
-void loop()
-{
-  if (SerialUSB.connected())
-  {
-    SerialUSB.println("hello");
-    delay(1000);
-  }
+void loop() {
+  if (!device.ready() || device.suspended()) return;   // Host が構成するまで待つ
+  uint8_t data[64];
+  const size_t n = vendor.read(data, sizeof(data));
+  if (n) vendor.write(data, n);                        // 受け付けた byte 数を返す
 }
 ```
 
-## Examples
+- **順序：** 宣言 → `configure()` → callback の登録 → `device.begin()`。変えるときは `device.end()` してから。
+- **状態：** `started()` は `begin()` が成功してから `end()` まで、`ready()` は Host が構成した（SET_CONFIGURATION）とき、
+  `suspended()` は bus が休止しているときに `true` です。`speed()` は Host と決まった速度を返します。
+- **callback：** すべて USB worker task で動きます。待つ処理、大量の表示、`begin()` / `end()` は書かず、
+  flag を立てるかデータを写して、処理は `loop()` で行います。worker の stack は `config.taskStackBytes`（既定 4096）です。
+- **エラー：** `begin()` は `bool` を返し、理由は `device.lastError()` / `lastErrorName()` です。
+  `ESP_ERR_INVALID_SIZE` は endpoint や FIFO に収まらない構成、`ESP_ERR_INVALID_ARG` は設定の誤り、
+  `ESP_ERR_INVALID_STATE` は呼ぶ時期の誤りです。症状からは[トラブルシューティング](docs/troubleshooting.ja.md)を引けます。
+- **事前の検査：** `config.startMode = EspUsbDeviceStartMode::DescriptorsOnly` にすると、USB を動かさずに
+  descriptor を作って構成を検査できます。[Info](examples/Info/) の DescriptorDump が使います。
+- **remote wakeup：** `config.remoteWakeupSupported = true` で広告し、Host が許可していれば `device.remoteWakeup()` で起こせます。
 
-ユーザー向けの基本 sketch は [examples/README.ja.md](examples/README.ja.md) にまとめています。
+## class ごとの要点
 
-診断用の sketch は `examples/Info/` にあります。動かないときはここから始めてください。
-使い方と切り分けの手順は [docs/usb-device-guide.ja.md](docs/usb-device-guide.ja.md) にまとめています。
+各 class の全設定、動作、Host OS 側の注意は [class の文書](docs/classes/)にあります。
 
-- `Info/EspUsbDeviceBringUpCheck`: 起動、列挙、速度、Host → Device 疎通を順に確認する。**最初に動かす。**
-- `Info/EspUsbDeviceDescriptorDump`: 組み立てられた descriptor 全部と endpoint 予算を表示する（Host 接続不要）。
-- `Info/EspUsbDeviceConsole`: Serial から手打ちで HID report / vendor 転送を送り、Host からの要求を表示する。
-
-機能別:
-
-- `Keyboard`: layout 付き ASCII 文字列と HID usage ID を送信する boot keyboard。
-- `KeyboardNKRO`: 任意数のキーを同時押下できる N-key rollover keyboard。
-- `Mouse`: 移動、wheel、button を送信する boot mouse。
-- `KeyboardMouse`: keyboard + mouse の composite HID。
-- `Gamepad`: axes、hat、button を送信する HID gamepad。
-- `MediaKeys`: volume、再生停止、system control を送信する HID media keys。
-- `VendorHID`: 独自 report を送受信する vendor-defined HID（1 report 最大 63 byte、ESP32-P4 では 511 byte）。
-- `USBVendor`: bulk IN/OUT と control request を扱う vendor-specific interface。
-- `CustomHID`: sketch 定義の HID report descriptor を使う custom HID。
-- `Serial`: PC / Host とテキストを送受信する CDC ACM serial。
-- `MIDI`: note / control change を送受信する USB MIDI device。
-- `MIDIController`: ADC / button input を MIDI CC / note に変換する controller。
-- `MIDIInterface`: UART MIDI 1.0 と USB MIDI 1.0 の bridge。
-- `MSC`: RAM buffer を block device として公開する Mass Storage Class。
-- `MSCFatRamDisk`: RAM 上の FAT12 disk で Host とファイルを受け渡す Mass Storage Class。
-- `MSCSdCard`: SPI SD card を Host へ USB storage として公開する Mass Storage Class。
-- `UsbNetwork`: DHCP サーバと `http://192.168.7.1/` の Web ページを持つ CDC-NCM
-  ネットワークデバイス（USB 経由でアクセス）。
-- `SmartCardReader`: Get UID と echo 命令に応答する擬似カードを持つ CCID スマートカードリーダー。
-- `CompositeHidCdcMsc`: HID keyboard + CDC serial + MSC FAT RAM disk を 1 台にした複合デバイス。
-
-## HID Keyboard / Mouse APIs
-
-Keyboard:
-
-- `keyboard.setLayout(layout)` は EspUsbHost と同じ layout ID と keymap table を使い、
-  Device 側では ASCII から usage への逆変換に使います。
-- `keyboard.write(text)`、`tapKey(key)`、`pressKey(key)` は文字向けの上位 helper です。
-- `keyboard.tapUsage()`、`pressUsage()`、`releaseUsage()`、`releaseAll()`、
-  `sendReport()` で raw HID usage / report 制御もできます。
-- `keyboard.onOutputReport(callback)` は Host からの LED output report を受け取ります。
-- `keyboard.ledState()` は Host からの最新 LED 状態（`EspUsbDeviceHidKeyboardOutputReport`）を
-  **値で**返します。callback の有無に関係なく更新されるので、統合レイヤが `onOutputReport()` の
-  単一 slot を占有していてもスケッチ側から Lock 状態を読めます（外付け Caps Lock LED を
-  光らせる、など）。LED は event ではなく状態なので polling で足り、callback は単一 slot の
-  ままです。Host が最初の output report を送るまでは全て false で、bus reset / 抜線でも
-  クリアされます。
-  参照ではなく値を返すのは、この値を書くのが TinyUSB device task で、読むのはスケッチの
-  task だからです（参照を返すと他 task が書き換える実体を読むことになる）。raw LED byte を
-  atomic に保持し、1 回の読み出しから report を組み立てるので、フィールドが途中状態で
-  混ざることはありません。EspBle の `ledState()` も同じ理由で値返しです。
-- `keyboard.enableNkro()`（`begin()` の前）で N-key rollover に切り替えます。usages
-  `0x00`-`0xDF` をカバーする bitmap レポート（International/LANG キーも含むので JIS
-  レイアウトも通る）で任意数のキーを同時押下でき、BIOS 向けに6キー boot へ自動 fallback
-  します。既定は無効です。
-- `keyboard.sendReport(EspUsbDeviceNkroKeyboardReport)` は**保持キー全体を1レポートで**
-  送ります。7キー以上の同時押下、あるいは毎周期に状態全体を書く用途はこちらです
-  （`pressUsage()` / `releaseUsage()` の増分 API では1キーの変化ごとに1レポートになり、
-  同時押し・同時離しが分割されます）。`enableNkro()` 前だと失敗します。
-- `EspUsbDeviceNkroKeyboardReport` は `modifiers` と usage `0x00`-`MaxBitmapUsage`
-  (`0xDF`) の28-byte `bitmap` を持ち、`clear()` / `press()` / `release()` / `isDown()`
-  で操作します。modifier usage `0xE0`-`0xE7` は bitmap 範囲外なので `press()` / `release()`
-  が `modifiers` へ振り分け、呼び出し側は usage の区別を意識しません。`press()` / `release()`
-  が false を返すのは、このレポートで表現できない usage（`0xDF` 超で modifier でもない）
-  のときだけです。
-- **bitmap を持つメンバは `bitmap`、usage の配列を持つメンバは `keys`** という規則です。
-  6KRO の `EspUsbDeviceBootKeyboardReport::keys[6]` は usage 配列で、`keys[0] = 0x04` が
-  型によって別の意味になり取り違えてもコンパイルが通るため名前を分けています。姉妹
-  ライブラリ `EspUsbHost` / `EspBle` も同じ規則です。bitmap のサイズは Host 側が
-  usage `0x00`-`0xFF` の32 byte、Device 側が report descriptor の宣言範囲に合わせた
-  `0x00`-`0xDF` の28 byte で**非対称**です。
-- `keyboard.heldState()` は Host へ最後に伝えた NKRO 状態を返します。同一状態の再送抑制と、
-  `releaseAll()` によらない再同期に使えます（ライブラリ側では再送を抑制しません）。
-  Boot protocol 選択中は「要求した状態」であって電波上のバイト列ではありません
-  （6キーへ畳まれるため）。
-
-Mouse:
-
-- `mouse.move(x, y)`、`wheel(delta)`、`sendReport(report)` は移動と raw report を送信します。
-- `mouse.press(buttons)`、`release(buttons)`、`releaseAll()`、`click(button)`、
-  `buttons()` は Device 側 button 状態を保持して扱います。
-
-## CDC / MIDI / MSC APIs
-
-CDC ACM:
-
-- `EspUsbDeviceCdcSerial` は USB serial の read / write callback と helper を提供します。
-- `available()`、`read()`、`write()`、`print()` 系の Arduino らしい使い方と、
-  raw callback の両方を扱えます。
-- **複数登録できます。** ポートごとに名前を付けて `EspUsbDeviceCdcSerial(device, "Console")`
-  のように登録すると、ホストにシリアルポートが複数見えます。何本載るかは IN endpoint で
-  決まり（1 ポートにつき 2 本）、S2/S3 は 2 ポート、ESP32-P4 の high-speed controller は
-  3 ポート、HID や Vendor と併用するとその分減ります。上限は
-  `EspUsbDevice::maxCdcPorts()` で確認できます。
-
-USB MIDI:
-
-- `EspUsbDeviceMidi` は 4 byte USB-MIDI event packet を送信します。
-- `noteOn()`、`noteOff()`、`controlChange()` などの helper と `writePacket()` を併用できます。
-- `EspUsbDeviceMidi(device, cableCount)` で最大 16 本の cable を公開できます。Host からは
-  cable ごとに別々の MIDI port として見えます。既定は 1 本です。cable は 1 組の bulk endpoint
-  を共有し、各 helper の 0 始まりの `cable` 引数、または `EspUsbDeviceMidiPacket::header` の
-  上位 nibble で指定します。
-- `EspUsbDeviceMidi(device, inCableCount, outCableCount)` で方向ごとに異なる cable 数を
-  指定できます（実際の MIDI インターフェースでは非対称が普通です）。名前はどちらも Host から
-  見た方向で、USB の endpoint 方向や EspUsbHost の `EspUsbHostMidiPortInfo` と同じです——
-  IN が device → Host（device が送る側）、OUT が Host → device です。`noteOn()` などの送信
-  helper の上限は `inCableCount()` なので、受信専用の cable への送信は、他の port に載ることなく
-  失敗します。
-- cable ごとの名前付けは未実装です（port 名は Host 側が付けます）。
-- ESP-IDF の USB Host（EspUsbHost）と組み合わせる場合、cable 数の上限は **5 本**です。
-  この Host は enumeration の control transfer より長い configuration descriptor を拒否し、
-  `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE` は Arduino のプリコンパイル済みライブラリで
-  256 固定、スケッチからは変更できません。5 cable は configuration header を含めて 229 byte で
-  enumerate でき、6 cable は 261 byte で `CHECK_SHORT_CONFIG_DESC FAILED` になります
-  （`tests/peer/usb_midi_cables` で実測）。16 本は USB 仕様上は正当で PC の Host は受け付けます。
-  制約は Host スタック側にあり、本ライブラリ側ではありません。
-
-MSC:
-
-- `EspUsbDeviceMsc` は inquiry、media 状態、capacity、read/write callback を扱います。
-- `EspUsbDeviceMscRamDisk` は外部 RAM buffer を block device として公開する helper です。
-- `EspUsbDeviceMscFatRamDisk` は RAM 上に小さい FAT12 image を作り、Host との一時ファイル
-  受け渡しに使う helper です。
-- `EspUsbDeviceMscSdCard` は Arduino `SD` の raw sector I/O を MSC に接続する helper です。
-- MSC は block device と filesystem が別です。OS からドライブとしてマウントするには、
-  有効な FAT image か SD card などの実 storage を read/write callback に接続してください。
-- flash / SPIFFS / LittleFS の直接公開は標準方針にしません。永続ストレージは SD card、
-  一時ファイル受け渡しは RAM disk + FAT helper を優先します。
-
-## USB Audio APIs
-
-旧card型の`EspUsbDeviceAudio`実装は削除しました。新Audioは1つのfunctionへ、
-Playback（Host→Device）とCapture（Device→Host）のstreamを独立して追加します。
+### HID
 
 ```cpp
-EspUsbDevice device;
-EspUsbAudioFunction audio(device); // defaultはUAC1
-
-auto &playback = audio.addPlaybackStream();
-playback.addFormat({48000, 2, 2, 16});
-
-auto &capture = audio.addCaptureStream();
-capture.addFormat({48000, 1, 2, 16});
+EspUsbDeviceHidKeyboard keyboard(device);
+EspUsbDeviceHidMouse mouse(device);
+// loop() の中で
+keyboard.write("hello\n");   // 文字列をキー操作として送る（setLayout() で配列を選ぶ）
+keyboard.tapUsage(0x28);     // usage ID で送る（Enter）
+mouse.move(10, 0);
 ```
 
-- `EspUsbAudioPlaybackStream::available()` / `read()`でspeaker PCMを消費する。
-- `EspUsbAudioCaptureStream::write()`でmicrophone PCMを供給する。
-- format fieldは`sampleRate`、`channels`、`bytesPerSample`、`bitsPerSample`で、
-  EspUsbHostと語彙を揃える。
-- `pollEvent()`はbounded queueからstream state、sample rate、mute、volume変更を返す。
-  高頻度のアプリ処理、I2S write、user callbackでTinyUSB taskをblockしないためPCMは
-  polling APIにしている。
-- `stats()`、`resetStats()`、`clearBuffer()`でtransfer、overrun、underrunを観測でき、
-  Audio Card固有のreceive task内部へ隠さない。
-- Master/Left/RightのstateはUSB Feature Unit requestとmute/volume APIで共有する。
-  volumeはsigned 1/256 dB wire単位。
-- mute、volume、downmixなどのDSPを暗黙適用しない。I2S、codec、microphone、speaker、
-  DSPはapplicationまたは任意のPCMFlow/PCMFlowDevice側の責務とする。
+- 文字の helper（`write`、`tapKey`、`pressKey`）と、usage ID・raw report の API の両方があります。
+- `keyboard.enableNkro(true)`（`begin()` の前）で N-key rollover。Host が boot protocol を選んでいる間（BIOS など）は 6 キーの形式で送ります。
+- `keyboard.ledState()` は Host が送った LED の状態（Num / Caps / Scroll Lock など）を値で返します。
+- Gamepad、Consumer Control、System Control、vendor 定義の report（`EspUsbDeviceHidVendor`）、
+  自分で書いた report descriptor（`EspUsbDeviceHidCustom`）を同じ device に並べられます。
+  ESP32-P4 の HS では、1 packet 1024 byte までの interrupt endpoint を使えます。
 
-UAC1はdefaultで、S3のspeaker、microphone、duplex Peer streaming、control変更、
-16/24/32-bit descriptor/transferを検証済みです。UAC2は
-`EspUsbAudioFunction(device, EspUsbAudioProtocol::Uac2)`で選択します。descriptor、
-Clock Sourceによるsample rate制御、Feature Unitのmute/volume（masterとlogical
-channel）、非同期playback interfaceのexplicit feedback endpointを含む双方向
-streamingを、EspUsbHostのUAC2 hostに対する2台テスト `peer/usb_audio_uac2` で
-検証済みです。UAC2 functionが宣言するsample rateは方向ごとに1つです（descriptor
-builderがalternate settingを1つだけ出力するため、Clock Sourceが報告するrateも1つ）。
+### CDC（USB serial）
 
-新Audio sourceはUSB Audio仕様とTinyUSB公開driver APIから独立設計しました。旧
-Espressif USBAudioCard由来sourceを継続改変せず削除しています。詳細は
-[Audio source provenance](docs/V2_AUDIO_PROVENANCE.ja.md)を参照してください。
+- `EspUsbDeviceCdcSerial` は Arduino の `Stream` です。`print()`、`readBytes()`、`setTimeout()` が使えます。
+- 名前を付けて複数置けます（`EspUsbDeviceCdcSerial(device, "Console")`）。1 port で IN endpoint を 2 本使います。
+- line coding、DTR / RTS、break を callback と照会で受け取れます。
 
-## CCID（スマートカードリーダー）APIs
+### Vendor、WebUSB、WinUSB
 
-- `EspUsbDeviceCcid` はボードを 1 slot の USB CCID リーダーとして見せます
-  （`bInterfaceClass` 0x0b、bulk IN/OUT と挿抜通知用の interrupt IN）。
-  slot の中のカードはスケッチが実装します。
-- `insertCard(atr, length)` / `removeCard()` がカードの有無と `IccPowerOn` で返す ATR を
-  決め、いずれも interrupt endpoint で Host へ通知します。状態は `cardPresent()` /
-  `cardPowered()` で読めます。
-- `onApdu(callback)` が各 exchange に応答します。callback は APDU を受け取り SW1SW2 を
-  含む応答を書くので、カードの正体を決めるのはスケッチです。callback 未設定時は、命令を
-  知らないカードと同じ 6D00 を返します。`onEscape(callback)` は vendor 固有の
-  `PC_to_RDR_Escape` 用、`onPower(callback)` は活性化の通知です。
-- slot status、活性化、parameter、abort の各メッセージはライブラリ側で応答するので、
-  仕様に従う Host に対してスケッチ側の対応は不要です。
-- callback は TinyUSB device task で実行されます。長く止めず、中から USB API を
-  呼び返さないでください。
+- bulk の送受信は、コピー（`read` / `write`）、callback（`onRxData`）、借用 DMA（`writeDirect` / `readDirect`）から選べます。
+- 借用 DMA は、スケッチの buffer をコピーせずに DMA へ渡します。完了は `EspUsbTransferResult` で一度だけ返り、
+  取消し、bus reset、`end()` のときも buffer は必ず戻ります。
+- vendor の control 要求をスケッチで処理できます。WebUSB の landing page と、Windows が driver を自動で当てる
+  Microsoft OS 2.0 descriptor を、実際に割り当てた interface に合わせて生成します。
 
-## ファームウェア更新 APIs
+### MIDI
 
-- `EspUsbDeviceDfu` は USB DFU function を追加します。消費するのは interface 1 本と
-  **endpoint 0 本**（全転送が EP0 を通ります）なので、endpoint 予算を使い切った
-  デバイスにも載ります。
-  - `EspUsbDeviceDfuMode::Download` は更新自体を実装します。`dfu-util -D
-    firmware.bin` が空いている OTA partition へ書き込み、デバイスが検証して
-    そのイメージで再起動します。ROM を使わないので ESP32-S2 / S3 / P4 で同じ
-    動作です。
-  - `EspUsbDeviceDfuMode::Runtime` は `DFU_DETACH`（`dfu-util -e`）にだけ応え、
-    既定ではチップの ROM download loader へ再起動します。
-  - hook は `onProgress()` / `onComplete()` / `onError()` / `onDetach()` と
-    `restartWhenComplete(false)`。いずれも usbd task 上で動きます。
-- `EspUsbDeviceMscFirmwareDisk` は、データ領域が OTA partition **そのもの**である
-  小さな FAT ボリュームを提供します。host がドライブへ `.bin` を放り込むと、device が
-  flash へ流し込み、検証し、そのイメージで再起動します。イメージは RAM に載りません。
-  載るのはボリュームのメタデータと、host のファイルマネージャが残すものを吸収する
-  スクラッチ領域だけです。firmware 領域への書き込みは昇順が前提で、そうでないものは
-  中途半端に適用せず拒否します。**UF2** を渡せばこの制約は消えます。block ごとに
-  自分の target address を持つので書き込み順は任意、完了判定は正確、family ID が
-  別 chip 向けのイメージを flash に触れる前に拒否します。
-- `EspUsbDeviceFirmwareUpdate` は動作していない側の OTA partition へイメージを
-  書き、検証し、boot partition を切り替えます。転送路に依存しません。DFU class が
-  使うほか、CDC / vendor bulk / MSC / NCM 越しの HTTP アップロードでバイトを
-  受け取るスケッチからも使えます。
-  - `available()` / `capacity()` / `targetLabel()` は、アップロードを始める前に
-    そもそも成立するかを答えます。application partition が 1 つだけの scheme
-    （`huge_app`）には新しいイメージの置き場所がありません。
-  - `begin()` / `write()` / `end()` / `abort()` でストリーム書き込み。flash は
-    先頭でまとめてではなく、書き込みが進むにつれて erase します。長さが分かっていて
-    順不同で届く転送路向けには `beginRandomAccess()` / `writeAt()` があります。
-  - `markValid()` は動作中のイメージを確定し、bootloader の rollback 待ちを
-    解除します。戻る手段は `rollback()` と `cancelPendingBoot()` です。
-- `EspUsbDevice::rebootToBootloader()` はチップの ROM download loader へ再起動し、
-  `esptool` で flash 全体を書き換えられるようにします。`rebootToRomDfu()` は
-  S2/S3 の ROM に DFU で立ち上がるよう頼みます。ただし ESP32-S3 では一方向の
-  `USB_PHY_SEL` eFuse が要るため、焼かれていなければコネクタが沈黙する再起動をせず
-  拒否します。download-boot フラグのレジスタは
-  ターゲットごとに違い、ESP32-P4 ではソフトウェアリセットのビットと同居して
-  いるため、ライブラリの API にしています。Arduino-ESP32 の
-  `usb_persist_restart()` はこのライブラリを使うスケッチからは link できません。
+```cpp
+EspUsbDeviceMidi midi(device);              // cable 1 本
+midi.noteOn(0, 60, 100);                     // channel 0〜15、note、velocity
+EspUsbDeviceMidiPacket packet;
+while (midi.readPacket(packet)) { /* 受信 */ }
+```
 
-chip 別の boot mode、ROM がどのコネクタで応答するか、経路の比較表は
-[docs/ota-over-usb.ja.md](docs/ota-over-usb.ja.md) にあります。
+- `EspUsbDeviceMidi(device, inCables, outCables)` で、方向ごとに 16 本までの cable を Host に見せます。
 
-## Network / Composite APIs
+### MSC（USB ドライブ）
 
-USB ネットワーク（CDC-NCM）:
+```cpp
+EspUsbDeviceMsc msc(device);
+uint8_t storage[32 * 512];
+EspUsbDeviceMscRamDisk volume(storage, 32);
+// setup() で
+volume.attach(msc);
+msc.mediaPresent(true);
+```
 
-- `EspUsbDeviceNet` はボードを USB ネットワークアダプタとして見せます。最近の Windows /
-  macOS / Linux は標準の NCM ドライバをインストール不要で bind します。
-- `onFrame()` / `sendFrame()` は生 Ethernet フレームを扱います。`beginNetwork()` を
-  呼ばなければ生フレーム transport のままです（PC 側ブリッジ実験に有用）。
-- `beginNetwork()` は lwIP/esp_netif インターフェースを起動します。アドレス方式は
-  `dhcpServer(true)`（デバイスが gateway、host に配布）、`dhcpClient(true)`（PC ブリッジ
-  LAN から取得）、`ipConfig(...)`（静的）から選択。DHCP は opt-in です。サブネットは既定で
-  `192.168.7.0/24`（デバイスは `192.168.7.1`）ですが、`beginNetwork()` の前に
-  `ipConfig(local, gateway, subnet)` を渡せば変更でき、DHCP サーバの配布レンジも設定した
-  IP/mask に自動追従します。
-- DHCP サーバは既定で gateway/DNS を広告しません（host の実インターネット経路をブラックホール
-  化しないため）。実際に転送する/到達可能な DNS がある場合は `dhcpAdvertiseGateway(true)` /
-  `dhcpDns(ip)` で opt-in します。
-- USB netif は route priority を低くしてあり、Wi-Fi STA 併用時は Wi-Fi が ESP のデフォルト経路の
-  ままです。`defaultRoute(true)` で USB ホストを ESP の uplink にできます（PC がブリッジ/NAT する
-  構成 + `dhcpClient(true)`）。
-- ホストに見せる MAC は、既定でこのチップ固有の Ethernet MAC（`esp_read_mac` / `ESP_MAC_ETH`）を
-  使います。個体ごとに一意で、Wi-Fi STA/AP・BT の MAC とも重複しないため、NCM と Wi-Fi を同時に
-  使っても自分自身と衝突しません。1 台の PC に 1 台なら常に問題なく、同一の 2 枚のボードを同じ PC に
-  挿しても MAC が異なるので動作します。`begin()` の前に `macAddress(mac)` を呼べば任意の MAC に
-  固定できます（ただし 2 枚を同じ MAC に固定すると同一ホスト上で衝突し、`dhcpServer(true)` の
-  2 台は既定で `192.168.7.0/24` サブネットが重複します。各デバイスに別々の `ipConfig(...)`
-  サブネットを与えれば、1 台のホストに複数台を共存させられます）。
+- BOT と SCSI はライブラリが処理し、block の読み書きは callback か helper に任せます。
+- helper：`EspUsbDeviceMscRamDisk`（raw block）、`EspUsbDeviceMscFatRamDisk`（ファイルを置ける FAT12。容量に合わせて cluster を選ぶ）、
+  `EspUsbDeviceMscSdCard`（SD card）、`EspUsbDeviceMscFirmwareDisk`（ファイルを書くと firmware を更新する）。
+- 保存先は PSRAM に置けます。媒体の取り外しと交換を Host に正しく伝えます。
 
-複合:
+### Audio
 
-- 複数クラスを 1 つの `EspUsbDevice` に登録し `begin()` を 1 回呼ぶだけで、interface 番号と
-  endpoint が割り当てられ複合 descriptor が構成されます。`CompositeHidCdcMsc` を参照。
+```cpp
+EspUsbAudioFunction audio(device, EspUsbAudioProtocol::Uac2);   // 省略すると UAC1
+EspUsbAudioPlaybackStream &playback = audio.addPlaybackStream();
+// setup() で
+playback.addFormat({48000, 2, 2, 16});   // rate、channel、byte/sample、bit/sample
+// loop() で
+size_t n = playback.read(pcm, sizeof(pcm));
+```
+
+- Playback（PC → ESP32）と Capture（ESP32 → PC）を 1 つの Function に持てます。
+- 音量・ミュート・rate の変更は `pollEvent()` で知らせるだけで、PCM には掛けません。I2S や codec はアプリ側で扱います。
+
+### Video
+
+- `EspUsbDeviceVideo` は UVC のカメラです。MJPEG か YUY2 の frame を `submitFrame()` で渡します。JPEG の encode はしません。
+- 転送は Isochronous か Bulk を実行時に選べます。ESP32-P4 の HS では帯域が大きく取れます。
+
+### NCM（USB ネットワーク）
+
+- `EspUsbDeviceNet` は PC から USB ネットワークアダプタに見えます。最近の Windows・macOS・Linux は driver の導入なしで使えます。
+- `beginNetwork()` で lwIP の netif を作り、`dhcpServer(true)` で PC にアドレスを配れます。Web の設定画面や API を USB 越しに見せる形です。
+- IP を使わず、Ethernet frame を直接扱うこともできます（`onFrame()` / `sendFrame()`）。
+
+### CCID（スマートカードリーダー）
+
+- 1 slot、T=1、short APDU のリーダーです。カードの ATR と APDU への応答をスケッチで書きます（`insertCard()`、`onApdu()`）。
+- PC の PC/SC アプリから、カードが挿さったリーダーとして見えます。
+
+### DFU と firmware の更新
+
+- `EspUsbDeviceDfu` の Download は、`dfu-util -D firmware.bin` で予備の OTA partition に書き、検証して再起動します。
+  endpoint を使わないので、どの構成にも足せます。Runtime は `dfu-util -e` の DETACH だけに応えます。
+- `EspUsbDeviceFirmwareUpdate` は経路に依存しない OTA の書込み器です。CDC、Vendor、NCM 越しの HTTP からも使えます。
+- `device.rebootToBootloader()` は動作中のスケッチから ROM の download loader に入ります。
+- chip ごとの boot mode と、各経路の比較は [USB 経由の OTA](docs/ota-over-usb.ja.md) にあります。
+
+## 複合 device と endpoint
+
+Function を必要なだけ宣言して `device.begin()` を一度呼ぶと、interface 番号と endpoint を割り当てて
+複合 device の descriptor を作ります。上限は controller の資源です。
+
+| controller | control 以外の IN endpoint | endpoint 番号 |
+| --- | --- | --- |
+| ESP32-S2 / S3 | 4 | 1〜6 |
+| ESP32-P4 の FS controller | 4 | 1〜6 |
+| ESP32-P4 の HS controller | 7 | 1〜15。bulk 512 byte、interrupt 1024 byte まで |
+
+- IN endpoint の消費：CDC・NCM は 2 本、CCID は 2 本（カード固定なら 1 本）、Vendor・MIDI・MSC・Video は 1 本、
+  HID は全 HID で 1 本を共有、DFU は 0 本。Audio は capture が 1 本、UAC2 の playback が feedback で 1 本です。
+  たとえば S3 では、HID ＋ CDC ＋ MSC（1 ＋ 2 ＋ 1）で 4 本を使い切ります。
+- `begin()` は endpoint の数と TX FIFO の容量を USB を動かす前に検査し、収まらなければ `ESP_ERR_INVALID_SIZE` を返します。
+  組み立てた descriptor と予算は [Info](examples/Info/) の DescriptorDump で、Host なしで確かめられます。
+- 例：[CompositeHidCdcMsc](examples/CompositeHidCdcMsc/)（keyboard ＋ serial ＋ FAT disk）。
+
+## ESP32-P4 と HS
+
+- P4 には HS（480 Mbps、UTMI PHY）と FS の 2 つの controller があります。`config.controller` の `Auto` は HS を選びます。
+- HS では bulk packet が 512 byte になります。MSC の `transferBytes` は 512 の倍数、`readDirect()` の容量も 512 の倍数が必要です。
+  FS で動いた設定でも、HS では `begin()` が拒否することがあります。
+- `device.speed()` で Host と決まった速度が分かります。HS controller でも、FS の Host や hub につなぐと FS です。
+- HS では USB 2.0 の TEST_MODE に応答します。
+- 例：[P4HighSpeedDevice](examples/P4HighSpeedDevice/)、[P4FullSpeedDevice](examples/P4FullSpeedDevice/)。
+
+## メモリと PSRAM
+
+- buffer は `begin()` で heap から確保し、`end()` で解放します。失敗したときは何も残しません。
+- CPU が読み書きする ring や MSC の保存先は、スケッチが渡せます。PSRAM も使えます。
+- USB の DMA が触る領域（staging、借用転送の buffer）は内部 RAM です。借用転送に PSRAM の buffer を渡すと `NotDmaCapable` で拒否します。
+- 詳しくは[詳細ガイド](docs/usb-device-advanced.ja.md)の DMA と PSRAM の章を見てください。
 
 ## 制限事項
 
-- Arduino-ESP32 標準の `USB.begin()`、`USBHIDKeyboard`、`USBHIDMouse` などとは併用しません。
-- USB Audioは`EspUsbAudioFunction`によるPlayback/Capture実装です。互換性重視の
-  UAC1がdefaultで、UAC2は
-  `EspUsbAudioFunction(device, EspUsbAudioProtocol::Uac2)`で明示選択します。
-  UAC2 functionは方向ごとにsample rate 1つ・alternate setting 1つを宣言するため、
-  Hostからrateを切り替えることはできません。I2S、codec、DACなどのデバイス接続は
-  このライブラリの責務外です。
-- ネットワークデバイスは CDC-NCM のみです。CDC-ECM は Arduino-ESP32 core で無効（有効化には core 再ビルドが必要）で、NCM は最近のホスト OS が標準対応します。デバイスが PC 経由でインターネットに抜けるにはホスト側のブリッジ/NAT が必要でスコープ外です（その用途は ESP 自身の Wi-Fi を使用）。
-- CCID リーダーは 1 slot、T=1、short APDU level exchange です。chaining、extended APDU、
-  PIN pad / secure entry、mechanical slot、clock / data rate の交渉は範囲外で、class
-  descriptor でも非対応と宣言するため仕様に従う Host は要求しません。CCID メッセージの
-  上限は 271 byte です（`ESP_USB_DEVICE_CCID_BUFFER_SIZE` で拡張）。
-- 複合デバイスはESP32-S3のUSB endpoint予算とconfiguration descriptor容量で制限されます。
-  Audioを含む複合構成はDevice側descriptor制約の確認中です。
-- MSC は block device と filesystem を分けて扱います。Host から通常の drive として mount
-  するには FAT RAM disk helper または SD card などを使います。
-- flash / SPIFFS / LittleFS を USB MSC として直接公開することは標準方針にしません。
-- SD card を MSC として Host に公開している間は、ESP32 側で同じ card の file API を使わないでください。
-- WebUSB / Microsoft OS 2.0 descriptor はこのライブラリが生成します。Windows 標準
-  ドライバが当たらない interface（vendor と DFU）それぞれに固定の WinUSB compatible ID
-  を返し、vendor 側には device interface GUID も返すので、どちらも Zadig が要りません。
-  custom vendor code、GUID、descriptor 内容の差し替え API は未実装です。
-- bulk IN endpoint は、コントローラの FIFO に収まるときだけ送信 FIFO を 2 パケット分に
-  します（`config.bulkInBuffering`）。ESP32-P4 の high-speed リンクで一方向 22.98 →
-  28.93 MB/s の実測です。device 単位で全部か無しかで、P4 high-speed では bulk IN 3 本は
-  収まりません。[応用ガイド 5.5節](docs/usb-device-advanced.ja.md#55-endpointごとの送信fifo)
-  を参照してください。
+- Arduino-ESP32 標準の `USB.begin()`、`USBHIDKeyboard`、`USBCDC` などとは同時に使えません。
+- NCM は CDC-NCM だけです（CDC-ECM、RNDIS はありません）。ESP32 が PC 経由でインターネットへ出るには、PC 側の bridge や共有が要ります。
+- CCID は 1 slot、T=1、short APDU です。extended APDU、chaining、PIN pad、T=0 は扱いません。
+- Video は 1 つの Function に 1 つの形式・解像度・fps です。still image とカメラの制御は宣言しません。
+- MSC は 1 Function で LUN 0 だけです。SD card を公開している間は、ESP32 側で同じ card の file API を使わないでください。
+- Audio は音量やミュートを PCM に掛けません。外部 codec の clock のずれには追従しません（ring の水位を見てアプリ側で吸収します）。
+- ISR からの呼出しには対応していません。
 
-USB device そのものの基礎、ESP32 固有の制約、動かないときの切り分け手順は
-[docs/usb-device-guide.ja.md](docs/usb-device-guide.ja.md) にまとめています。
-TinyUSB との関係、descriptor のバイト構造、callback context、独自 class の実装は
-[docs/usb-device-advanced.ja.md](docs/usb-device-advanced.ja.md) にまとめています。
-chip 別の boot mode の入り方、動作中のスケッチから入る方法、USB経由の
-ファームウェア更新経路は [docs/ota-over-usb.ja.md](docs/ota-over-usb.ja.md)
-にまとめています。
-症状から引ける対処集は [docs/troubleshooting.ja.md](docs/troubleshooting.ja.md) に、
-Core 標準 USB API からの移行手順は
-[docs/migrating-from-arduino-esp32-usb.ja.md](docs/migrating-from-arduino-esp32-usb.ja.md)
-にまとめています。
-テスト構造と段階的なカバレッジ計画は [tests/TEST_PLAN.ja.md](tests/TEST_PLAN.ja.md)
-を参照してください。
-[ch32-riscv-ug/wch-protocols](https://github.com/ch32-riscv-ug/wch-protocols) の
-ESP32-P4 high-speed 実測から起票された改修依頼への回答——採用したもの、実測したうえで
-採用しなかったものとその理由——は [docs/CHANGE_REQUESTS.ja.md](docs/CHANGE_REQUESTS.ja.md)
-にまとめています。
-設計背景と `EspUsbHost` 既存テストからの移行メモは [docs/DESIGN_NOTES.ja.md](docs/DESIGN_NOTES.ja.md)
-にまとめています。
-現在の開発方針と残作業は [docs/DEVELOPMENT_PLAN.ja.md](docs/DEVELOPMENT_PLAN.ja.md)
-にまとめています。
-リリース前確認は [docs/RELEASE_CHECKLIST.ja.md](docs/RELEASE_CHECKLIST.ja.md) を参照してください。
+## 文書
+
+| 文書 | 内容 |
+| --- | --- |
+| [USB device ガイド](docs/usb-device-guide.ja.md) | USB の基礎、電源と connector、ESP32 固有の注意、立ち上げ |
+| [class の文書](docs/classes/) | class ごとの使い方、全設定、動作、Host OS 側の注意 |
+| [詳細ガイド](docs/usb-device-advanced.ja.md) | task モデル、descriptor の詳細、control 転送、FIFO、DMA と PSRAM、自作の Function |
+| [サンプル](examples/README.ja.md) | 40 本以上の完結したスケッチ。2.x の例もすべて含む |
+| [トラブルシューティング](docs/troubleshooting.ja.md) | `begin()` のエラー、列挙の問題、OS ごと・class ごとの問題 |
+| [USB 経由の OTA](docs/ota-over-usb.ja.md) | ファームウェア更新の経路：ROM loader、DFU、drive、serial、vendor、browser |
+| [v2 からの移行](docs/migrating-from-v2.ja.md) | EspUsbDevice 2.x のスケッチを 3.0 へ |
+| [Arduino-ESP32 USB からの移行](docs/migrating-from-arduino-esp32-usb.ja.md) | `USBHIDKeyboard`、`USBCDC`、`USBMSC` などから |
+| [テスト](tests/README.ja.md) | 実機試験の構成と、確かめた範囲（[TEST_PLAN](tests/TEST_PLAN.ja.md)） |
+| [変更履歴](CHANGELOG.md) | 版ごとの変更 |
+
+## まだ確かめていないこと
+
+Windows と macOS の Host、実際の SD card と OTA の書込み、ESP32-S2 の ROM DFU への移行、Arduino-ESP32 4.x。
+試験の Host は ESP32 と Linux PC です。[TEST_PLAN](tests/TEST_PLAN.ja.md) を参照してください。
+
+## ライセンス
+
+MIT です。[LICENSE](LICENSE) を参照してください。DWC2 controller の driver は TinyUSB（MIT）と
+ST のコード（BSD-3-Clause）に由来します。[third_party/tinyusb](third_party/tinyusb/PROVENANCE.ja.md) を参照してください。

@@ -1,4 +1,6 @@
 #include "EspUsbAudioModel.h"
+#include "EspUsbMemory.h"
+#include <string.h>
 
 namespace espusb {
 namespace internal {
@@ -74,6 +76,19 @@ AudioStreamModel::AudioStreamModel(AudioDirection direction)
 {
 }
 
+AudioStreamModel::~AudioStreamModel()
+{
+  clearFormats();
+}
+
+void AudioStreamModel::clearFormats()
+{
+  freeUsbMemory(formats_);
+  formats_ = nullptr;
+  formatCount_ = 0;
+  error_ = AudioFormatError::None;
+}
+
 bool AudioStreamModel::addFormat(const AudioPcmFormat &format, UsbSpeed speed,
                                  const AudioBusLimits &limits)
 {
@@ -94,12 +109,78 @@ bool AudioStreamModel::addFormat(const AudioPcmFormat &format, UsbSpeed speed,
       return false;
     }
   }
-  if (formatCount_ == MAX_FORMATS)
+  if (formatCount_ >= SIZE_MAX / sizeof(AudioPcmFormat))
   {
     error_ = AudioFormatError::FormatCapacity;
     return false;
   }
-  formats_[formatCount_++] = format;
+  auto *replacement = static_cast<AudioPcmFormat *>(allocateUsbMemory((formatCount_ + 1) * sizeof(AudioPcmFormat)));
+  if (!replacement) { error_ = AudioFormatError::NoMemory; return false; }
+  // Keep PCM groups contiguous, preserving first-declared alternate order and
+  // each group's rate order. This also makes the shared clock list indexable.
+  size_t insertion = formatCount_;
+  for (size_t i = 0; i < formatCount_; ++i) if (formats_[i].samePcm(format)) {
+    insertion = i + 1;
+    while (insertion < formatCount_ && formats_[insertion].samePcm(format)) ++insertion;
+    break;
+  }
+  if (insertion) memcpy(replacement, formats_, insertion * sizeof(AudioPcmFormat));
+  replacement[insertion] = format;
+  if (insertion < formatCount_) memcpy(replacement + insertion + 1, formats_ + insertion, (formatCount_ - insertion) * sizeof(AudioPcmFormat));
+  freeUsbMemory(formats_);
+  formats_ = replacement;
+  ++formatCount_;
+  return true;
+}
+
+bool AudioStreamModel::hasUniformPcmFormat() const
+{
+  if (!formatCount_) return false;
+  for (size_t i = 1; i < formatCount_; ++i)
+    if (formats_[i].channels != formats_[0].channels || formats_[i].subslotBytes != formats_[0].subslotBytes || formats_[i].validBits != formats_[0].validBits) return false;
+  return true;
+}
+
+size_t AudioStreamModel::alternateCount() const {
+  size_t count = 0;
+  for (size_t i = 0; i < formatCount_; ++i) if (!i || !formats_[i].samePcm(formats_[i-1])) ++count;
+  return count;
+}
+const AudioPcmFormat *AudioStreamModel::alternateFormat(uint8_t alternate) const {
+  if (!alternate) return nullptr;
+  for (size_t i = 0; i < formatCount_; ++i)
+    if ((!i || !formats_[i].samePcm(formats_[i-1])) && !--alternate) return formats_ + i;
+  return nullptr;
+}
+size_t AudioStreamModel::alternateRateCount(uint8_t alternate) const {
+  const auto *first = alternateFormat(alternate);
+  if (!first) return 0;
+  size_t count = 1, offset = size_t(first - formats_);
+  while (offset + count < formatCount_ && first->samePcm(formats_[offset+count])) ++count;
+  return count;
+}
+size_t AudioStreamModel::maximumFrameBytes() const {
+  size_t bytes = 0;
+  for (size_t i = 0; i < formatCount_; ++i) {
+    const size_t frame = formats_[i].channels * formats_[i].subslotBytes;
+    if (frame > bytes) bytes = frame;
+  }
+  return bytes;
+}
+bool AudioStreamModel::hasCompleteRateSets() const {
+  if (!formatCount_) return true;
+  const size_t rates = alternateRateCount(1);
+  for (size_t offset = rates; offset < formatCount_;) {
+    size_t count = 1;
+    while (offset + count < formatCount_ && formats_[offset].samePcm(formats_[offset+count])) ++count;
+    if (count != rates) return false;
+    for (size_t i = 0; i < rates; ++i) {
+      bool found = false;
+      for (size_t j = 0; j < count; ++j) if (formats_[i].sampleRate == formats_[offset+j].sampleRate) { found = true; break; }
+      if (!found) return false;
+    }
+    offset += count;
+  }
   return true;
 }
 
@@ -181,6 +262,9 @@ bool buildAudioFunctionGraph(const AudioFunctionModel &function,
   {
     graph.error = AudioGraphError::InconsistentChannels;
     return false;
+  }
+  if (!function.playback().hasCompleteRateSets() || !function.capture().hasCompleteRateSets()) {
+    graph.error = AudioGraphError::IncompatibleClockRates; return false;
   }
   if (hasPlayback && hasCapture)
   {

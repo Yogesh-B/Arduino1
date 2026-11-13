@@ -2,6 +2,90 @@
 
 ## Unreleased
 
+## 3.0.0
+Major version. Existing sketches need changes; see `docs/migrating-from-v2.md`.
+メジャー版です。既存のスケッチには変更が必要です。`docs/migrating-from-v2.ja.md` を参照してください。
+
+- (EN) The USB stack is the library's own: class drivers, the common device
+  core and a maintained DWC2 driver. The TinyUSB class/stack, `tusb_config.h`
+  and the `CFG_TUD_*` / `build_opt.h` settings are gone; defining an old flag is
+  a compile error. Only the selected Functions are linked.
+- (JA) USB スタックをライブラリ自身のものにしました（class driver、共通 core、
+  保守している DWC2 driver）。TinyUSB の class/stack、`tusb_config.h`、
+  `CFG_TUD_*` と `build_opt.h` の設定は無くなり、旧 flag を定義すると compile error
+  になります。リンクされるのは使う Function だけです。
+- (EN) Capacities and transfer modes are per instance and set at run time with
+  each Function's `configure()`; `begin()` allocates them and `end()` frees them.
+  The six-Function limit is gone: the controller's endpoints and FIFO decide.
+  Configurations that cannot fit fail `begin()` instead of failing enumeration.
+- (JA) 容量と転送方式は instance ごとに、実行時に各 Function の `configure()` で
+  決めます。`begin()` が確保し `end()` が解放します。6 Function の制限は無くなり、
+  controller の endpoint と FIFO で決まります。収まらない構成は列挙で失敗せず、
+  `begin()` が拒否します。
+- (EN) ESP32-P4 high speed (480 Mbps) on the HS controller, for revision v1.x
+  and v3.x (P4X), alongside the FS controller. `EspUsbController` selects it and
+  `device.speed()` reports the negotiated speed. TEST_MODE is supported at HS.
+- (JA) ESP32-P4 の HS controller で高速（480 Mbps）に対応しました（revision v1.x と
+  v3.x の P4X、FS controller も可）。`EspUsbController` で選び、`device.speed()` で
+  実際の速度が分かります。HS では TEST_MODE に応答します。
+- (EN) Lifecycle: `started()` / `ready()` / `suspended()`, `startMode`
+  (`DescriptorsOnly` checks a configuration without USB), worker task stack,
+  priority, core and queue depth, and a bounded `end()` (`stopTimeoutMs`). The
+  USB worker runs callbacks; `device.task()` is gone. Function `begin()` is no
+  longer public: start and stop the device. Each Function's `startError()`
+  names why it refused to start.
+- (JA) 状態は `started()` / `ready()` / `suspended()`。`startMode`
+  （`DescriptorsOnly` で USB を使わずに構成を検査）、worker task の stack・優先度・
+  core・queue、期限付きの `end()`（`stopTimeoutMs`）を追加しました。callback は
+  USB worker が呼び、`device.task()` は無くなりました。Function の `begin()` は
+  非公開になり、Device を開始・停止します。各 Function の `startError()` が、
+  開始を断った理由を返します。
+- (EN) Bulk transfers (CDC, Vendor, MIDI): copy, callback and borrowed DMA
+  receive modes, `writeDirect` / `readDirect` with one typed completion, cancel
+  and return on reset or `end()`, external or PSRAM rings. CDC is an Arduino
+  `Stream` with a bounded transmit wait.
+- (JA) bulk 転送（CDC、Vendor、MIDI）にコピー・callback・借用 DMA の受信方式、
+  完了が一度だけ返る `writeDirect` / `readDirect`、reset や `end()` での取消しと返却、
+  外部・PSRAM の ring を加えました。CDC は Arduino の `Stream` で、送信待ちに期限があります。
+- (EN) Every class is reimplemented on the new core with per-instance
+  settings: Audio formats and rates, Video transport and payload, NCM NTB pools,
+  the CCID message buffer (automatic: `max(271, Bulk-OUT MPS)`), DFU transfer
+  size and DETACH acceptance, MSC staging and media change, and a FAT RAM disk
+  that stays valid FAT12 at any size.
+- (JA) すべての class を新しい core で作り直し、instance ごとに設定できるように
+  しました：Audio の format と rate、Video の転送方式と payload、NCM の NTB、
+  CCID の message buffer（自動で `max(271, Bulk-OUT MPS)`）、DFU の転送長と DETACH の
+  受付、MSC の staging と媒体交換、容量によらず正しい FAT12 になる FAT RAM disk。
+- (EN) Standard conformance: full-speed bulk packets are 8/16/32/64; UAC2
+  feedback is 10.14 in 3 bytes at FS and 16.16 in 4 at HS; DEVICE_REMOTE_WAKEUP
+  is accepted in the Address state; WebUSB and MS OS 2.0 claim only their own
+  descriptor requests; a read-only SD card reports write protection.
+- (JA) 規格への準拠：FS の bulk packet は 8/16/32/64、UAC2 feedback は FS で 10.14 の
+  3 byte・HS で 16.16 の 4 byte、DEVICE_REMOTE_WAKEUP を Address の状態でも受け付け、
+  WebUSB と MS OS 2.0 は自分の descriptor 要求だけを処理し、読み取り専用の SD は
+  書込み保護として報告します。
+- (EN) HID: keys pressed without NKRO now combine up to six (a seventh is
+  refused); `tapUsage()` releases only what it pressed; `releaseKey()`;
+  `mouse.move()` keeps held buttons; System Control takes standard usages
+  0x81-0x83; out-of-range MIDI or Consumer values are refused, not clamped.
+  `lastErrorName()` names every `esp_err_t`. A fresh MIDI config keeps the
+  constructor's cable counts.
+- (JA) HID：NKRO なしでも押したキーが最大 6 個まで重なり（7 個目は拒否）、
+  `tapUsage()` は自分が押したものだけを離します。`releaseKey()` を追加し、
+  `mouse.move()` は押しているボタンを保ちます。System Control は標準 usage 0x81〜0x83。
+  範囲外の MIDI や Consumer の値は丸めずに拒否します。`lastErrorName()` は全ての
+  `esp_err_t` の名前を返します。新しく作った MIDI の config は、コンストラクタで
+  指定した cable 数を保ちます。
+- (EN) Verified on hardware by the `tests/` probes: ESP32-S3 and ESP32-S2
+  at full speed (S3 to S3, and S2 to S3 in both directions), ESP32-P4 v1.x and
+  P4X at high speed in both directions and on one P4's own HS and FS
+  controllers, and a P4X and an S2 against a Linux PC. Windows and macOS hosts
+  are not yet verified.
+- (JA) `tests/` の試験で実機確認しています：ESP32-S3 と ESP32-S2 の FS（S3 同士、
+  S2 と S3 の両方向）、ESP32-P4 v1.x と P4X の HS 直結の両方向、P4 一台の HS と FS
+  controller の結線、P4X と S2 のそれぞれと Linux PC。Windows と macOS の Host は
+  未確認です。
+
 ## 2.6.1
 - (EN) Honor HID `timeoutMs`: wait for a busy IN endpoint, with zero retaining
   polling behavior and a busy timeout reporting `ESP_ERR_TIMEOUT`. Consecutive

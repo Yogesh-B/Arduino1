@@ -1,398 +1,105 @@
-# Examples
+# EspUsbDevice のサンプル
 
 > English: [README.md](README.md)
 
-`EspUsbDevice` の基本的な使い方を確認するための Arduino sketches です。
-このライブラリを使う sketch では Arduino-ESP32 標準の `USB.begin()`、
-`USBHIDKeyboard`、`USBHIDMouse` は使いません。
-
-## Info（診断・切り分け用）
-
-機能のデモではなく、**動かないときに原因を切り分けるための**スケッチです。
-新しいボードや新しい構成では、まずここから始めてください。手順の全体像は
-[docs/usb-device-guide.ja.md](../docs/usb-device-guide.ja.md) にまとめています。
-
-- [Info/EspUsbDeviceBringUpCheck](Info/EspUsbDeviceBringUpCheck/README.ja.md):
-  **最初に動かす。** `begin()` の成否、Host が列挙するか、ネゴシエートされた速度、
-  Host → Device 方向の疎通を順に確認します。列挙されない場合のチェックリスト付きです。
-  HID keyboard として列挙しますがキーは送らないので、PC に挿したままで安全です。
-- [Info/EspUsbDeviceDescriptorDump](Info/EspUsbDeviceDescriptorDump/README.ja.md):
-  **次に動かす。** 登録したクラスからライブラリが組み立てた descriptor を全部表示し、
-  endpoint 予算を controller の上限と比較します。Host に接続しなくても確認できるので、
-  複合デバイスが収まるかを事前に判定できます。
-- [Info/EspUsbDeviceConsole](Info/EspUsbDeviceConsole/README.ja.md):
-  **詰めるとき。** Serial monitor から手打ちで HID report や vendor 転送を送り、
-  Host から降りてくる要求（output report、protocol 切り替え、control request）を
-  すべて表示します。ビルドし直さずに 1 転送ずつ試せます。
-
-## ESP32-P4 Device port
-
-- [P4HighSpeedDevice](P4HighSpeedDevice/README.ja.md): rhport 1と、external UTMI
-  High-Speed PHYへ接続されたboard側connectorを使います。
-- [P4FullSpeedDevice](P4FullSpeedDevice/README.ja.md): rhport 0、通常は
-  GPIO26/GPIO27を使い、GPIO24/GPIO25へ切り替えるFS routing callもコメントアウトした
-  状態でsketchに記載しています。
-
-connector名、VBUS、USB-C CC処理はboard回路図に依存します。
-
-## Keyboard
-
-HID boot keyboard device の例です。詳しくは [Keyboard/README.ja.md](Keyboard/README.ja.md) を参照してください。
-
-- `EspUsbDeviceConfig` で port、speed、VID/PID、string descriptor を設定します。
-- `EspUsbDeviceHidKeyboard::write()` で US ASCII 文字列を送信します。
-- `tapKey()` で 1 文字、`tapUsage()` / `pressUsage()` で raw HID usage ID を送信します。
-- `setLayout()` で Host 側と同じ layout ID を選び、文字から usage への変換を切り替えます。
-- `onOutputReport()` で NumLock / CapsLock / ScrollLock などの LED 状態を受け取ります。
-
-文字列 wrapper は Host 側と同じ keymap table を逆引きし、Host 側と同じ layout ID を使います。
-
-## KeyboardNKRO
-
-N-key rollover 対応の HID keyboard の例です。
-詳しくは [KeyboardNKRO/README.ja.md](KeyboardNKRO/README.ja.md) を参照してください。
-
-- `begin()` の前に `EspUsbDeviceHidKeyboard::enableNkro()` を呼ぶと、6キー boot report
-  からキー bitmap に切り替わります。
-- `pressUsage()` / `releaseUsage()` で任意数のキーを同時押下できます。
-- bitmap は usages `0x00`-`0xDF`（International/LANG キー含む）をカバーするので JIS
-  レイアウトも通り、Host が boot protocol（BIOS）を要求すれば6キー形式で応答します。
-
-## Mouse
-
-HID boot mouse device の例です。
-詳しくは [Mouse/README.ja.md](Mouse/README.ja.md) を参照してください。
-
-- `EspUsbDeviceHidMouse::move()` で移動、wheel、button 状態を送信します。
-- `click()` で press / release の組を送信します。
-- left / right / middle / back / forward button を raw button bit として扱います。
-
-## KeyboardMouse
-
-keyboard と mouse を同時に登録する composite HID device の例です。
-現時点の composite HID は、単一 HID interface と report ID で構成します。
-詳しくは [KeyboardMouse/README.ja.md](KeyboardMouse/README.ja.md) を参照してください。
-
-- keyboard report ID: `1`
-- mouse report ID: `2`
-- composite HID endpoint MPS: `16 bytes`
-
-## Gamepad
-
-HID gamepad device の例です。
-詳しくは [Gamepad/README.ja.md](Gamepad/README.ja.md) を参照してください。
-
-- `EspUsbDeviceHidGamepad` で axes、hat switch、button bitmask を送信します。
-- `send()` で 6 axes、hat、32 buttons をまとめて送れます。
-- PC の game controller 設定画面や EspUsbHost の `onGamepad()` で確認できます。
-
-## MediaKeys
-
-HID consumer control / system control device の例です。
-詳しくは [MediaKeys/README.ja.md](MediaKeys/README.ja.md) を参照してください。
-
-- `EspUsbDeviceHidConsumerControl` で volume、mute、play/pause、track 操作を送信します。
-- `EspUsbDeviceHidSystemControl` で power / standby / wake usage も扱えます。
-- system control key は Host の電源状態に影響するため、自動送信しない example にしています。
-
-## VendorHID
-
-Vendor-defined HID device の例です。
-詳しくは [VendorHID/README.ja.md](VendorHID/README.ja.md) を参照してください。
-
-- `EspUsbDeviceHidVendor` で 63 byte payload の Input / Output / Feature report を扱います。
-- Device から Host へ Input report を定期送信します。
-- Host からの Output / Feature report を callback で受け取り、Serial monitor に出力します。
-- 専用 Host application や EspUsbHost との小さな独自プロトコルに向いています。
-
-## USBVendor
-
-HID ではない vendor-specific USB interface の例です。
-詳しくは [USBVendor/README.ja.md](USBVendor/README.ja.md) を参照してください。
-
-- `EspUsbDeviceVendor` で bulk IN / OUT endpoint を使う独自通信を扱います。
-- `available()` / `read()` / `write()` / `flush()` を使う stream 風 API です。
-- `onControlRequest()` で EP0 の vendor request を受け取ります。
-- `EspUsbDeviceConfig` で WebUSB landing URL を設定できます。
-
-## CustomHID
-
-任意の HID report descriptor を使う custom HID device の例です。
-詳しくは [CustomHID/README.ja.md](CustomHID/README.ja.md) を参照してください。
-
-- sketch 内で `REPORT_DESCRIPTOR` を定義します。
-- `EspUsbDeviceHidCustom` に descriptor と input report size を渡します。
-- 1 秒ごとに 8 byte Input report を送信します。
-- 独自 descriptor の検証や、小さな固定長 HID report の試作に向いています。
-
-## Serial
-
-USB CDC ACM serial device の例です。
-詳しくは [Serial/README.ja.md](Serial/README.ja.md) を参照してください。
-
-- `EspUsbDeviceCdcSerial` で PC / Host とテキストを送受信します。
-- `available()` / `read()` / `write()` / `print()` / `printf()` を使います。
-- Host からの line coding と DTR / RTS 状態を callback で受け取ります。
-- USB CDC とログ用 Serial monitor を分けて扱います。
-
-## SerialMulti
-
-シリアルポートを2つ持つ USB CDC device の例です。
-詳しくは [SerialMulti/README.ja.md](SerialMulti/README.ja.md) を参照してください。
-
-- `EspUsbDeviceCdcSerial` を2つ登録し、ホストにポートを2つ見せます。
-- ポートごとに名前を付け、Host 側で区別できるようにします。
-- バッファ・line coding・DTR 状態はポートごとに独立です。
-- 何本載るかは IN endpoint で決まります（S2/S3 は2本、P4 HS は3本）。
-
-## MIDI
-
-USB MIDI device の例です。
-詳しくは [MIDI/README.ja.md](MIDI/README.ja.md) を参照してください。
-
-- `EspUsbDeviceMidi` で Note On / Off、Control Change などを送信します。
-- 4 byte USB-MIDI event packet を raw に送受信できます。
-- Host から受信した MIDI packet を Serial monitor に出力します。
-- DAW、MIDI monitor、EspUsbHost などで確認できます。
-
-## MIDIController
-
-ADC と button input を USB MIDI message に変換する例です。
-詳しくは [MIDIController/README.ja.md](MIDIController/README.ja.md) を参照してください。
-
-- analog input を MIDI CC に変換します。
-- button press / release を Note On / Off に変換します。
-- potentiometer や BOOT button で簡単な MIDI controller を作れます。
-
-## MIDIInterface
-
-UART MIDI 1.0 と USB MIDI 1.0 を相互変換する bridge example です。
-詳しくは [MIDIInterface/README.ja.md](MIDIInterface/README.ja.md) を参照してください。
-
-- 31250 baud serial MIDI を USB-MIDI event packet に変換します。
-- Host からの USB-MIDI event packet を serial MIDI byte stream に戻します。
-- DIN MIDI 機器と USB MIDI host の bridge として使えます。
-
-## AudioSpeaker
-
-USB Audio speaker sink device の例です。
-詳しくは [AudioSpeaker/README.ja.md](AudioSpeaker/README.ja.md) を参照してください。
-
-Audio exampleはdefaultでUAC1を使います。UAC1のspeaker、microphone、duplex streamingは
-EspUsbHost Peer testで確認済みです。UAC2は明示選択できますが、現時点で検証済みとするのは
-Device descriptor/class requestまでで、end-to-end streamingはEspUsbHostのUAC2対応後に行います。
-
-- `EspUsbAudioPlaybackStream::read()`でHostからのPCMを読みます。
-- formatは`{sampleRate, channels, bytesPerSample, bitsPerSample}`で設定します。
-- `pollEvent()`でvolume、mute、sample rate、interface enableを取得します。
-- `hasMute()` / `getMute()` / `setMute()`と対応するvolume APIで
-  Master/Left/RightのFeature Unit stateを取得・変更します。
-- I2S bridge や codec 初期化はこのライブラリの責務外です。受信した PCM はアプリケーション、
-  PCMFlow、PCMFlowDevice などへ渡せます。
-
-## AudioMicrophone
-
-USB Audio source（マイク）device の例です。device から Host へ PCM を送ります。
-詳しくは [AudioMicrophone/README.ja.md](AudioMicrophone/README.ja.md) を参照してください。
-
-- `EspUsbAudioCaptureStream`へmono 48 kHz / 16-bit formatを追加します。
-- `capture.write()`でHostへPCMを送出します（ここでは440 Hzの正弦波を生成）。
-- 音声取り込みやcodec入力はアプリケーションの責務です。
-
-## AudioHeadset
-
-USB Audio headset の例です。1台で speaker（Host→device）と microphone（device→Host）を同時に担います。
-詳しくは [AudioHeadset/README.ja.md](AudioHeadset/README.ja.md) を参照してください。
-
-- 1つの`EspUsbAudioFunction`へPlaybackとCapture streamを追加します。
-- loopback headsetとして`playback.read()`したPCMを`capture.write()`へ渡します。
-- Hostからは再生デバイスと録音デバイスの両方に見えます。
-
-## AudioSpeakerM5
-
-USB Audio speaker sink と PCMFlowDevice の M5 speaker helper をつなぐ例です。
-詳しくは [AudioSpeakerM5/README.ja.md](AudioSpeakerM5/README.ja.md) を参照してください。
-
-- PC から 48 kHz / 16-bit / stereo の USB Audio speaker として PCM を受け取ります。
-- USB volume/muteはeventとして通知し、PCMへのDSP適用はアプリケーション側で行います。
-- PCMFlowDevice の `M5SpeakerBufferedPlayer::writePcm()` で stereo 入力の downmix と
-  `M5.Speaker` への安定した受け渡しを行います。
-- EspUsbDevice 本体は PCMFlow / PCMFlowDevice へ依存せず、この example だけが任意連携します。
-
-## VideoCamera
-
-テストパターンを生成して流す USB Video Class カメラです。イメージセンサは要りません。
-Windows・macOS・Linux はいずれも標準の UVC ドライバを何もインストールせずに当てます。
-詳しくは [VideoCamera/README.ja.md](VideoCamera/README.ja.md) を参照してください。
-
-- 制約は isochronous の帯域です。full speed なら 160x120 非圧縮が 15 fps で、
-  大きなフレームを実用にするのは MJPEG です。
-- フレームの投入は 1 箇所から、宣言したレートでペーシングします。
-
-## AudioMicrophoneM5
-
-M5 内蔵マイクを使う USB Audio microphone（device → Host）の例です。
-詳しくは [AudioMicrophoneM5/README.ja.md](AudioMicrophoneM5/README.ja.md) を参照してください。
-
-- `M5.Mic`からmono 16 kHz / 16-bit PCMを取り込み、`capture.write()`でHostへ送ります。
-- `M5.Mic.record()`（非同期・ダブルバッファ）を小さいリングで使い、完了済みの最古ブロックを送ります。
-- 取り込みは M5Unified のみに依存し、USB 側は EspUsbDevice が担います。
-
-## AudioHeadsetM5
-
-M5 ハードウェアで headset を実現する例です。M5 スピーカー再生（Host → device）と M5 マイク取り込み（device → Host）。
-詳しくは [AudioHeadsetM5/README.ja.md](AudioHeadsetM5/README.ja.md) を参照してください。
-
-- 受信 PCM を PCMFlowDevice の `M5SpeakerBufferedPlayer` で `M5.Speaker` へ再生し、`M5.Mic` の取り込みを Host へ返します。48 kHz / 16-bit（speaker=stereo、microphone=mono、USB は両方向で同一レート共有）。
-- **既知の制約:** M5 のスピーカーとマイクの同時使用（全二重）は安定して動作しません。M5Unified は両方を1つの I2S ポートで TX 専用/RX 専用に install し、`begin()` のたびに相手を uninstall するため、再生＋録音の同時利用は glitch します（CoreS3 でも確認。スピーカーを別 I2S ポートへ移しても改善せず）。本 example はベストエフォートのデモです。安定動作が必要なら単方向の `AudioSpeakerM5`（再生）/ `AudioMicrophoneM5`（録音）を、両方向のデモは非M5の `AudioHeadset`（USB のみ）を使ってください。
-
-## MSC
-
-USB Mass Storage Class device の例です。
-詳しくは [MSC/README.ja.md](MSC/README.ja.md) を参照してください。
-
-- `EspUsbDeviceMsc` で SCSI inquiry、media 状態、write 可否を設定します。
-- `EspUsbDeviceMscRamDisk` で RAM buffer を 512 byte block device として公開します。
-- `disk.attach(msc)` で read/write callback と `msc.begin()` をまとめて設定します。
-- この example は SCSI / block I/O 疎通確認用で、FAT でフォーマットされた USB メモリではありません。
-
-MSC は block device と filesystem が分かれます。Host から通常のドライブとしてマウント
-させたい場合は、有効な FAT image か SD card などの実 block storage が別途必要です。
-flash / SPIFFS / LittleFS の直接公開は標準 example では扱わず、実用的な永続ストレージは
-SD card を優先します。RAM disk は、FAT helper を追加すると firmware、設定ファイル、
-Wi-Fi 転送用の一時ファイル受け渡しにも使えます。
-
-## MSCFatRamDisk
-
-RAM 上に小さい FAT12 image を作る MSC device の例です。
-詳しくは [MSCFatRamDisk/README.ja.md](MSCFatRamDisk/README.ja.md) を参照してください。
-
-- `EspUsbDeviceMscFatRamDisk` で Host から mount できる RAM disk を作ります。
-- `README.TXT` を初期ファイルとして配置します。
-- Host が `CONFIG.TXT` をコピーして eject した後、Device 側で file scan / read します。
-- firmware update、設定ファイル投入、Wi-Fi 転送などの一時ファイル受け渡しの基本形です。
-
-## MSCSdCard
-
-SPI 接続の SD card を MSC block device として公開する例です。
-詳しくは [MSCSdCard/README.ja.md](MSCSdCard/README.ja.md) を参照してください。
-
-- `EspUsbDeviceMscSdCard` で Arduino `SD` の raw sector I/O を MSC に接続します。
-- Host から SD card を通常の USB storage として読み書きします。
-- Host が SD を所有している間、ESP32 側では `SD.open()` などの file API を使わない設計にします。
-- 実用的な永続ストレージ example の基本形です。
-
-## CompositeHidCdcMsc
-
-HID keyboard + CDC serial + MSC FAT RAM disk を 1 つの `EspUsbDevice` に載せた
-全部入り複合デバイスの例です。
-詳しくは [CompositeHidCdcMsc/README.ja.md](CompositeHidCdcMsc/README.ja.md) を参照してください。
-
-- 複数の function を同じ `EspUsbDevice` に登録し `begin()` を 1 回呼ぶだけで、ライブラリが
-  複合 descriptor を構成し interface と endpoint を割り当てます。
-- CDC で `type <text>` を送ると、その文字列を HID keyboard で入力します。
-- CDC notificationを含む非control IN 4本でESP32-S3の上限に達します。さらにIN endpointを
-  追加する構成にはESP32-P4が必要です。
-- USB Audioも同じcomposite descriptor builderを使います。UAC1がdefaultで、
-  UAC2は明示選択です。実際に組み合わせられるfunctionはconfiguration descriptor容量と
-  targetのendpoint予算に制約されます。
-
-## UsbNetwork
-
-内蔵 DHCP サーバと Web ページを持つ USB ネットワークデバイス（CDC-NCM）の例です。
-詳しくは [UsbNetwork/README.ja.md](UsbNetwork/README.ja.md) を参照してください。
-
-- `EspUsbDeviceNet` を登録し `beginNetwork()` を呼ぶだけで、ドライバ不要の USB
-  ネットワークアダプタとして現れます。
-- DHCP サーバ（`dhcpServer(true)`）、ブリッジ LAN 上の DHCP クライアント
-  （`dhcpClient(true)`）、静的アドレス（`ipConfig(...)`）を選べます。
-- PC は USB 経由で `http://192.168.7.1/` にアクセス（「USB 設定ポータル」パターン）。
-- IP スタック無しの生フレームは `onFrame()` / `sendFrame()`。
-- デバイス側は CDC-NCM のみ（CDC-ECM は core で無効）。
-
-## SmartCardReader
-
-カードの中身をスケッチで実装する USB CCID スマートカードリーダーの例です。
-詳しくは [SmartCardReader/README.ja.md](SmartCardReader/README.ja.md) を参照してください。
-
-- `EspUsbDeviceCcid` を登録すると 1 slot のリーダーとして列挙され、PC/SC ホスト
-  （pcsc_scan、Windows のスマートカードサービス、EspUsbHost の `ccid*` API）から
-  カードの活性化と APDU のやり取りができます。
-- `insertCard(atr, length)` / `removeCard()` でカードの有無を切り替えます。擬似カードは
-  PC/SC の Get UID 疑似 APDU と echo 命令に応答します。
-- シリアルモニタの 'i' / 'r' でカードを出し入れすると、Host には挿抜通知として届きます。
-
-## FirmwareDFU
-
-スケッチを動かしたまま `dfu-util` で USB 経由のファームウェア更新を行う例です。
-詳しくは [FirmwareDFU/README.ja.md](FirmwareDFU/README.ja.md) を参照してください。
-
-- `EspUsbDeviceDfu` を `Download` mode で登録すると、`dfu-util -D firmware.bin`
-  が空いている OTA partition へ書き込み、ボードがそのイメージで再起動します。
-- interface 1 本、**endpoint 0 本**（全転送が EP0）なので、endpoint 予算を
-  使い切ったデバイスにも足せます。
-- ROM を使わないため S2 / S3 / P4 で同じように動きます。
-- application partition が 2 つある partition scheme が必要です。
-
-## FirmwareCDC
-
-最小のファームウェア更新です。素の CDC serial port に長さを送ってからその分の
-バイトを送るだけ。
-詳しくは [FirmwareCDC/README.ja.md](FirmwareCDC/README.ja.md) を参照してください。
-
-- `EspUsbDeviceCdcSerial` と `EspUsbDeviceFirmwareUpdate`、それと 60 行の Python
-  host スクリプト。
-- すでに serial port を持つ機器に更新コマンドを足すときの雛形。
-- flash への書き込みは USB callback ではなく `loop()` で行います。これは偶然では
-  なくパターンです。
-
-## FirmwareVendor
-
-vendor interface 経由の更新です。コマンドは control request、イメージは bulk OUT。
-ライブラリ内で最速の経路です。
-詳しくは [FirmwareVendor/README.ja.md](FirmwareVendor/README.ja.md) を参照してください。
-
-- コマンドを EP0、データを bulk に分けるので、host は転送を邪魔せず進捗を読めます。
-- ESP32-P4 の high-speed リンクでは DFU の EP0 転送よりはるかに短時間で渡ります。
-  代償は host スクリプトを自分で配る必要があること。
-
-## FirmwareMSC
-
-ボードが見せるドライブにファイルを放り込むファームウェア更新です。
-詳しくは [FirmwareMSC/README.ja.md](FirmwareMSC/README.ja.md) を参照してください。
-
-- `EspUsbDeviceMscFirmwareDisk` はデータ領域が OTA partition **そのもの**の FAT
-  ボリュームを提供するので、イメージが RAM に載りません。
-- ESP イメージを `0xE9` magic で検出し、directory entry の長さに達するか eject された
-  時点で commit、切り替え前に検証します。
-- 書き込みは昇順が前提です。逆戻りは中途半端に適用せず拒否します。
-- application partition が 2 つある partition scheme が必要です。
-
-## FirmwareHTTP
-
-host 側にブラウザ以外なにも要らない USB 経由のファームウェア更新です。
-詳しくは [FirmwareHTTP/README.ja.md](FirmwareHTTP/README.ja.md) を参照してください。
-
-- `EspUsbDeviceNet` と Arduino の `HTTPUpdateServer` の組み合わせ。PC は USB 経由で
-  アドレスを受け取り、`http://192.168.7.1/update` で `.bin` をアップロードします。
-- ドライバ不要、host tool 不要、boot mode 不要。
-- 机の外に出す前に `setup()` へ認証を付けてください。
-
-## FirmwareBootMode
-
-動作中のスケッチから ROM download loader へ入り、誰も BOOT を押さずに `esptool` で
-flash 全体を書き換える例です。
-詳しくは [FirmwareBootMode/README.ja.md](FirmwareBootMode/README.ja.md) を参照してください。
-
-- `device.rebootToBootloader()` がターゲットの download-boot フラグを立てて再起動、
-  `device.rebootToRomDfu()` は S2/S3 の ROM に DFU で立ち上がるよう頼みます。
-- 要求の仕方は 3 通り: CDC の 1200bps touch、DFU runtime interface 経由の
-  `dfu-util -e`、シリアルへの 1 バイト。
-- loader がどのコネクタで応答するかはチップごとに違います。
-  [docs/ota-over-usb.ja.md](../docs/ota-over-usb.ja.md) を参照してください。
-
-## 注意
-
-- USB device として使う側の ESP32-S3 などを USB host に接続してください。
-- Serial monitor はログ確認用です。USB HID device としての接続先とは別の経路で確認してください。
-- 既存の Arduino USB class と同時に使う設計ではありません。
+どの例も、それだけで完結したスケッチです。それぞれに README と、Arduino-ESP32 3.3.12 を固定した
+`sketch.yaml` があります。作りたいものに近い例の README から読んでください。何を示す例か、
+何が必要か、Host 側でどう確かめるかが書いてあります。
+
+## ビルド
+
+`sketch.yaml` に、対応する board を profile として書いています。
+
+| profile | board |
+| --- | --- |
+| `esp32s3` | ESP32-S3。USB Mode は「USB-OTG (TinyUSB)」（`USBMode=default`） |
+| `esp32s2` | ESP32-S2 |
+| `esp32p4` | ESP32-P4 revision v1.x（`ChipVariant=prev3`） |
+| `esp32p4x` | ESP32-P4 revision v3.1 以降の「P4X」（`ChipVariant=postv3`） |
+
+```sh
+arduino-cli compile --profile esp32s3 examples/Serial
+arduino-cli upload  --profile esp32s3 --port <port> examples/Serial
+python3 tools/build_check.py esp32s3        # その profile を持つ全部の例
+```
+
+board の USB OTG の connector を Host につなぎます。log を出す例は、別の debug 接続
+（USB-UART か USB Serial/JTAG）の `Serial` を使います。試験対象の USB device と log が同じ cable を
+共有しないためです。ESP32-P4 では、特に書いていない限り HS controller を使います。
+[P4HighSpeedDevice](P4HighSpeedDevice/) と [P4FullSpeedDevice](P4FullSpeedDevice/) を参照してください。
+
+## HID
+
+| 例 | 内容 | class の文書 |
+| --- | --- | --- |
+| [Keyboard](Keyboard/) | boot keyboard：文字の入力、layout、usage の直接指定、同時押し、LED の状態 | [HID](../docs/classes/hid.ja.md) |
+| [KeyboardNKRO](KeyboardNKRO/) | N キーロールオーバーと boot protocol への切替え | [HID](../docs/classes/hid.ja.md) |
+| [Mouse](Mouse/) | boot mouse：移動、wheel、ボタン、ドラッグ | [HID](../docs/classes/hid.ja.md) |
+| [KeyboardMouse](KeyboardMouse/) | keyboard と mouse を 1 つの複合 HID interface にまとめる | [HID](../docs/classes/hid.ja.md) |
+| [Gamepad](Gamepad/) | 軸、hat switch、ボタン | [HID](../docs/classes/hid.ja.md) |
+| [MediaKeys](MediaKeys/) | Consumer Control と System Control | [HID](../docs/classes/hid.ja.md) |
+| [CustomHID](CustomHID/) | スケッチで書いた report descriptor | [HID](../docs/classes/hid.ja.md) |
+| [VendorHID](VendorHID/) | vendor 定義の Input / Output / Feature report | [HID](../docs/classes/hid.ja.md) |
+
+## Serial、MIDI、vendor bulk
+
+| 例 | 内容 | class の文書 |
+| --- | --- | --- |
+| [Serial](Serial/) | CDC ACM：line coding、DTR/RTS、break | [CDC](../docs/classes/cdc.ja.md) |
+| [CdcConsole](CdcConsole/) | CDC の port を `Stream&` を受け取るコードへ渡す | [CDC](../docs/classes/cdc.ja.md) |
+| [SerialMulti](SerialMulti/) | 1 つの device に複数の CDC port | [CDC](../docs/classes/cdc.ja.md) |
+| [MIDI](MIDI/) | note と control change の送信、受信 packet の表示 | [MIDI](../docs/classes/midi.ja.md) |
+| [MidiEcho](MidiEcho/) | Host がまだ受け取っていない packet を保持する echo | [MIDI](../docs/classes/midi.ja.md) |
+| [MIDIController](MIDIController/) | ADC とボタンから MIDI | [MIDI](../docs/classes/midi.ja.md) |
+| [MIDIInterface](MIDIInterface/) | UART MIDI（31250 baud）と USB MIDI の中継 | [MIDI](../docs/classes/midi.ja.md) |
+| [USBVendor](USBVendor/) | vendor bulk interface、control 要求、WebUSB、WinUSB | [Vendor](../docs/classes/vendor.ja.md) |
+| [VendorEcho](VendorEcho/) | 書き切れなかった残りを保持する最小の bulk echo | [Vendor](../docs/classes/vendor.ja.md) |
+| [ReconfigureVendor](ReconfigureVendor/) | `end()`・`configure()`・`begin()` で実行中に容量を変える | [Vendor](../docs/classes/vendor.ja.md) |
+
+## ストレージとファームウェア更新
+
+| 例 | 内容 | class の文書 |
+| --- | --- | --- |
+| [MSC](MSC/) | RAM 上の raw block device | [MSC](../docs/classes/msc.ja.md) |
+| [MSCFatRamDisk](MSCFatRamDisk/) | スケッチがファイルを置いた FAT12 の RAM disk | [MSC](../docs/classes/msc.ja.md) |
+| [MSCSdCard](MSCSdCard/) | SPI の SD card を USB drive として見せる | [MSC](../docs/classes/msc.ja.md) |
+| [FirmwareMSC](FirmwareMSC/) | drive へ `.bin` か `.uf2` をコピーして更新 | [USB 経由の OTA](../docs/ota-over-usb.ja.md) |
+| [FirmwareDFU](FirmwareDFU/) | スケッチを動かしたまま `dfu-util` で更新 | [DFU](../docs/classes/dfu.ja.md) |
+| [FirmwareHTTP](FirmwareHTTP/) | USB の network 越しに browser から更新 | [USB 経由の OTA](../docs/ota-over-usb.ja.md) |
+| [FirmwareCDC](FirmwareCDC/) | serial port と小さな Host script で更新 | [USB 経由の OTA](../docs/ota-over-usb.ja.md) |
+| [FirmwareVendor](FirmwareVendor/) | vendor interface と Host script で更新 | [USB 経由の OTA](../docs/ota-over-usb.ja.md) |
+| [FirmwareBootMode](FirmwareBootMode/) | スケッチから ROM loader や ROM DFU へ入る | [USB 経由の OTA](../docs/ota-over-usb.ja.md) |
+
+## Audio、Video、その他の class
+
+| 例 | 内容 | class の文書 |
+| --- | --- | --- |
+| [AudioSpeaker](AudioSpeaker/) | UAC1 の playback、rate・mute・volume の event | [Audio](../docs/classes/audio.ja.md) |
+| [AudioPlayback](AudioPlayback/) | 複数の format と rate を持つ UAC2 の playback | [Audio](../docs/classes/audio.ja.md) |
+| [AudioMicrophone](AudioMicrophone/) | 生成した音を UAC1 の capture で送る | [Audio](../docs/classes/audio.ja.md) |
+| [AudioHeadset](AudioHeadset/) | playback と capture を 1 つの Function で | [Audio](../docs/classes/audio.ja.md) |
+| [AudioSpeakerM5](AudioSpeakerM5/)、[AudioMicrophoneM5](AudioMicrophoneM5/)、[AudioHeadsetM5](AudioHeadsetM5/) | 同じことを M5Stack の speaker と microphone で | [Audio](../docs/classes/audio.ja.md) |
+| [VideoCamera](VideoCamera/) | 生成した試験パターンを送る UVC camera | [Video](../docs/classes/video.ja.md) |
+| [UsbNetwork](UsbNetwork/) | DHCP と web server を持つ CDC-NCM の network device | [NCM](../docs/classes/ncm.ja.md) |
+| [SmartCardReader](SmartCardReader/) | card をスケッチで実装した CCID reader | [CCID](../docs/classes/ccid.ja.md) |
+
+## 複合 device と controller
+
+| 例 | 内容 |
+| --- | --- |
+| [CompositeHidCdcMsc](CompositeHidCdcMsc/) | keyboard、serial port、FAT disk を 1 つの device に |
+| [CompositeCdcMidi](CompositeCdcMidi/) | serial port と MIDI を 1 つの device に |
+| [MscCdcBlocks](MscCdcBlocks/) | block device と serial port。staging の大きさは FS と HS の両方で有効 |
+| [P4HighSpeedDevice](P4HighSpeedDevice/) | ESP32-P4 の HS（480 Mbps）controller |
+| [P4FullSpeedDevice](P4FullSpeedDevice/) | ESP32-P4 の FS controller と pin |
+| [Info](Info/) | 立ち上げの確認、対話 console、descriptor の表示 |
+
+## 確認していること
+
+どの例も、`sketch.yaml` にある全 profile で compile できます。例が使っているライブラリの動作は、
+別の `tests/` の試験で実機確認しています（ESP32-S3 と ESP32-S2 の FS、ESP32-P4 と P4X の FS と HS、
+P4X と S2 のそれぞれと Linux PC）。詳しくは[テスト](../tests/README.ja.md)を参照してください。
+例そのものを Windows や macOS の Host で 1 本ずつ動かした確認はまだありません。
+
+EspUsbDevice 2.x から移る場合：2.x の例はすべて同じ名前でここにあります。
+[v2 からの移行](../docs/migrating-from-v2.ja.md)を参照してください。

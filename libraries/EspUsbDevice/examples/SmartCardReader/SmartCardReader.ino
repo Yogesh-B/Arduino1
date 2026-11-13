@@ -1,124 +1,110 @@
-#include "EspUsbDevice.h"
-
-// USB CCID smart card reader. The board enumerates as a reader with one slot;
-// the "card" behind that slot is this sketch. A PC/SC host (pcsc_scan, Windows
-// "Smart Card" service, EspUsbHost's ccid* API) can list the reader, activate
-// the card, read its ATR, and exchange APDUs with it.
-//
-// The emulated card answers two instructions:
-//   FF CA 00 00 00  Get UID (PC/SC pseudo APDU)  -> the 4-byte UID below + 9000
-//   80 01 00 00 Lc  echo                          -> the data sent back + 9000
-// Anything else gets 6D00 (instruction not supported), like a real card would.
-//
-// Send a card in and out over the serial monitor: 'i' inserts, 'r' removes.
+#include <EspUsbDevice.h>
+#include <atomic>
+#include <string.h>
 
 EspUsbDevice device;
-EspUsbDeviceCcid Ccid(device);
+EspUsbDeviceCcid reader(device);
 
-// PC/SC synthetic ATR for a contactless storage card: the historical bytes
-// carry the PC/SC RID A0 00 00 03 06, standard 03 (ISO 14443 A part 3) and card
-// name 00 01 (MIFARE Classic 1K), which is how a host names the card.
-static const uint8_t CARD_ATR[] = {
+// PC/SC synthetic ATR for a contactless storage card: the historical bytes carry
+// RID A0 00 00 03 06, standard 03 (ISO 14443 A part 3) and card name 00 01
+// (MIFARE Classic 1K). Example data, not read from a real card.
+const uint8_t cardAtr[] = {
     0x3b, 0x8f, 0x80, 0x01, 0x80, 0x4f, 0x0c, 0xa0, 0x00, 0x00,
     0x03, 0x06, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x6a,
 };
+const uint8_t cardUid[] = {0x04, 0x11, 0x22, 0x33};
 
-static const uint8_t CARD_UID[] = {0x04, 0x11, 0x22, 0x33};
+// The callbacks run on the USB worker and must return at once, so they only
+// copy what loop() prints.
+portMUX_TYPE apduLock = portMUX_INITIALIZER_UNLOCKED;
+uint8_t lastApdu[16];
+size_t lastApduLength = 0;
+uint32_t printedApdus = 0, lastStatus = 0;
+std::atomic<int> powerChange{-1};
 
-static uint32_t lastStatusMs = 0;
+size_t answerApdu(const uint8_t *apdu, size_t length, uint8_t *reply, size_t capacity) {
+  taskENTER_CRITICAL(&apduLock);
+  lastApduLength = length;
+  memcpy(lastApdu, apdu, length < sizeof(lastApdu) ? length : sizeof(lastApdu));
+  taskEXIT_CRITICAL(&apduLock);
 
-static size_t answerApdu(const uint8_t *apdu, size_t length, uint8_t *response, size_t capacity)
-{
-  Serial.printf("APDU len=%u:", static_cast<unsigned>(length));
-  for (size_t i = 0; i < length; i++)
-  {
-    Serial.printf(" %02x", apdu[i]);
+  // Get UID (PC/SC pseudo APDU): FF CA 00 00 00.
+  if (length >= 4 && apdu[0] == 0xff && apdu[1] == 0xca) {
+    if (capacity < sizeof(cardUid) + 2) return 0; // 0 fails the command.
+    memcpy(reply, cardUid, sizeof(cardUid));
+    reply[sizeof(cardUid)] = 0x90;
+    reply[sizeof(cardUid) + 1] = 0x00;
+    return sizeof(cardUid) + 2;
   }
-  Serial.println();
-
-  // Get UID (PC/SC pseudo APDU): CLA FF, INS CA.
-  if (length >= 4 && apdu[0] == 0xff && apdu[1] == 0xca)
-  {
-    if (capacity < sizeof(CARD_UID) + 2)
-    {
-      return 0;
-    }
-    memcpy(response, CARD_UID, sizeof(CARD_UID));
-    response[sizeof(CARD_UID)] = 0x90;
-    response[sizeof(CARD_UID) + 1] = 0x00;
-    return sizeof(CARD_UID) + 2;
-  }
-
-  // Echo: CLA 80, INS 01, Lc bytes of data.
-  if (length >= 5 && apdu[0] == 0x80 && apdu[1] == 0x01)
-  {
+  // Echo: 80 01 00 00 Lc <data> returns <data> 90 00.
+  if (length >= 5 && apdu[0] == 0x80 && apdu[1] == 0x01) {
     const size_t dataLength = apdu[4];
-    if (length < 5 + dataLength || capacity < dataLength + 2)
-    {
-      return 0;
-    }
-    memcpy(response, &apdu[5], dataLength);
-    response[dataLength] = 0x90;
-    response[dataLength + 1] = 0x00;
+    if (length < 5 + dataLength || capacity < dataLength + 2) return 0;
+    memcpy(reply, apdu + 5, dataLength);
+    reply[dataLength] = 0x90;
+    reply[dataLength + 1] = 0x00;
     return dataLength + 2;
   }
-
-  // 6D00: instruction not supported.
-  response[0] = 0x6d;
-  response[1] = 0x00;
+  if (capacity < 2) return 0;
+  reply[0] = 0x6d; // 6D 00: instruction not supported.
+  reply[1] = 0x00;
   return 2;
 }
 
-void setup()
-{
-  Serial.begin(115200);
-  delay(1500);
-
-  Ccid.onApdu(answerApdu);
-  Ccid.onPower([](bool on)
-               { Serial.printf("CARD %s\n", on ? "activated" : "deactivated"); });
-
-  EspUsbDeviceConfig config;
-  config.manufacturer = "EspUsbDevice";
-  config.product = "EspUsbDevice CCID Reader";
-  config.serialNumber = "espusb-ccid";
-  config.pid = 0x4021;
-  if (!device.begin(config))
-  {
-    Serial.printf("begin failed: %s\n", device.lastErrorName());
+void setup() {
+  Serial.begin(115200); // Separate debug connection; also inserts and removes the card.
+  EspUsbCcidConfig config; // messageBytes 0: 271 at full speed, 512 at high speed.
+  config.name = "EspUsbDevice CCID Reader";
+  esp_err_t error = reader.configure(config);
+  if (error == ESP_OK) error = reader.onApdu(answerApdu);
+  if (error == ESP_OK) error = reader.onPower([](bool on) { powerChange = on ? 1 : 0; });
+  if (error != ESP_OK) {
+    Serial.printf("CCID setup failed: %d\n", int(error));
     return;
   }
+  // Start with a card in the slot. A removable reader accepts this before or
+  // after begin(); the host is told once it configures the reader.
+  reader.insertCard(cardAtr, sizeof(cardAtr));
 
-  // Start with a card in the slot. Remove it with 'r' and put it back with 'i'.
-  Ccid.insertCard(CARD_ATR, sizeof(CARD_ATR));
-  Serial.println("CCID reader ready. 'i' inserts a card, 'r' removes it.");
+  EspUsbDeviceConfig identity;
+  identity.pid = 0x4021;
+  identity.manufacturer = "EspUsbDevice";
+  identity.product = "EspUsbDevice CCID Reader";
+  identity.serialNumber = "espusb-ccid";
+  if (!device.begin(identity)) {
+    Serial.printf("USB start failed: %s\n", device.lastErrorName());
+    return;
+  }
+  Serial.printf("CCID reader ready (%u-byte messages). 'i' inserts a card, 'r' removes it.\n",
+      unsigned(reader.messageCapacity()));
 }
 
-void loop()
-{
-  if (Serial.available() > 0)
-  {
-    const char command = Serial.read();
-    if (command == 'i')
-    {
-      Serial.printf("insert %u\n", Ccid.insertCard(CARD_ATR, sizeof(CARD_ATR)) ? 1 : 0);
-    }
-    else if (command == 'r')
-    {
-      Ccid.removeCard();
-      Serial.println("removed");
-    }
+void loop() {
+  if (Serial.available() > 0) {
+    const char command = char(Serial.read());
+    if (command == 'i') Serial.printf("insert %u\n", unsigned(reader.insertCard(cardAtr, sizeof(cardAtr))));
+    else if (command == 'r') Serial.printf("remove %s\n", esp_err_to_name(reader.removeCard()));
   }
+  const int power = powerChange.exchange(-1);
+  if (power >= 0) Serial.printf("card %s\n", power ? "activated" : "deactivated");
 
-  if (millis() - lastStatusMs >= 2000)
-  {
-    lastStatusMs = millis();
+  const uint32_t apdus = reader.apduCount();
+  if (apdus != printedApdus) {
+    printedApdus = apdus;
+    uint8_t copy[sizeof(lastApdu)];
+    taskENTER_CRITICAL(&apduLock);
+    const size_t length = lastApduLength;
+    memcpy(copy, lastApdu, sizeof(copy));
+    taskEXIT_CRITICAL(&apduLock);
+    Serial.printf("APDU #%lu, %u bytes:", static_cast<unsigned long>(apdus), unsigned(length));
+    for (size_t i = 0; i < length && i < sizeof(copy); i++) Serial.printf(" %02x", copy[i]);
+    Serial.println(length > sizeof(copy) ? " ..." : "");
+  }
+  if (millis() - lastStatus >= 2000) {
+    lastStatus = millis();
     Serial.printf("mounted=%u card=%u powered=%u commands=%lu apdus=%lu\n",
-                  Ccid.mounted() ? 1 : 0,
-                  Ccid.cardPresent() ? 1 : 0,
-                  Ccid.cardPowered() ? 1 : 0,
-                  static_cast<unsigned long>(Ccid.commandCount()),
-                  static_cast<unsigned long>(Ccid.apduCount()));
+        unsigned(reader.mounted()), unsigned(reader.cardPresent()), unsigned(reader.cardPowered()),
+        static_cast<unsigned long>(reader.commandCount()), static_cast<unsigned long>(apdus));
   }
   delay(10);
 }

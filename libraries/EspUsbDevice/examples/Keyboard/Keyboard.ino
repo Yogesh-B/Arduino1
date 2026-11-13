@@ -1,69 +1,61 @@
-#include "EspUsbDevice.h"
+#include <EspUsbDevice.h>
 
 EspUsbDevice device;
 EspUsbDeviceHidKeyboard keyboard(device);
 
-void setup()
-{
-  Serial.begin(115200);
-  delay(1500);
-
-  keyboard.setLayout(ESP_USB_DEVICE_KEYBOARD_LAYOUT_EN_US);
-
-  // The callback fires the moment the host changes the Lock LEDs. It is a single
-  // slot, so keyboard.ledState() below is the way to read the same state when
-  // something else (an integration layer, say) already took it.
-  keyboard.onOutputReport([](const EspUsbDeviceHidKeyboardOutputReport &report)
-                          {
-                            Serial.printf("LEDS num=%u caps=%u scroll=%u raw=0x%02x\n",
-                                          report.numLock ? 1 : 0,
-                                          report.capsLock ? 1 : 0,
-                                          report.scrollLock ? 1 : 0,
-                                          report.leds);
-                          });
-
-  EspUsbDeviceConfig config;
-  config.vid = 0x303a;
-  config.pid = 0x4001;
-  config.manufacturer = "EspUsb";
-  config.product = "EspUsbDevice Keyboard";
-  config.serialNumber = "espusb-keyboard";
-
-  if (!device.begin(config))
-  {
-    Serial.printf("USB_BEGIN_FAILED %s\n", device.lastErrorName());
+// Text, a second layout, a held modifier and a raw usage. Sent only on request.
+void demo() {
+  if (!keyboard.write("Hi from EspUsbDevice\n")) {
+    Serial.printf("WRITE_FAILED %s\n", device.lastErrorName());
     return;
   }
-
-  Serial.println("USB keyboard ready");
-}
-
-void loop()
-{
-  static uint32_t lastSendMs = 0;
-  const uint32_t now = millis();
-  if (now - lastSendMs < 3000)
-  {
-    delay(1);
-    return;
-  }
-  lastSendMs = now;
-
-  if (!keyboard.write("Hi from EspUsbDevice\n"))
-  {
-    Serial.printf("WRITE_FAILED error=%s\n", device.lastErrorName());
-  }
-
+  // The layout maps characters to key positions; the Host's own layout setting
+  // decides which character appears. These symbols move on a JIS keyboard.
   keyboard.setLayout(ESP_USB_DEVICE_KEYBOARD_LAYOUT_JA_JP);
   keyboard.write("@[]:\"");
   keyboard.tapKey('\n');
   keyboard.setLayout(ESP_USB_DEVICE_KEYBOARD_LAYOUT_EN_US);
-
-  // Raw HID usage remains available for keys that are not part of the ASCII wrapper.
+  // Hold Shift+B until the matching release; usages are key positions.
+  keyboard.pressUsage(ESP_USB_HID_KEY_B, ESP_USB_DEVICE_MOD_LEFT_SHIFT);
+  keyboard.releaseUsage(ESP_USB_HID_KEY_B);
+  keyboard.releaseAll();
+  // Keys outside the ASCII mapping are sent by HID usage ID.
   keyboard.tapUsage(ESP_USB_HID_KEY_LANG1);
-  // ledState() holds the latest host output report - no need to mirror it into a
-  // global from the callback.
-  Serial.printf("last_leds=0x%02x caps=%u\n",
-                keyboard.ledState().leds,
-                keyboard.ledState().capsLock ? 1 : 0);
+  // ledState() is updated with or without a callback.
+  const EspUsbDeviceHidKeyboardOutputReport leds = keyboard.ledState();
+  Serial.printf("last_leds=0x%02x caps=%u\n", leds.leds, leds.capsLock ? 1 : 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+  keyboard.setLayout(ESP_USB_DEVICE_KEYBOARD_LAYOUT_EN_US);
+  // Runs on the USB worker when the Host changes the Lock LEDs. Register before
+  // begin(); afterwards it returns ESP_ERR_INVALID_STATE.
+  keyboard.onOutputReport([](const EspUsbDeviceHidKeyboardOutputReport &report) {
+    Serial.printf("LEDS num=%u caps=%u scroll=%u raw=0x%02x\n",
+        report.numLock ? 1 : 0, report.capsLock ? 1 : 0,
+        report.scrollLock ? 1 : 0, report.leds);
+  });
+
+  EspUsbDeviceConfig config;
+  config.pid = 0x4001;
+  config.manufacturer = "EspUsb";
+  config.product = "EspUsbDevice Keyboard";
+  config.serialNumber = "espusb-keyboard";
+  if (!device.begin(config)) {
+    Serial.printf("USB_BEGIN_FAILED %s\n", device.lastErrorName());
+    return;
+  }
+  Serial.println("USB keyboard ready: type here to send keys, ~ runs the demo");
+}
+
+void loop() {
+  // Type into the separate debug serial port to send keys over the data USB.
+  // Select a text editor on the USB Host before entering text.
+  if (device.ready() && Serial.available()) {
+    const char key = char(Serial.read());
+    if (key == '~') demo();
+    else if (key != '\r') keyboard.tapKey(key);  // Unmapped characters are skipped.
+  }
+  delay(1);
 }

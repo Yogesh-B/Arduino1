@@ -2,37 +2,45 @@
 
 > 日本語版: [README.ja.md](README.ja.md)
 
-Creates a USB HID boot mouse device and sends relative movement, wheel deltas,
-and button state to a USB host.
+Creates a USB HID boot mouse and sends relative movement, wheel deltas and
+button state to a USB Host.
 
 ## Hardware
 
-- ESP32-S3 or another Arduino-ESP32 board with USB device support
-- A USB host such as a PC, another ESP32 running EspUsbHost, or a test fixture
-- A separate Serial monitor connection for logs when available
+- ESP32-S3, ESP32-S2 or ESP32-P4 board; the native USB OTG port goes to the Host
+- A USB Host such as a PC, another ESP32 running EspUsbHost, or a test fixture
+- A separate debug connection for `Serial` (115200) logs
 
 ## What It Does
 
-- Starts `EspUsbDevice` as a full-speed HID mouse
-- Sends relative `x` / `y` movement deltas
-- Sends wheel movement
-- Maintains mouse button state locally so press/release calls match Host-side
+- Starts `EspUsbDevice` as an HID mouse with its own VID/PID/strings
+- Once the Host has configured the device, one step per second:
+  right, down, left, up (30 counts each), wheel +1, left-button press and release
+- Keeps the button state on the device so press/release calls match Host-side
   `buttons` and `previousButtons` event fields
-- Demonstrates left-button press and release
+- Prints failures with `device.lastErrorName()` and the current button bitmask
+
+Movement starts as soon as the Host configures the device. Use a test area.
 
 ## Key APIs
 
-- `mouse.move(x, y)` sends relative movement.
-- `mouse.move(x, y, wheel, buttons)` sends a full boot mouse report and replaces
-  the current button state.
-- `mouse.wheel(delta)` sends wheel movement while preserving current buttons.
+- `mouse.move(x, y)` sends relative movement and keeps the buttons held by
+  `press()`, so `press()` then `move()` drags.
+- `mouse.move(x, y, wheel, buttons)` with `buttons` 0-255 sets the held buttons,
+  as `press()`/`release()` would. The default `EspUsbDeviceHidMouse::KeepButtons`
+  (-1) keeps them. A value outside -1..255 fails with `ESP_ERR_INVALID_ARG`.
+- `mouse.wheel(delta)` sends wheel movement while keeping the current buttons.
 - `mouse.press(buttons)` sets one or more button bits and sends the new state.
-- `mouse.release(buttons)` clears one or more button bits and sends the new
-  state.
+- `mouse.release(buttons)` clears one or more button bits and sends the new state.
 - `mouse.releaseAll()` clears all button bits.
-- `mouse.click(button)` sends press, delay, and release.
+- `mouse.click(button)` sends press, a short hold, and release.
 - `mouse.buttons()` returns the current device-side button bitmask.
-- `mouse.sendReport(report)` sends a raw boot mouse report.
+- `mouse.sendReport(report)` sends a raw `EspUsbDeviceBootMouseReport`;
+  `mouse.sendState()` resends the current buttons with zero movement.
+
+In report protocol the device sends 4 bytes (buttons, X, Y, wheel); in boot
+protocol it converts to the 3-byte boot format. X/Y/wheel are reset to 0 after
+a successful send, so a Host idle repeat does not repeat the movement.
 
 ## Button Bits
 
@@ -48,13 +56,34 @@ and button state to a USB host.
 
 ```text
 USB mouse ready
-MOUSE_FAILED error=ESP_ERR_TIMEOUT
+MOUSE_FAILED ESP_ERR_TIMEOUT buttons=0x00
 ```
 
-The example only prints failures. Movement and button behavior should be
-observed on the USB host.
+The sketch prints only failures. Watch movement and buttons on the Host.
+
+## Checks
+
+- `move()` takes deltas, not screen coordinates.
+- `press()` leaves a button held until `release()`. The sketch always sends the
+  release, even if the press failed; it does not implement a general pending-release
+  queue, so an application must recover its own button state.
+- A true result means the report was copied and queued, not that the Host read it.
+
+## Changes from v2
+
+- Reports are sent only while `device.ready()` is true, so a missing Host no
+  longer produces a failure every second.
+- The release is sent even when the press failed, and the failure log includes
+  `mouse.buttons()`.
+- `move(x, y)` without `buttons` now keeps the held buttons. v2 defaulted
+  `buttons` to 0, so a move released any held button; pass 0 explicitly for that.
+- `wheel()`, `press()`, `release()`, `click()`, `buttons()` and
+  `sendReport()`/`sendState()` are unchanged. Relative values are cleared after
+  a successful send, so a Host idle repeat sends zero movement.
 
 ## See Also
 
-- [KeyboardMouse](../KeyboardMouse/) - composite keyboard and mouse device
-- [Keyboard](../Keyboard/) - HID keyboard device
+- [KeyboardMouse](../KeyboardMouse/) - composite keyboard and mouse
+- [Keyboard](../Keyboard/) - HID keyboard
+- [HID API guide](../../docs/classes/hid.md)
+- [All examples](../README.md)

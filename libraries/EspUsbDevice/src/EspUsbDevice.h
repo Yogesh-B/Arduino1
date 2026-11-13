@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <Print.h>
+#include <Stream.h>
 #include <atomic>
 #include <functional>
 #include "espusbdevice_version.h"
@@ -32,11 +33,27 @@ typedef int esp_err_t;
 #define ESP_ERR_NOT_SUPPORTED 0x106
 #endif
 
+// begin() always validates descriptors and reserves selected Function resources.
+// DescriptorsOnly omits the PHY, interrupt and USB worker; ready() remains false.
+enum class EspUsbDeviceStartMode : uint8_t
+{
+  Usb,
+  DescriptorsOnly,
+};
+
 enum class EspUsbController : uint8_t
 {
   Auto,
   FullSpeed,
   HighSpeed,
+};
+
+// Bus speed the host negotiated at its last bus reset (USB 2.0 7.1.7.5).
+enum class EspUsbBusSpeed : uint8_t
+{
+  None,
+  Full,
+  High,
 };
 
 // How much of the controller's transmit FIFO each bulk IN endpoint gets.
@@ -113,6 +130,9 @@ enum EspUsbDeviceMsOs20Layout : uint8_t
 
 struct EspUsbDeviceConfig
 {
+  // UTF-8 text, copied to immutable USB descriptors during begin(). Each
+  // string may use at most 126 UTF-16 code units; invalid/long text is rejected.
+  // config() retains the supplied pointer values, not ownership of the sources.
   const char *manufacturer = "EspUsbDevice";
   const char *product = "EspUsbDevice";
   const char *serialNumber = nullptr;
@@ -129,8 +149,12 @@ struct EspUsbDeviceConfig
   // what every release before this emitted.
   uint16_t deviceVersion = 0x0100;
   bool selfPowered = false;
+  // Advertise capability; only the Host can enable its use.
+  bool remoteWakeupSupported = false;
   uint16_t maxPowerMilliamps = 100;
   bool webusbEnabled = false;
+  // nullptr advertises WebUSB without a landing page. When enabled, a URL
+  // must be valid UTF-8 and fit 252 bytes after removing http(s)://.
   const char *webusbUrl = nullptr;
   EspUsbDeviceMsOs20Layout msOs20Layout = ESP_USB_DEVICE_MS_OS_20_AUTO;
   // The GUID Windows records as this interface's DeviceInterfaceGUIDs, which is
@@ -161,8 +185,9 @@ struct EspUsbDeviceConfig
   // twice (measured; see the user guide, "What Windows re-reads"). Being
   // composite from the first release avoids ever writing the device-scope one.
   //
-  // Forces the subset layout, because function subsets are the point. Costs 4
-  // bytes plus the subset headers. Default off: a device that is not going to
+  // Selects the subset layout when msOs20Layout is Auto, because function
+  // subsets are the point; an explicit msOs20Layout wins. Costs 4 bytes plus
+  // the subset headers. Default off: a device that is not going to
   // grow does not need it, and the flat layout is what has been measured most.
   bool msOs20CcgpDevice = false;
   // wVendorRevision in the Microsoft OS 2.0 descriptor set.
@@ -178,18 +203,28 @@ struct EspUsbDeviceConfig
   // bump. Set it yourself only if you need the number to follow your own
   // release scheme; microsoftOs20VendorRevision() reports whichever applied.
   uint16_t msOs20VendorRevision = 0;
-  bool startTinyUsb = true;
+  EspUsbDeviceStartMode startMode = EspUsbDeviceStartMode::Usb;
+  // Event slots owned by the selected USB configuration; must be nonzero.
+  // One additional slot is reserved for hardware events, excluded from fences.
+  uint16_t eventQueueDepth = 16;
+  // ESP-IDF task stack capacity in bytes, including application callbacks.
+  uint32_t taskStackBytes = 4096;
+  // -1 selects the existing default: configMAX_PRIORITIES - 1. Otherwise use
+  // an RTOS priority from 0 through configMAX_PRIORITIES - 1.
+  int8_t taskPriority = -1;
   EspUsbController controller = EspUsbController::Auto;
+  // Use the board's hardware VBUS-valid signal instead of forcing B-session
+  // valid. Requires actual VBUS sensing/routing on the board. Reconfigure after
+  // end(), before begin(); false keeps the default for boards without sensing.
+  bool vbusSensing = false;
   EspUsbBulkInBuffering bulkInBuffering = EspUsbBulkInBuffering::Auto;
-  // Core to run the USB device task on, or -1 to leave the scheduler to place
-  // it (the default, and what every release before this did).
-  //
-  // Worth setting on a dual-core part when the sketch produces data as fast as
-  // USB can carry it: begin() is normally called from the Arduino loop task on
-  // core 1, an unpinned usbd task tends to end up beside it, and the two then
-  // interrupt each other. Pinning USB to core 0 and leaving the producer on
-  // core 1 separates them. On a single-core target this does nothing.
+  // -1 leaves the worker unpinned; otherwise choose an available core index.
+  // A single-core build accepts only 0 or -1.
   int8_t taskCoreId = -1;
+  // How long end() waits for the worker to finish its current callback. If it
+  // does not, end() returns ESP_ERR_TIMEOUT with the stop still requested; call
+  // end() again once the callback returns. 0 waits indefinitely.
+  uint32_t stopTimeoutMs = 5000;
 };
 
 static constexpr uint8_t ESP_USB_DEVICE_KEYBOARD_LED_NUM_LOCK = 0x01;
@@ -296,9 +331,10 @@ static constexpr uint16_t ESP_USB_DEVICE_CONSUMER_CONTROL_MUTE = 0x00e2;
 static constexpr uint16_t ESP_USB_DEVICE_CONSUMER_CONTROL_VOLUME_UP = 0x00e9;
 static constexpr uint16_t ESP_USB_DEVICE_CONSUMER_CONTROL_VOLUME_DOWN = 0x00ea;
 
-static constexpr uint8_t ESP_USB_DEVICE_SYSTEM_CONTROL_POWER_OFF = 0x01;
-static constexpr uint8_t ESP_USB_DEVICE_SYSTEM_CONTROL_STANDBY = 0x02;
-static constexpr uint8_t ESP_USB_DEVICE_SYSTEM_CONTROL_WAKE_HOST = 0x03;
+// Generic Desktop usage IDs; the HID array encodes these as selectors 1..3.
+static constexpr uint8_t ESP_USB_DEVICE_SYSTEM_CONTROL_POWER_OFF = 0x81;
+static constexpr uint8_t ESP_USB_DEVICE_SYSTEM_CONTROL_STANDBY = 0x82;
+static constexpr uint8_t ESP_USB_DEVICE_SYSTEM_CONTROL_WAKE_HOST = 0x83;
 
 static constexpr uint8_t ESP_USB_DEVICE_MIDI_CIN_NOTE_OFF = 0x08;
 static constexpr uint8_t ESP_USB_DEVICE_MIDI_CIN_NOTE_ON = 0x09;
@@ -471,7 +507,7 @@ struct EspUsbDeviceCdcLineState
 };
 
 // Stage of a control transfer, as the observation hook reports it. Same values
-// as TinyUSB's CONTROL_STAGE_*.
+// as the USB control-transfer stages.
 static constexpr uint8_t ESP_USB_DEVICE_CONTROL_STAGE_SETUP = 1;
 static constexpr uint8_t ESP_USB_DEVICE_CONTROL_STAGE_DATA = 2;
 static constexpr uint8_t ESP_USB_DEVICE_CONTROL_STAGE_ACK = 3;
@@ -504,6 +540,9 @@ struct EspUsbDeviceVendorControlRequest
   uint16_t wValue = 0;
   uint16_t wIndex = 0;
   uint16_t wLength = 0;
+  // Data-stage bytes transferred so far; 0 at SETUP. DATA/ACK report the
+  // actual total in either direction, excluding SETUP/status packets and ZLPs.
+  uint16_t actualBytes = 0;
   const void *rawRequest = nullptr;
 };
 
@@ -534,12 +573,20 @@ enum EspUsbDeviceCcidError : uint8_t
 // Longest ATR ISO 7816-3 allows (TS + T0 + 15 interface + 15 historical + TCK).
 static constexpr size_t ESP_USB_DEVICE_CCID_MAX_ATR = 33;
 
-// Largest CCID message (10-byte header + abData) the device accepts or sends.
-// The default covers short APDU level exchange (10 + 261) with room to spare;
-// raise it with a build flag if a sketch answers with more.
-#ifndef ESP_USB_DEVICE_CCID_BUFFER_SIZE
-#define ESP_USB_DEVICE_CCID_BUFFER_SIZE 320
+#ifdef ESP_USB_DEVICE_CCID_BUFFER_SIZE
+#error "Use EspUsbCcidConfig::messageBytes instead of ESP_USB_DEVICE_CCID_BUFFER_SIZE"
 #endif
+struct EspUsbCcidConfig
+{
+  // Complete message, including its 10-byte header. 0 selects 271 (a whole
+  // short APDU: 10 + 4 + 1 + 255 + 1), raised to the Bulk-OUT max packet of the
+  // selected controller (512 at high speed), which CCID 1.1 requires as the
+  // minimum for short APDU exchange.
+  size_t messageBytes = 0;
+  bool removable = true; // false omits notification endpoint; insert before begin
+  const char *name = nullptr;
+};
+struct EspUsbCcidState;
 
 struct EspUsbDeviceMidiPacket
 {
@@ -574,12 +621,28 @@ public:
   // being pulled - so a host-side test can reproduce disconnection without
   // anyone touching the hardware. The EspUsbHost suite drives exactly this
   // from its peer to test replugging a camera mid-stream.
-  void end();
-  void task();
+  // Success means the worker and DMA have stopped and borrowed buffers were
+  // returned. A call from a USB callback is rejected with INVALID_STATE.
+  esp_err_t end();
+  // Successful begin() owns the selected resources until end(), including
+  // DescriptorsOnly mode. ready() additionally requires Host configuration.
+  bool started() const;
   bool ready() const;
+  // Bus suspend is independent of Host configuration: ready() stays true.
+  // False before USB startup, in DescriptorsOnly mode, and after end().
+  bool suspended() const;
+  // Full or High once the host has reset the bus; a high-speed controller runs
+  // at Full on a full-speed hub or host. None before USB startup, in
+  // DescriptorsOnly mode, and after end().
+  EspUsbBusSpeed speed() const;
+  // Task-context Host-permission query; false after reset/end or in an ISR.
+  bool remoteWakeupEnabled() const;
+  // Task-context, nonblocking queue request. ESP_OK means accepted, not resumed.
+  // Rejected unless configured, suspended and enabled by the Host. Later state
+  // changes can cancel an accepted request. Duplicate pending requests fail.
+  esp_err_t remoteWakeup();
 
   const EspUsbDeviceConfig &config() const;
-  uint16_t hidEndpointSize() const;
   // Bitmap of IN endpoint numbers that were given a two-packet transmit FIFO,
   // as begin() decided it. 0 before begin(), and 0 whenever
   // EspUsbBulkInBuffering::Auto found the controller's FIFO too full to double
@@ -613,10 +676,8 @@ public:
   // USB Serial/JTAG port, which is not the high-speed OTG connector. See
   // docs/ota-over-usb.md.
   //
-  // Arduino-ESP32's usb_persist_restart() does the same job and cannot be used
-  // from a sketch that links this library - it drags esp32-hal-tinyusb.c in,
-  // which defines tud_descriptor_bos_cb() and tud_vendor_control_xfer_cb() a
-  // second time - and is a no-op on ESP32-P4 in any case.
+  // Sets ROM download mode directly, including the shared PHY routing needed
+  // for USB Serial/JTAG on S3. It does not initialize Arduino's USB stack.
   bool rebootToBootloader();
   // Restart into the ROM's DFU device on USB-OTG instead of its serial loader,
   // for a host that drives dfu-util rather than esptool. ESP32-S2 and ESP32-S3
@@ -648,10 +709,8 @@ public:
   uint16_t hidInterfacesLength() const;
   uint8_t hidInterfaceCount() const;
   const uint16_t *stringDescriptor(uint8_t index, uint16_t langid);
-  // Number of EspUsbDeviceCdcSerial functions this build can drive. A compile-
-  // time property of the SoC's endpoint budget, not of the device: registering
-  // more than this makes begin() fail.
-  static uint8_t maxCdcPorts();
+  // Cached WebUSB URL #1, or nullptr when no landing page is configured.
+  const uint8_t *webUsbUrlDescriptor() const;
   const uint8_t *hidReportDescriptor(uint8_t instance);
   // Length of what hidReportDescriptor(instance) returns. For a composite HID
   // that is the merged descriptor, which is not any one class's own length.
@@ -671,11 +730,13 @@ public:
   // answers it, so a stalled one still shows up) and at ACK for every control
   // transfer that completes, which covers the standard and class requests the
   // stack handles internally. Runs on the usbd task; keep it short.
-  void onAnyControlRequest(ControlRequestObserver callback);
+  // Set while stopped; ESP_ERR_INVALID_STATE while started, as the worker reads it.
+  esp_err_t onAnyControlRequest(ControlRequestObserver callback);
   void handleHidSetReport(uint8_t instance, uint8_t reportId, uint8_t reportType, const uint8_t *data, uint16_t length);
   void handleHidSetProtocol(uint8_t instance, uint8_t protocol);
   void handleBusAttached();
   void handleBusDetached();
+  bool handleVendorControlRequest(uint8_t rhport, uint8_t stage, const void *request);
   // Report one control request to the observer, if a sketch installed one.
   void notifyControlRequest(const EspUsbDeviceControlRequestInfo &info);
   bool hasControlObserver() const { return static_cast<bool>(controlObserver_); }
@@ -689,6 +750,7 @@ public:
 private:
   friend class EspUsbDeviceClass;
   friend class EspUsbDeviceCdcSerial;
+  friend class EspUsbDeviceBulkStream;
   friend class EspUsbDeviceHidKeyboard;
   friend class EspUsbDeviceHidMouse;
   friend class EspUsbDeviceHidCustom;
@@ -698,45 +760,25 @@ private:
   friend class EspUsbDeviceHidSystemControl;
   friend class EspUsbDeviceVendor;
   friend class EspUsbAudioFunction;
+  friend class EspUsbDeviceVideo;
   friend class EspUsbDeviceNet;
   friend class EspUsbDeviceCcid;
+  friend class EspUsbDeviceMidi;
   friend class EspUsbDeviceDfu;
-  // Raised from 4 when CDC became multi-instance: the P4 HS controller's 7
-  // non-control IN endpoints admit HID + MSC + Vendor + CDC x2, which is five
-  // functions. Each slot is one pointer, so the ceiling costs nothing to carry;
-  // the endpoint budget is what actually decides whether a device is buildable.
-  static constexpr size_t MAX_CLASSES = 6;
-  // String descriptor indices 1-3 are manufacturer / product / serial and 4 is
-  // the CDC-NCM MAC address. Per-function names start after those.
+  friend class EspUsbDeviceMsc;
+  friend class EspUsbHidFunction;
+  friend struct EspUsbHidState;
+  // String descriptor indices 1-3 are manufacturer / product / serial. Index
+  // 4 is reserved; Function names precede their class-specific strings.
   static constexpr uint8_t FIRST_FUNCTION_STRING_INDEX = 5;
-  // Sized for the largest descriptor the library can emit: a 16-cable MIDI
-  // function is 572 bytes on its own (34 head + 30 * 16 jacks + 29 * 2
-  // endpoints), plus the 9-byte configuration header and room for one more
-  // small function alongside it. Anything larger returns a clean build failure
-  // from configurationDescriptorForSpeed() rather than overrunning. Three
-  // buffers of this size are held per device, on the heap - see the members.
-  static constexpr size_t MAX_CONFIG_DESCRIPTOR = 704;
-  static constexpr size_t MAX_HID_REPORT_DESCRIPTOR = 256;
-  static constexpr size_t MAX_STRING_DESCRIPTOR = 64;
-  static constexpr size_t MAX_BOS_DESCRIPTOR = 57;
-  // Largest descriptor set this builds. One WinUSB function costs 8 (function
-  // subset header) + 20 (compatible ID) + 132 (the DeviceInterfaceGUIDs
-  // registry property); two of them plus 10 (set header) and 8 (configuration
-  // subset) is 330. A single flat function - the non-composite case - is 162
-  // and stops short in the same buffer.
-  //
-  // Two is the ceiling because only two of this library's classes ask Windows
-  // for WinUSB: the vendor interface and DFU.
-  // Plus 6 bytes per function for the vendor revision descriptor, which sits in
-  // every function subset (or once under the set header when flat).
-  // Plus 4 for the CCGP feature descriptor when a device asks to be composite.
-  static constexpr size_t MAX_MS_OS_20_DESCRIPTOR = 346;
-
   bool buildDescriptors();
-  // Allocates the three configuration descriptor buffers on first use. False (and
-  // ESP_ERR_NO_MEM) when the allocation fails, which leaves them null.
-  bool allocateDescriptorBuffers();
-  void buildWebUsbDescriptors();
+  bool buildStringDescriptors();
+  bool buildWebUsbUrlDescriptor();
+  void releaseDescriptors();
+  bool buildConfigurationDescriptor(bool highSpeed);
+  bool buildMergedHidReport();
+  bool needsHighSpeedDescriptors() const;
+  bool buildWebUsbDescriptors();
   // Resolves config_.msOs20Layout for the configuration currently in
   // configDescriptor_. Only meaningful after the configuration is assembled.
   bool microsoftOs20SubsetLayout() const;
@@ -752,7 +794,6 @@ private:
   // endpoint whose FIFO cannot be placed still enumerates and still reports
   // completed transfers, and the host receives nothing.
   bool transmitFifoFits(bool highSpeed) const;
-  bool hasIsochronousInEndpoint(bool highSpeed) const;
   bool compositeHid() const;
   bool hasHidClass() const;
   bool hasCdcClass() const;
@@ -765,51 +806,52 @@ private:
   uint8_t classReportId(uint8_t classInstance) const;
   // Two different numbers meet here. classReportId() and classRuntimeInstance()
   // take the class's slot in classes_ (EspUsbDeviceClass::hidInstance_), which
-  // is registration order. hidClassForInstance() takes TinyUSB's HID instance
+  // is registration order. hidClassForInstance() takes the HID driver instance
   // number - always 0 in this build - and returns the class behind it. Treating
   // one as the other is what once broke a HID class registered after a non-HID
   // one.
   uint8_t classRuntimeInstance(uint8_t classInstance) const;
   EspUsbDeviceClass *hidClassForInstance(uint8_t instance) const;
   void setLastError(esp_err_t error);
+  esp_err_t stop(uint32_t timeoutMs);
+  void stopAndWait();
   void removeClass(EspUsbDeviceClass *deviceClass);
 
   EspUsbDeviceConfig config_;
-  EspUsbDeviceClass *classes_[MAX_CLASSES] = {};
-  // Function name per class slot, published at string index
-  // FIRST_FUNCTION_STRING_INDEX + slot. Filled by buildDescriptors() from
-  // EspUsbDeviceClass::functionName(); null slots have no string.
-  const char *functionStrings_[MAX_CLASSES] = {};
-  size_t classCount_ = 0;
-  bool running_ = false;
+  // Intrusive configuration order; the exact-sized lookup/name table exists
+  // only during a build/run and is released on end or failed begin.
+  EspUsbDeviceClass *firstClass_ = nullptr, *lastClass_ = nullptr;
+  EspUsbDeviceClass **classes_ = nullptr;
+  size_t classCount_ = 0, rejectedClassCount_ = 0;
+  struct RegistrationTransaction;
+  bool allocateClassRegistry();
+  void releaseClassRegistry();
+  EspUsbDeviceClass *classAt(size_t index) const;
+  std::atomic<bool> running_{false};
   bool ready_ = false;
-  bool tinyusbStarted_ = false;
+  bool usbStarted_ = false;
   esp_err_t lastError_ = ESP_OK;
   uint8_t deviceDescriptor_[18] = {};
-  // One allocation split three ways, made on the first buildDescriptors() and
-  // released by the destructor. These are by far the largest members, and keeping
-  // them out of the object matters because sketches and tests do put an
-  // EspUsbDevice on the stack - several at once, in the case of
-  // tests/unit/descriptor - where 2 KB of buffers per instance overflows the
-  // Arduino loop task.
+  // Exact-sized, independently selected descriptor storage.
   uint8_t *configDescriptor_ = nullptr;
   uint8_t *configDescriptorHighSpeed_ = nullptr;
   uint8_t *otherSpeedDescriptor_ = nullptr;
   uint8_t deviceQualifierDescriptor_[10] = {};
-  uint8_t bosDescriptor_[MAX_BOS_DESCRIPTOR] = {};
-  uint8_t microsoftOs20Descriptor_[MAX_MS_OS_20_DESCRIPTOR] = {};
-  uint8_t hidReportDescriptor_[MAX_HID_REPORT_DESCRIPTOR] = {};
-  uint16_t configDescriptorLength_ = 0;
+  uint8_t *bosDescriptor_ = nullptr;
+  uint8_t *microsoftOs20Descriptor_ = nullptr;
+  uint8_t *hidReportDescriptor_ = nullptr;
+  uint16_t configDescriptorLength_ = 0, highSpeedDescriptorLength_ = 0;
   uint16_t bosDescriptorLength_ = 0;
   uint16_t microsoftOs20DescriptorLength_ = 0;
   uint16_t microsoftOs20VendorRevision_ = 0;
-  uint8_t vendorInterfaceNumber_ = 0xff;
-  uint8_t dfuInterfaceNumber_ = 0xff;
   uint16_t bulkInDoubleBuffered_ = 0;
   uint16_t hidInterfacesLength_ = 0;
   uint8_t hidInterfaceCount_ = 0;
   uint16_t hidReportDescriptorLength_ = 0;
-  uint16_t stringDescriptor_[MAX_STRING_DESCRIPTOR] = {};
+  // One exact-sized block: word offsets followed by immutable UTF-16 strings.
+  uint16_t *stringDescriptors_ = nullptr;
+  uint16_t stringDescriptorSlots_ = 0;
+  uint8_t *webUsbUrlDescriptor_ = nullptr;
   ControlRequestObserver controlObserver_;
   uint8_t controlResponseRequest_ = 0;
   uint16_t controlResponseValue_ = 0;
@@ -820,11 +862,14 @@ private:
 class EspUsbDeviceClass
 {
 public:
+  EspUsbDeviceClass(const EspUsbDeviceClass &) = delete;
+  EspUsbDeviceClass &operator=(const EspUsbDeviceClass &) = delete;
+  EspUsbDeviceClass(EspUsbDeviceClass &&) = delete;
+  EspUsbDeviceClass &operator=(EspUsbDeviceClass &&) = delete;
   virtual ~EspUsbDeviceClass();
-  virtual bool begin() { return true; }
-  virtual bool afterDeviceStarted() { return true; }
+  virtual esp_err_t startError() const { return ESP_FAIL; }
   virtual void end() {}
-  virtual bool isHid() const { return true; }
+  virtual bool isHid() const { return false; }
   virtual bool isCdc() const { return false; }
   virtual bool isMidi() const { return false; }
   virtual bool isMsc() const { return false; }
@@ -833,28 +878,35 @@ public:
   virtual bool isVideo() const { return false; }
   virtual bool isNet() const { return false; }
   virtual bool isDfu() const { return false; }
+  // Required v3 writer contract: nullptr measures the required byte count;
+  // it must not write. The size must stay stable until configuration changes.
   virtual uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) = 0;
+  // nullptr/0 queries the size; non-null writers must respect capacity.
   virtual uint16_t configurationDescriptorForSpeed(
       uint8_t *dst, size_t capacity, uint8_t interfaceNumber,
-      uint8_t endpointNumber, bool highSpeed)
-  {
-    (void)capacity;
-    return configurationDescriptor(dst, interfaceNumber, endpointNumber,
-                                   highSpeed ? 512 : 64);
-  }
+      uint8_t endpointNumber, bool highSpeed);
   virtual uint8_t interfaceCount() const = 0;
+  // Span of endpoint numbers reserved for this Function, not the number of
+  // directional endpoint addresses. IN and OUT may share one number.
   virtual uint8_t endpointCount() const = 0;
   // Name to publish for this function, or null for none. A composite device
   // that repeats one class needs it: without a string the host has nothing to
-  // tell two identical functions apart. Returned pointer must outlive begin().
+  // tell two identical functions apart. UTF-8 is copied during begin(); the
+  // returned pointer must remain valid until begin() returns.
   virtual const char *functionName() const { return nullptr; }
+  // Optional class-specific strings (e.g. an NCM MAC address), separate from
+  // functionName(). Keep count/text stable through begin(); the core snapshots
+  // them as UTF-16. A declared string must be non-null. No storage when unused.
+  virtual size_t auxiliaryStringCount() const { return 0; }
+  virtual const char *auxiliaryString(size_t) const { return nullptr; }
+  // A contiguous range after all function names; first=0 when count=0.
+  virtual void assignAuxiliaryStringIds(uint8_t first) { (void)first; }
   // Called by buildDescriptors() before asking for the descriptor, so a class
   // can emit and address itself correctly.
   //
-  // instance is this function's index among functions of the same class, in
-  // descriptor order. TinyUSB numbers its class instances by interface claim
-  // order, which follows descriptor order, so this is exactly the index the
-  // tud_<class>_n() API expects.
+  // instance is this function's logical index among functions of the same
+  // class in descriptor order. Legacy adapters may map it to their stack slot;
+  // independent functions dispatch their endpoints by interface identity.
   //
   // stringIndex is the string descriptor index reserved for functionName(), or
   // 0 when the class did not ask for a name.
@@ -863,20 +915,26 @@ public:
     (void)instance;
     (void)stringIndex;
   }
+  // Preferred ID. Repeated HID types receive unique IDs in a composite.
   virtual uint8_t hidReportId() const { return 0; }
+  // Assigned composite identity from the last descriptor build; 0 after end
+  // or for a standalone HID. Normal sendReport/sendInput choose it for you.
+  uint8_t compositeReportId() const { return assignedReportId_; }
   virtual const uint8_t *hidReportDescriptor() const { return nullptr; }
   virtual uint16_t hidReportDescriptorLength() const { return 0; }
+  virtual bool sendHidInput(uint8_t, const void *, size_t, uint32_t) { return false; }
   // Preferred IN endpoint wMaxPacketSize for this HID class, or 0 for "no
   // preference" (use the default). NKRO keyboards return a larger size so their
-  // multi-byte bitmap report fits one packet. Bounded by CFG_TUD_HID_EP_BUFSIZE.
+  // multi-byte bitmap report fits one packet. This is a bus packet preference,
+  // independent of the complete report's runtime storage.
   virtual uint16_t hidInEndpointSize() const { return 0; }
   // wMaxPacketSize this HID function wants for its interrupt endpoints in the
   // high-speed configuration, or 0 to keep the full-speed value there too.
   //
   // Full speed caps an interrupt endpoint at 64 bytes and high speed at 1024, so
   // the two configurations genuinely differ for a class that moves more than one
-  // report's worth per interval - which, of the classes here, is only
-  // EspUsbDeviceHidVendor. Everything else sends 8 or 16 bytes and returns 0.
+  // report's worth per interval - which, of the classes here, are
+  // EspUsbDeviceHidVendor and EspUsbDeviceHidCustom. The others return 0.
   virtual uint16_t hidHighSpeedEndpointSize() const { return 0; }
   virtual void onHidSetReport(uint8_t reportId, uint8_t reportType, const uint8_t *data, uint16_t length) {}
   virtual void onHidSetProtocol(uint8_t protocol) { (void)protocol; }
@@ -891,97 +949,77 @@ public:
   // LEDs, so clearing there is correct either way.
   virtual void onBusAttached() {}
   virtual void onBusDetached() {}
+  virtual bool onVendorControlRequest(uint8_t, uint8_t, const void *) { return false; }
+  // Why this Function's settings cannot be described, or ESP_OK. Checked before
+  // the descriptors are built, so begin() reports the cause instead of a size.
+  virtual esp_err_t descriptorConfigurationError() const { return ESP_OK; }
 
 protected:
   friend class EspUsbDevice;
+  // Lifecycle hooks run by EspUsbDevice::begin()/end() only.
+  virtual bool begin() { return true; }
+  virtual bool afterDeviceStarted() { return true; }
+  virtual void prepareToStop() {}
   explicit EspUsbDeviceClass(EspUsbDevice &device);
+  // Worst negotiated bulk packet for the selected controller, before startup.
+  uint16_t maximumBulkPacketSize() const;
   EspUsbDevice &device_;
   // This class's slot in EspUsbDevice::classes_, i.e. its registration order.
-  // Not a TinyUSB instance number, despite the name: the device maps it through
-  // classReportId() and classRuntimeInstance() before anything reaches TinyUSB.
-  uint8_t hidInstance_ = 0;
+  // Logical Function index, mapped through classReportId() and
+  // classRuntimeInstance() to the selected HID driver.
+  uint8_t hidInstance_ = UINT8_MAX;
+  EspUsbDeviceClass *nextRegistered_ = nullptr;
+  bool registered_ = false, registrationRejected_ = false;
+  uint8_t assignedReportId_ = 0, descriptorInterfaceNumber_ = 0xff;
 };
 
-class EspUsbDeviceCdcSerial : public EspUsbDeviceClass, public Print
+struct EspUsbHidState;
+// Common runtime for HID Functions. A Device's merged HID shares one transport;
+// report descriptor sizes select storage, without TinyUSB class buffers.
+class EspUsbHidFunction : public EspUsbDeviceClass
 {
 public:
-  using LineCodingCallback = std::function<void(const EspUsbDeviceCdcLineCoding &)>;
-  using LineStateCallback = std::function<void(const EspUsbDeviceCdcLineState &)>;
-  using RxCallback = std::function<void(size_t)>;
-
-  // name is published as the function's iFunction / iInterface string. Give
-  // every port of a multi-port device a distinct one: it is what lets a host
-  // (and its user) tell the ports apart, since the ports are otherwise
-  // identical ACM functions. Optional for a single-port device.
-  explicit EspUsbDeviceCdcSerial(EspUsbDevice &device, const char *name = nullptr);
-  ~EspUsbDeviceCdcSerial() override;
-
-  bool begin() override;
-  bool afterDeviceStarted() override;
+  explicit EspUsbHidFunction(EspUsbDevice &device);
+  ~EspUsbHidFunction() override;
   void end() override;
-  bool isHid() const override { return false; }
-  bool isCdc() const override { return true; }
-  uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
-  uint8_t interfaceCount() const override { return 2; }
-  uint8_t endpointCount() const override { return 2; }
-  const char *functionName() const override { return name_; }
-  void assignFunctionIds(uint8_t instance, uint8_t stringIndex) override;
-
-  // Port index among the CDC functions of this device, in the order they appear
-  // in the configuration descriptor. Also the TinyUSB CDC instance this object
-  // drives. Valid after begin().
-  uint8_t port() const { return instance_; }
-  // Alternative to the constructor argument. Only read while the descriptor is
-  // built, so it must be set before EspUsbDevice::begin().
-  void setName(const char *name) { name_ = name; }
-
-  int available();
-  int read();
-  size_t read(uint8_t *buffer, size_t size);
-  size_t write(uint8_t data) override;
-  size_t write(const uint8_t *buffer, size_t size) override;
-  void flush();
-  bool connected() const;
-  const EspUsbDeviceCdcLineCoding &lineCoding() const;
-  const EspUsbDeviceCdcLineState &lineState() const;
-  void onLineCoding(LineCodingCallback callback);
-  void onLineState(LineStateCallback callback);
-  void onRx(RxCallback callback);
-
-  void handleLineCoding(uint32_t baud, uint8_t stopBits, uint8_t parity, uint8_t dataBits);
-  void handleLineState(bool dtr, bool rts);
-  void handleRx();
-
+  bool isHid() const override { return true; }
+  esp_err_t startError() const override { return hidStartError_; }
+  bool sendHidInput(uint8_t reportId, const void *, size_t, uint32_t timeoutMs) override;
+  // Set current Feature state without sending an interrupt report. Payload
+  // excludes the report ID; 0 selects this Function's unambiguous default ID.
+  // Valid after begin(), including before the host configures the interface.
+  esp_err_t setFeatureReport(const void *data, size_t length, uint8_t reportId = 0);
+  // Shared interface capacities, including a report ID byte when declared.
+  size_t inputReportCapacity() const;
+  // wMaxPacketSize of this Function's interrupt IN endpoint at the speed the
+  // host negotiated (shared by every HID in a composite interface). 0 until
+  // the host has reset the bus, and after end().
+  uint16_t inputPacketSize() const;
+  size_t outputReportCapacity() const;
+  size_t featureReportCapacity() const;
+protected:
+  bool hidStarted() const;
+  bool failHidBegin(esp_err_t error) { hidStartError_ = error; return false; }
 private:
-  friend class EspUsbDevice;
+  EspUsbHidState *hidState_ = nullptr;
+  esp_err_t hidStartError_ = ESP_OK;
 
-  // Whether instance_ addresses a CDC instance this build actually compiled.
-  // Checked before every tud_cdc_n_*() call, so a device that registered more
-  // ports than the build can hold degrades to a silent port rather than
-  // corrupting another one's state.
-  bool instanceValid() const;
-
-  const char *name_ = nullptr;
-  uint8_t instance_ = 0;
-  uint8_t stringIndex_ = 0;
-  EspUsbDeviceCdcLineCoding lineCoding_;
-  EspUsbDeviceCdcLineState lineState_;
-  LineCodingCallback lineCodingCallback_;
-  LineStateCallback lineStateCallback_;
-  RxCallback rxCallback_;
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
 
-// Why a writeDirect() call was refused. Reported by
-// EspUsbDeviceVendor::lastDirectError(), so a stream that keeps its own
-// in-flight bookkeeping can tell a contract mistake from ordinary backpressure.
-enum class EspUsbDeviceVendorDirectError : uint8_t
+// Per-call submission error. Rejection never borrows a buffer or notifies.
+enum class EspUsbTransferError : uint8_t
 {
   None = 0,
-  // The build is buffered. Direct transfers need -DCFG_TUD_VENDOR_TXRX_BUFFERED=0.
+  // The selected receive mode or transport does not support this operation.
   NotSupported,
   // No device, or this interface's endpoints are not open yet.
   NotMounted,
-  // Null buffer, zero length, or more than 65535 bytes.
+  // Invalid buffer/length, including a Function's format or capacity limit.
   BadArgument,
   // The buffer's address is not 64-byte aligned. Its *length* need not be.
   NotAligned,
@@ -993,183 +1031,253 @@ enum class EspUsbDeviceVendorDirectError : uint8_t
   TransferFailed,
 };
 
-class EspUsbDeviceVendor : public EspUsbDeviceClass, public Print
+struct EspUsbTransferSubmission
+{
+  EspUsbTransferError error = EspUsbTransferError::None;
+  uint64_t id = 0; // Nonzero only for an accepted loan; survives begin/end.
+  explicit operator bool() const { return error == EspUsbTransferError::None; }
+};
+
+// Capacities belong to this instance. Configure while stopped; begin allocates
+// the selected resources and end releases them. No TinyUSB class-size flags.
+enum class EspUsbBulkRxMode : uint8_t { Stream, Callback, Borrowed, Disabled };
+enum class EspUsbTransferTermination : uint8_t { Continue, EndWithShortPacket };
+
+enum class EspUsbStreamTermination : uint8_t { FunctionDefault, Continue, EndWithShortPacket };
+
+struct EspUsbBulkStreamConfig
+{
+  size_t rxCapacity = 512;
+  size_t txCapacity = 512;
+  // Optional non-DMA ring storage. Capacities describe the provided regions;
+  // keep them alive from begin through end. Null selects automatic allocation.
+  uint8_t *rxBuffer = nullptr;
+  uint8_t *txBuffer = nullptr;
+  uint16_t transferBytes = 512;
+  bool autoFlush = true;
+  EspUsbStreamTermination streamTermination = EspUsbStreamTermination::FunctionDefault;
+  EspUsbBulkRxMode rxMode = EspUsbBulkRxMode::Stream;
+};
+
+using EspUsbVendorConfig = EspUsbBulkStreamConfig;
+using EspUsbVendorRxMode = EspUsbBulkRxMode;
+struct EspUsbBulkState;
+enum class EspUsbTransferStatus : uint8_t { Success, BusReset, Stopped, TransferError, Cancelled };
+
+struct EspUsbTransferResult
+{
+  const void *buffer = nullptr;
+  size_t requestedBytes = 0;
+  size_t actualBytes = 0;
+  EspUsbTransferStatus status = EspUsbTransferStatus::Success;
+  // On reset/stop the controller may have sent an unknown prefix.
+  bool actualBytesKnown = true;
+  uint64_t id = 0;
+};
+class EspUsbDeviceBulkStream : public EspUsbDeviceClass
 {
 public:
   using RxCallback = std::function<void(size_t)>;
-  // callback(sentBytes): a transmit on the bulk IN endpoint has completed.
   using TxCompleteCallback = std::function<void(size_t)>;
-  // callback(data, length): a bulk OUT packet arrived, handed over from the
-  // controller's own buffer. Direct builds only - see directWriteSupported().
   using RxDataCallback = std::function<void(const uint8_t *, size_t)>;
-  using ControlRequestCallback = std::function<bool(const EspUsbDeviceVendorControlRequest &)>;
+  using DirectCompleteCallback = std::function<void(const EspUsbTransferResult &)>;
 
-  explicit EspUsbDeviceVendor(EspUsbDevice &device, uint16_t endpointSize = 64);
-  ~EspUsbDeviceVendor() override;
-
-  bool begin() override;
+  ~EspUsbDeviceBulkStream() override;
+  esp_err_t configure(const EspUsbBulkStreamConfig &config);
+  const EspUsbBulkStreamConfig &configuration() const { return config_; }
   void end() override;
   bool isHid() const override { return false; }
-  bool isVendor() const override { return true; }
-  uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
-  uint8_t interfaceCount() const override { return 1; }
-  uint8_t endpointCount() const override { return 1; }
+  // Why this Function refused to start in the last begin(); ESP_OK otherwise.
+  esp_err_t startError() const override { return startError_; }
 
   bool mounted() const;
   int available();
   int read();
+  int peek();
   size_t read(uint8_t *buffer, size_t size);
-  size_t write(uint8_t data) override;
-  size_t write(const uint8_t *buffer, size_t size) override;
-  // Room left in the transmit FIFO right now. write() never accepts more than
-  // this and returns 0 once it reaches zero, so a sketch that wants to know how
-  // much it may hand over before that happens asks here.
+  virtual size_t write(uint8_t data);
+  // Copies accepted bytes. Automatic dispatch by default, never a completion wait.
+  virtual size_t write(const uint8_t *buffer, size_t size);
+  // Shared implementation for the CDC/Vendor Arduino Print facades.
+  int availableForWrite();
   size_t writeAvailable() const;
-  // Size of the transmit FIFO, i.e. the largest value writeAvailable() can ever
-  // return. Compile-time (CFG_TUD_VENDOR_TX_BUFSIZE); raise it from build_opt.h.
-  static size_t writeCapacity();
-  // Block the calling task until the transmit FIFO has room for `bytes`, or the
-  // timeout expires. Returns true when the room is there.
-  //
-  // The alternative a sketch has otherwise is to spin: write() returns 0, the
-  // sketch yields, and tries again - about 30,000 times per 4 MiB on an ESP32-P4
-  // high-speed bulk IN. That is harmless when the CPU has nothing else to do and
-  // expensive when it does, because the spinning task competes with whatever
-  // produces the data. Here the task is descheduled instead and woken from the
-  // transmit-complete callback.
-  //
-  // `bytes` is clamped to writeCapacity(): waiting for more than the FIFO can
-  // ever hold would only ever time out. timeoutMs == 0 polls once without
-  // blocking. Returns false if the device is not mounted, since nothing will
-  // drain the FIFO then.
-  //
-  // Flushes before it waits. TinyUSB only arms a transfer once the FIFO holds a
-  // whole packet, so a remainder shorter than wMaxPacketSize would otherwise
-  // sit there with nothing to push it out - and a caller waiting for room is by
-  // definition not about to add more.
+  // Effective allocated capacities; zero before begin and after end.
+  size_t writeCapacity() const;
+  size_t readCapacity() const;
   bool waitWritable(size_t bytes, uint32_t timeoutMs = 100);
-  // Send whatever is in the transmit FIFO now, whole packet or not.
-  //
-  // Needed after a write shorter than wMaxPacketSize: TinyUSB arms a transfer
-  // only once a whole packet has accumulated, so a short message - a reply, a
-  // status word, the tail of a stream - is not on the wire until this is
-  // called. A sketch that streams in large blocks never notices; one that
-  // answers requests has to call it after every answer.
+  // Starts draining pending copied data, also when autoFlush is disabled.
   void flush();
 
-  // --- Direct transfer path -----------------------------------------------
-  //
-  // Opt-in and off by default. Put
-  //
-  //     -DCFG_TUD_VENDOR_TXRX_BUFFERED=0
-  //
-  // in the sketch's build_opt.h and compile with `arduino-cli compile --clean`.
-  // The --clean is not optional: without it the sketch is rebuilt and the
-  // library is not, so the sketch sees the macro and the library does not, and
-  // everything here silently keeps the buffered behaviour. Two builds differing
-  // in this flag must differ in size; identical sizes mean it did not take.
-  //
-  // What the build costs: the class transmit and receive FIFOs are gone, so
-  // available() and read() return 0 and flush() does nothing. Received data
-  // arrives through onRxData() instead. write() still works - it copies into
-  // the controller's endpoint buffer, one endpoint buffer per call - but must
-  // not be mixed with writeDirect() on the same interface, because both claim
-  // the same endpoint. The bulk IN transmit FIFO doubling
-  // (EspUsbBulkInBuffering) is unaffected and stays on by default.
-  //
-  // Why a build flag and not a runtime choice: in a buffered build the vendor
-  // class arms a zero-length packet of its own after any transfer whose length
-  // is a multiple of wMaxPacketSize, and that ZLP takes the endpoint claim.
-  // Measured on an ESP32-P4 high-speed link, 27,136-byte stages: armed from the
-  // completion callback the application wins the claim and the stream runs;
-  // armed from any other task the ZLP wins, the next writeDirect() is refused
-  // and the stream stops dead after one transfer. The direct build does not
-  // compile that ZLP path at all and does not care which task arms the next
-  // transfer. Like for like against the same host with 8 reads in flight, the
-  // direct path moves 42.6 MB/s at 65,024-byte stages where the buffered one
-  // moves 33.9.
+  // Strict borrowed TX: no hidden copy, 64-byte aligned DMA memory, bounded by
+  // maxDirectTransfer() on the negotiated link. Keep it unchanged until the
+  // typed completion, including BusReset/Stopped. Rejection borrows nothing.
+  // Register the completion callback while stopped. Runs on the USB worker;
+  // it may submit another prepared buffer but must not block or call end().
   static bool directWriteSupported();
-
-  // Hand `buffer` to the controller instead of copying it through the class
-  // transmit FIFO: claim the bulk IN endpoint and arm one transfer of `length`
-  // bytes on the caller's own memory.
-  //
-  // The caller's contract:
-  //  - `buffer` stays untouched and alive until the completion callback reports
-  //    it. Ownership is the caller's until then.
-  //  - `buffer`'s address is 64-byte aligned and in DMA-capable memory. Both
-  //    are checked and a buffer failing either is refused, never quietly
-  //    copied - an API that exists to avoid the copy should say so when it
-  //    cannot. PSRAM has to be staged through an internal bounce buffer by the
-  //    caller.
-  //  - Cache maintenance is **not** your job. TinyUSB cleans the buffer when it
-  //    arms the transfer (dcd_dwc2.c, DMA builds), and on ESP32-P4 the L1 data
-  //    cache is shared between the two cores - there is one
-  //    CACHE_L1_DCACHE_* control register, unlike the per-core instruction
-  //    caches - so that clean covers data produced on either core. An
-  //    esp_cache_msync(..., C2M) of your own is redundant, and a per-transfer
-  //    one is not free. S2/S3 reach internal SRAM without a data cache at all.
-  //
-  // `length` is capped at 65535 by usbd_edpt_xfer() and **need not be aligned
-  // or a multiple of wMaxPacketSize**: a short final stage or a status line is
-  // a normal thing to send, and it simply ends the host's transfer with a short
-  // packet.
-  //
-  // Returns false and sets lastDirectError() on refusal;
-  // EspUsbDeviceVendorDirectError::Busy means a transfer is still in flight,
-  // which is ordinary backpressure rather than a mistake.
-  bool writeDirect(const void *buffer, size_t length);
-  EspUsbDeviceVendorDirectError lastDirectError() const;
-  const char *lastDirectErrorName() const;
-
-  // A transmit completed; `sentBytes` is what went out. Runs **on the usbd
-  // task**: keep it non-blocking, and do nothing in it beyond bookkeeping,
-  // arming the next transfer, and signalling another task. Arming the next
-  // writeDirect() here is what keeps a stream gapless - there is no rule that
-  // it must happen here, and arming from another task works too, but then the
-  // endpoint sits idle for the scheduling gap.
-  //
-  // Hand it a buffer that is **already full**. Filling one here, between a
-  // transfer completing and the next being armed, is time the endpoint spends
-  // idle: measured on an ESP32-P4 high-speed link with 27,136-byte stages,
-  // 22.8 MB/s filling inside the callback against 27.4 MB/s when the callback
-  // only arms. Produce into one buffer while the other is in flight.
-  void onTxComplete(TxCompleteCallback callback);
-
-  // Received data, straight from the controller's endpoint buffer. Direct
-  // builds only: on a buffered build the payload goes to the receive FIFO and
-  // this never fires, so use onRx() with available()/read() there. **The
-  // pointer is valid only for the duration of the call** - copy what you need.
-  // Runs on the usbd task, with the same rules as onTxComplete().
-  void onRxData(RxDataCallback callback);
-  // ------------------------------------------------------------------------
-
-  void onRx(RxCallback callback);
-  void onControlRequest(ControlRequestCallback callback);
-  bool sendControlResponse(const EspUsbDeviceVendorControlRequest &request, const void *data = nullptr, size_t length = 0);
-  uint16_t endpointSize() const;
-
+  size_t maxDirectTransfer() const;
+  EspUsbTransferSubmission writeDirect(const void *buffer, size_t length,
+                   EspUsbTransferTermination termination = EspUsbTransferTermination::Continue);
+  esp_err_t onDirectTxComplete(DirectCompleteCallback callback);
+  // Borrowed RX mode: capacity is a multiple of MPS and 64, the entire region
+  // is exclusively DMA-owned until completion. Short/ZLP may return less data.
+  EspUsbTransferSubmission readDirect(void *buffer, size_t capacity);
+  size_t maxDirectReceive() const;
+  esp_err_t onDirectRxComplete(DirectCompleteCallback callback);
+  // Request cancellation; the typed completion returns ownership later.
+  // A timeout or successful request alone never permits freeing the buffer.
+  // id=0 selects the current loan. A nonzero id cannot cancel a newer loan.
+  esp_err_t cancelDirectTx(uint64_t id = 0);
+  esp_err_t cancelDirectRx(uint64_t id = 0);
+  esp_err_t onTxComplete(TxCompleteCallback callback);
+  // Callback RX mode requires rxCapacity=0. Packet data is borrowed only for
+  // this callback; copy what must outlive it. Set callbacks while stopped.
+  esp_err_t onRxData(RxDataCallback callback);
+  esp_err_t onRx(RxCallback callback);
+  uint16_t endpointSize() const { return endpointSize_; }
   void handleRx(const uint8_t *data, size_t length);
-  bool handleControlRequest(uint8_t rhport, uint8_t stage, const void *request);
-  // Called from tud_vendor_tx_cb() on the usbd task when a transmit completes,
-  // i.e. when the FIFO has just given room back.
   void handleTxComplete(size_t sentBytes);
 
-private:
+protected:
+  explicit EspUsbDeviceBulkStream(EspUsbDevice &device, uint16_t endpointSize = 64);
+  // Protocol framing hooks. Called under the transport lock; never invoke user
+  // callbacks here. The filter may compact valid bytes, returning at most n.
+  virtual size_t bulkPacketUnit() const { return 1; }
+  virtual size_t filterBulkRx(uint8_t *, size_t n) { return n; }
+  virtual bool validateBulkTx(const uint8_t *, size_t) const { return true; }
+  size_t copyTransferCapacity() const;
+  bool txPending() const;
+  virtual uint16_t openBulkInterface(uint8_t port, const uint8_t *descriptor, uint16_t length,
+      uint8_t &in, uint8_t &out, uint16_t &mps) = 0;
+  bool openBulkPair(uint8_t port, const uint8_t *endpoints, uint8_t &in, uint8_t &out, uint16_t &mps);
+  virtual bool onBulkControl(uint8_t port, uint8_t stage, const void *request) {
+    return onVendorControlRequest(port, stage, request);
+  }
+  virtual bool defaultStreamTermination() const { return false; }
+  virtual void onBulkReset() {}
+  virtual bool onBulkExtraCompletion(uint8_t, uint8_t, uint32_t) { return false; }
+  friend struct EspUsbBulkState;
+  esp_err_t startError_ = ESP_OK;
+  EspUsbBulkStreamConfig config_;
+  EspUsbBulkState *state_ = nullptr;
   uint16_t endpointSize_ = 64;
-  // The endpoint number the device handed this interface, learned while the
-  // configuration descriptor is built. writeDirect() needs it to address the
-  // bulk IN endpoint; 0 means "not built yet".
-  uint8_t endpointNumber_ = 0;
+  uint8_t interfaceNumber_ = 0;
   RxCallback rxCallback_;
   RxDataCallback rxDataCallback_;
   TxCompleteCallback txCompleteCallback_;
-  ControlRequestCallback controlRequestCallback_;
-  EspUsbDeviceVendorDirectError lastDirectError_ = EspUsbDeviceVendorDirectError::None;
-  // Created on the first waitWritable() and destroyed in end(). A sketch that
-  // only ever spins on write() never pays for it.
-  void *writableSignal_ = nullptr;
+  DirectCompleteCallback directTxCompleteCallback_;
+  DirectCompleteCallback directRxCompleteCallback_;
+  uint64_t nextTransferId_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
+
+class EspUsbDeviceVendor : public EspUsbDeviceBulkStream, public Print
+{
+public:
+  using Print::write;
+  size_t write(uint8_t value) override { return EspUsbDeviceBulkStream::write(value); }
+  size_t write(const uint8_t *buffer, size_t size) override { return EspUsbDeviceBulkStream::write(buffer, size); }
+  int availableForWrite() override { return EspUsbDeviceBulkStream::availableForWrite(); }
+  void flush() override { EspUsbDeviceBulkStream::flush(); }
+  using ControlRequestCallback = std::function<bool(const EspUsbDeviceVendorControlRequest &)>;
+  // endpointSize is the full-speed bulk packet: 8, 16, 32 or 64 (larger values
+  // select 64). Any other size fails begin() with ESP_ERR_INVALID_SIZE. High
+  // speed always uses 512.
+  explicit EspUsbDeviceVendor(EspUsbDevice &device, uint16_t endpointSize = 64);
+  ~EspUsbDeviceVendor() override;
+  bool isVendor() const override { return true; }
+  uint8_t interfaceCount() const override { return 1; }
+  uint8_t endpointCount() const override { return 1; }
+  uint16_t configurationDescriptor(uint8_t *, uint8_t, uint8_t, uint16_t) override;
+  bool onVendorControlRequest(uint8_t port, uint8_t stage, const void *request) override;
+  esp_err_t onControlRequest(ControlRequestCallback callback);
+  bool sendControlResponse(const EspUsbDeviceVendorControlRequest &, const void *data = nullptr, size_t length = 0);
+  bool handleControlRequest(uint8_t port, uint8_t stage, const void *request);
+protected:
+  uint16_t openBulkInterface(uint8_t, const uint8_t *, uint16_t, uint8_t &, uint8_t &, uint16_t &) override;
+private:
+  ControlRequestCallback controlRequestCallback_;
+};
+
+class EspUsbDeviceCdcSerial : public EspUsbDeviceBulkStream, public Stream
+{
+public:
+  using Print::write;
+  size_t write(uint8_t value) override { return EspUsbDeviceBulkStream::write(value); }
+  // Copies all bytes when possible, waiting up to the TX timeout for room.
+  // Worker calls stay nonblocking; ISR calls accept nothing.
+  size_t write(const uint8_t *buffer, size_t size) override;
+  int availableForWrite() override { return EspUsbDeviceBulkStream::availableForWrite(); }
+  // Starts copied TX and waits for data/ZLP completion within the TX timeout.
+  void flush() override;
+  void setTxTimeoutMs(uint32_t timeout) { txTimeoutMs_.store(timeout, std::memory_order_relaxed); }
+  uint32_t txTimeoutMs() const { return txTimeoutMs_.load(std::memory_order_relaxed); }
+  using EspUsbDeviceBulkStream::read;
+  int available() override { return EspUsbDeviceBulkStream::available(); }
+  int read() override { return EspUsbDeviceBulkStream::read(); }
+  int peek() override { return EspUsbDeviceBulkStream::peek(); }
+  using BreakCallback = std::function<void(uint16_t)>;
+  using LineCodingCallback = std::function<void(const EspUsbDeviceCdcLineCoding &)>;
+  using LineStateCallback = std::function<void(const EspUsbDeviceCdcLineState &)>;
+  explicit EspUsbDeviceCdcSerial(EspUsbDevice &device, const char *name = nullptr);
+  ~EspUsbDeviceCdcSerial() override;
+  void end() override;
+  bool isCdc() const override { return true; }
+  uint8_t interfaceCount() const override { return 2; }
+  uint8_t endpointCount() const override { return 2; }
+  uint16_t configurationDescriptor(uint8_t *, uint8_t, uint8_t, uint16_t) override;
+  const char *functionName() const override { return name_; }
+  void assignFunctionIds(uint8_t instance, uint8_t stringIndex) override;
+  // Index in CDC descriptor order, assigned at begin; independent of TinyUSB.
+  uint8_t port() const { return instance_; }
+  esp_err_t setName(const char *name);
+  bool connected() const;
+  EspUsbDeviceCdcLineCoding lineCoding() const;
+  EspUsbDeviceCdcLineState lineState() const;
+  esp_err_t onLineCoding(LineCodingCallback callback);
+  esp_err_t onLineState(LineStateCallback callback);
+  esp_err_t onBreak(BreakCallback callback);
+protected:
+  uint16_t openBulkInterface(uint8_t, const uint8_t *, uint16_t, uint8_t &, uint8_t &, uint16_t &) override;
+  bool onBulkControl(uint8_t port, uint8_t stage, const void *request) override;
+  bool defaultStreamTermination() const override { return true; }
+  void onBulkReset() override;
+  bool onBulkExtraCompletion(uint8_t endpoint, uint8_t result, uint32_t bytes) override;
+private:
+  std::atomic<uint32_t> txTimeoutMs_{1000}, txEpoch_{0};
+  const char *name_ = nullptr;
+  uint8_t instance_ = 0, stringIndex_ = 0, notifyEndpoint_ = 0;
+  uint8_t *controlBuffer_ = nullptr;
+  EspUsbDeviceCdcLineCoding lineCoding_{115200, 0, 0, 8};
+  EspUsbDeviceCdcLineState lineState_;
+  BreakCallback breakCallback_;
+  LineCodingCallback lineCodingCallback_;
+  LineStateCallback lineStateCallback_;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+};
+
+struct EspUsbNetConfig {
+  size_t ntbInBytes = 3200, ntbOutBytes = 3200;
+  size_t txBuffers = 3, rxBuffers = 2;
+  size_t maxDatagrams = 8;
+  uint16_t maxFrameBytes = 1514;
+  uint8_t *txBuffer = nullptr, *rxBuffer = nullptr;
+  size_t txBufferBytes = 0, rxBufferBytes = 0;
+  const char *name = nullptr;
+};
+struct EspUsbNetStats {
+  uint32_t txFrames = 0, rxFrames = 0, invalidNtbs = 0;
+};
+struct EspUsbNetState;
+struct EspUsbNetifGlue;
 
 // CDC-NCM (USB network / "USB Ethernet") device function. Presents the device
 // to a USB host as a network adapter. Phase 1 exposes raw Ethernet frames via
@@ -1178,14 +1286,15 @@ private:
 class EspUsbDeviceNet : public EspUsbDeviceClass
 {
 public:
-  // callback(frame data, length): a complete Ethernet frame arrived from the host.
+  // A complete frame on the USB worker; data is valid until callback returns.
   using FrameCallback = std::function<void(const uint8_t *, size_t)>;
 
   explicit EspUsbDeviceNet(EspUsbDevice &device);
   ~EspUsbDeviceNet() override;
 
-  bool begin() override;
-  bool afterDeviceStarted() override;
+  esp_err_t configure(const EspUsbNetConfig &config);
+  const EspUsbNetConfig &configuration() const { return netConfig_; }
+  esp_err_t startError() const override { return startError_; }
   void end() override;
   bool isHid() const override { return false; }
   bool isNet() const override { return true; }
@@ -1194,67 +1303,88 @@ public:
   uint8_t endpointCount() const override { return 2; }          // notif IN + bulk duplex
 
   // Set the device's 6-byte MAC address. Call before EspUsbDevice::begin().
-  // Defaults to a fixed locally-administered address if not set.
-  void macAddress(const uint8_t mac[6]);
+  // Defaults to a locally-administered address derived per Function.
+  esp_err_t macAddress(const uint8_t mac[6]);
   const uint8_t *macAddress() const;
 
-  void onFrame(FrameCallback callback);
+  esp_err_t onFrame(FrameCallback callback);
   // Send one Ethernet frame to the host. Returns false if the link cannot
   // currently accept a frame of this size (caller may retry).
   bool sendFrame(const uint8_t *data, size_t length);
   bool linkUp() const;
+  size_t ntbInCapacity() const;
+  size_t ntbOutCapacity() const;
+  size_t txBufferCount() const;
+  size_t rxBufferCount() const;
+  EspUsbNetStats stats() const;
+  const char *functionName() const override { return netConfig_.name; }
+  void assignFunctionIds(uint8_t instance, uint8_t nameIndex) override;
+  size_t auxiliaryStringCount() const override { return 1; }
+  const char *auxiliaryString(size_t index) const override { return index ? nullptr : macString_; }
+  void assignAuxiliaryStringIds(uint8_t first) override { macIndex_ = first; }
 
   // --- Optional lwIP / esp_netif integration (Phase 2) ---
   // Configure the interface's IPv4 address, gateway, and subnet mask. Used for a
   // static address and as the DHCP server's own address/pool base. Defaults to
   // 192.168.7.1 / 192.168.7.1 / 255.255.255.0. Call before beginNetwork().
-  void ipConfig(IPAddress local, IPAddress gateway, IPAddress subnet);
+  esp_err_t ipConfig(IPAddress local, IPAddress gateway, IPAddress subnet);
   // Run a DHCP server so the USB host is handed an address automatically. OFF by
   // default (never enabled unless requested). Mutually exclusive with dhcpClient.
-  void dhcpServer(bool enable);
+  esp_err_t dhcpServer(bool enable);
   // Act as a DHCP client (get our address from the network, e.g. when the PC
   // bridges the USB NIC onto its LAN). OFF by default. Mutually exclusive with
   // dhcpServer. When neither is enabled the static ipConfig() address is used.
-  void dhcpClient(bool enable);
+  esp_err_t dhcpClient(bool enable);
   // By default the DHCP server does NOT advertise itself as a gateway or DNS —
   // the device is a local endpoint, and advertising a non-forwarding gateway as
   // the host's default route would black-hole its off-link traffic. Enable these
   // only if the device actually forwards (e.g. bridged to another uplink) or the
   // advertised DNS is reachable. Call before beginNetwork().
-  void dhcpAdvertiseGateway(bool enable);  // offer the ipConfig() gateway as the DHCP router (option 3)
-  void dhcpDns(IPAddress dns);             // offer this DNS server (option 6); 0.0.0.0 = do not offer
+  esp_err_t dhcpAdvertiseGateway(bool enable);  // offer the ipConfig() gateway as the DHCP router (option 3)
+  esp_err_t dhcpDns(IPAddress dns);             // offer this DNS server (option 6); 0.0.0.0 = do not offer
   // Make this interface the ESP's own default route (esp_netif default netif).
   // OFF by default: the USB netif uses a low route priority so a coexisting Wi-Fi
   // STA (priority 100) stays the default and the USB link never hijacks the ESP's
   // outbound traffic. Enable only when the ESP should reach the internet *through*
   // the USB host (e.g. a PC that bridges/NATs to it, with dhcpClient(true)). Call
   // before beginNetwork().
-  void defaultRoute(bool enable);
+  esp_err_t defaultRoute(bool enable);
   // Bring up the esp_netif/lwIP interface bound to this NCM function. Call once
   // after EspUsbDevice::begin(). If never called, the class stays a raw-frame
   // transport (onFrame/sendFrame) with no IP stack — useful for host-side bridging.
   bool beginNetwork();
+  bool endNetwork();
   bool networkUp() const;
   IPAddress localIP() const;
 
-  // Internal (called from TinyUSB tud_network_* callbacks).
-  bool handleRecv(const uint8_t *src, uint16_t size);
-  uint16_t handleXmit(uint8_t *dst, void *ref, uint16_t arg);
-  void handleInit();
-
 private:
+  friend struct EspUsbNetState;
+  friend struct EspUsbNetifGlue;
+  void handleRecv(const uint8_t *src, uint16_t size);
+  void refreshMacString();
+  EspUsbNetConfig netConfig_;
+  EspUsbNetState *state_ = nullptr;
+  esp_err_t startError_ = ESP_OK;
+  uint8_t interface_ = 255, nameIndex_ = 0, macIndex_ = 0;
+  uint8_t mac_[6] = {};
+  uint16_t defaultMacSuffix_ = 0;
+  bool macUserSet_ = false;
+  char macString_[13] = {};
   FrameCallback frameCallback_;
-
-  void *netif_ = nullptr;        // esp_netif_t* (opaque here to avoid leaking IDF types)
+  void *netif_ = nullptr, *networkContext_ = nullptr, *networkDriver_ = nullptr;
+  void (*networkReceive_)(void *, const uint8_t *, size_t) = nullptr;
+  void (*networkStop_)(EspUsbDeviceNet &) = nullptr;
+  std::atomic<unsigned> networkUsers_{0};
   bool netStarted_ = false;
-  bool dhcpServer_ = false;
-  bool dhcpClient_ = false;
-  bool dhcpAdvertiseGateway_ = false;
-  bool defaultRoute_ = false;
-  uint32_t dhcpDns_ = 0;         // network byte order; 0 => do not offer DNS
-  uint32_t cfgIp_ = 0;           // network byte order; 0 => use defaults in beginNetwork()
-  uint32_t cfgGateway_ = 0;
-  uint32_t cfgNetmask_ = 0;
+  bool dhcpServer_ = false, dhcpClient_ = false;
+  bool dhcpAdvertiseGateway_ = false, defaultRoute_ = false;
+  uint32_t dhcpDns_ = 0, cfgIp_ = 0, cfgGateway_ = 0, cfgNetmask_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
 
 // USB CCID smart card reader function. The device side of what EspUsbHost's
@@ -1274,7 +1404,7 @@ public:
   // sees as command status FAILED with bError = ICC_MUTE.
   //
   // For onApdu() the buffers are the APDU and its answer including SW1SW2 - the
-  // device does not add or interpret a status word. Runs in the TinyUSB device
+  // device does not add or interpret a status word. Runs in the USB worker
   // task: no blocking, and no USB calls back into this object.
   using ApduCallback = std::function<size_t(const uint8_t *apdu, size_t length,
                                             uint8_t *response, size_t capacity)>;
@@ -1286,12 +1416,17 @@ public:
   explicit EspUsbDeviceCcid(EspUsbDevice &device);
   ~EspUsbDeviceCcid() override;
 
-  bool begin() override;
+  esp_err_t configure(const EspUsbCcidConfig &config);
+  const EspUsbCcidConfig &configuration() const { return config_; }
+  size_t messageCapacity() const;
+  esp_err_t startError() const override { return startError_; }
+  const char *functionName() const override { return config_.name; }
+  void assignFunctionIds(uint8_t, uint8_t stringIndex) override { stringIndex_ = stringIndex; }
   void end() override;
   bool isHid() const override { return false; }
   uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
   uint8_t interfaceCount() const override { return 1; }
-  uint8_t endpointCount() const override { return 2; } // bulk duplex + interrupt IN
+  uint8_t endpointCount() const override { return config_.removable ? 2 : 1; } // bulk duplex + optional interrupt IN
   void onBusAttached() override;
   void onBusDetached() override;
 
@@ -1300,15 +1435,15 @@ public:
   // must be 2..ESP_USB_DEVICE_CCID_MAX_ATR. Notifies the host over the
   // interrupt endpoint when the device is mounted. Call from the sketch task.
   bool insertCard(const uint8_t *atr, size_t length);
-  void removeCard();
+  esp_err_t removeCard();
   bool cardPresent() const;
   // True once the host has activated the card with IccPowerOn.
   bool cardPowered() const;
   size_t atr(uint8_t *buffer, size_t capacity) const;
 
-  void onApdu(ApduCallback callback);
-  void onEscape(EscapeCallback callback);
-  void onPower(PowerCallback callback);
+  esp_err_t onApdu(ApduCallback callback);
+  esp_err_t onEscape(EscapeCallback callback);
+  esp_err_t onPower(PowerCallback callback);
 
   // True while the host has the CCID interface configured.
   bool mounted() const;
@@ -1318,7 +1453,8 @@ public:
   uint32_t apduCount() const;
   uint8_t lastMessageType() const;
 
-  // Internal: a complete PC_to_RDR message arrived (TinyUSB device task).
+private:
+  // Internal: a complete PC_to_RDR message arrived (USB worker).
   void handleMessage(const uint8_t *message, size_t length);
   // Internal: a message longer than the device's buffer arrived and was dropped.
   void handleOverrun(uint8_t messageType, uint8_t slot, uint8_t sequence);
@@ -1328,6 +1464,13 @@ public:
   void handleNotifyComplete();
 
 private:
+  friend struct EspUsbCcidState;
+  EspUsbCcidConfig config_;
+  EspUsbCcidState *state_ = nullptr;
+  size_t messageBytes_ = 0; // resolved at begin
+  size_t resolvedMessageBytes() const;
+  esp_err_t startError_ = ESP_OK;
+  uint8_t interfaceNumber_ = 255, stringIndex_ = 0;
   size_t writeHeader(uint8_t messageType, uint32_t dataLength, uint8_t slot,
                      uint8_t sequence, uint8_t iccStatus, uint8_t commandStatus,
                      uint8_t error, uint8_t parameter);
@@ -1350,21 +1493,47 @@ private:
   // notification on it, so the host has not been told the current state yet.
   std::atomic<bool> notifyPending_{false};
   bool aborted_ = false; // an ABORT request is pending for the current slot
+  uint8_t abortSequence_ = 0;
 
-  uint8_t response_[ESP_USB_DEVICE_CCID_BUFFER_SIZE] = {};
+  uint8_t *response_ = nullptr;
   std::atomic<uint32_t> commandCount_{0};
   std::atomic<uint32_t> apduCount_{0};
   std::atomic<uint8_t> lastMessageType_{0};
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  void prepareToStop() override;
+  bool begin() override;
 };
 
-class EspUsbDeviceMidi : public EspUsbDeviceClass
+enum class EspUsbMidiRxMode : uint8_t { Queue, Callback, Disabled };
+struct EspUsbMidiConfig
+{
+  // Cables 1-16. 0 keeps the current count: the constructor's, or the last
+  // configure()'s, so a fresh config does not reset cables set at construction.
+  uint8_t inCables = 0, outCables = 0;
+  const char *name = nullptr;
+  size_t rxPackets = 128;
+  size_t txPackets = 128;
+  // 0 chooses one bus packet for the selected controller. A nonzero value
+  // selects complete MIDI events per copied submission, including values < MPS.
+  size_t transferPackets = 0;
+  EspUsbMidiRxMode rxMode = EspUsbMidiRxMode::Queue;
+  bool autoFlush = true;
+  EspUsbStreamTermination streamTermination = EspUsbStreamTermination::FunctionDefault;
+  EspUsbDeviceMidiPacket *rxBuffer = nullptr;
+  EspUsbDeviceMidiPacket *txBuffer = nullptr;
+};
+
+class EspUsbDeviceMidi : public EspUsbDeviceBulkStream
 {
 public:
   // USB MIDI 1.0 addresses cables with a 4-bit field, so one interface carries
   // at most 16.
   static constexpr uint8_t MAX_CABLES = 16;
 
-  // cableCount is clamped to 1..MAX_CABLES. Each cable appears to the host as a
+  // cableCount must be in 1..MAX_CABLES. Each cable appears to the host as a
   // separate MIDI port; they all share one pair of bulk endpoints, multiplexed
   // by the cable number in each packet header.
   explicit EspUsbDeviceMidi(EspUsbDevice &device, uint8_t cableCount = 1);
@@ -1376,8 +1545,16 @@ public:
   EspUsbDeviceMidi(EspUsbDevice &device, uint8_t inCableCount, uint8_t outCableCount);
   ~EspUsbDeviceMidi() override;
 
-  bool begin() override;
-  void end() override;
+  esp_err_t configure(const EspUsbMidiConfig &config);
+  const EspUsbMidiConfig &configuration() const { return midiConfig_; }
+  using PacketCallback = std::function<void(const EspUsbDeviceMidiPacket &)>;
+  esp_err_t onPacket(PacketCallback callback);
+  size_t availablePackets();
+  size_t availableForWritePackets() const;
+  size_t receiveCapacity() const;
+  size_t sendCapacity() const;
+  size_t transferCapacity() const;
+  uint32_t receiveErrors() const { return receiveErrors_.load(std::memory_order_relaxed); }
   bool isHid() const override { return false; }
   bool isMidi() const override { return true; }
   uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
@@ -1389,8 +1566,10 @@ public:
   uint8_t endpointCount() const override { return 1; }
 
   // Cables this device sends on / receives on, host-view as above.
-  uint8_t inCableCount() const { return inCableCount_; }
-  uint8_t outCableCount() const { return outCableCount_; }
+  uint8_t inCableCount() const { return midiConfig_.inCables; }
+  uint8_t outCableCount() const { return midiConfig_.outCables; }
+  const char *functionName() const override { return midiConfig_.name; }
+  void assignFunctionIds(uint8_t, uint8_t stringIndex) override { stringIndex_ = stringIndex; }
   // Bytes configurationDescriptor() will write, so callers can size a buffer
   // before asking for the descriptor.
   uint16_t descriptorLength() const;
@@ -1409,12 +1588,46 @@ public:
   bool pitchBend(uint8_t channel, uint16_t value, uint8_t cable = 0);
 
 private:
+  // The public MIDI API deals in complete events. The shared byte transport
+  // remains an implementation detail. MIDI is neither Print nor Stream.
+  size_t write(uint8_t) override { return 0; }
+  size_t write(const uint8_t *, size_t) override;
+  using EspUsbDeviceBulkStream::read;
+  using EspUsbDeviceBulkStream::peek;
+  using EspUsbDeviceBulkStream::availableForWrite;
+  using EspUsbDeviceBulkStream::available;
+  using EspUsbDeviceBulkStream::writeAvailable;
+  using EspUsbDeviceBulkStream::readCapacity;
+  using EspUsbDeviceBulkStream::writeCapacity;
+  using EspUsbDeviceBulkStream::waitWritable;
+  using EspUsbDeviceBulkStream::onRx;
+  using EspUsbDeviceBulkStream::onRxData;
+  using EspUsbDeviceBulkStream::onTxComplete;
+  using EspUsbDeviceBulkStream::writeDirect;
+  using EspUsbDeviceBulkStream::readDirect;
+  using EspUsbDeviceBulkStream::onDirectTxComplete;
+  using EspUsbDeviceBulkStream::onDirectRxComplete;
+  using EspUsbDeviceBulkStream::cancelDirectTx;
+  using EspUsbDeviceBulkStream::cancelDirectRx;
+  size_t bulkPacketUnit() const override { return 4; }
+  size_t filterBulkRx(uint8_t *, size_t) override;
+  bool validateBulkTx(const uint8_t *, size_t) const override;
+  bool defaultStreamTermination() const override { return true; }
+  uint16_t openBulkInterface(uint8_t, const uint8_t *, uint16_t,
+      uint8_t &, uint8_t &, uint16_t &) override;
+  EspUsbMidiConfig midiConfig_;
+  PacketCallback packetCallback_;
+  std::atomic<uint32_t> receiveErrors_{0};
   static uint8_t status(uint8_t codeIndex, uint8_t channel);
-  static uint8_t clamp7(uint8_t value);
+  bool rejectMessage();
   static uint8_t header(uint8_t codeIndex, uint8_t cable);
 
-  uint8_t inCableCount_ = 1;
-  uint8_t outCableCount_ = 1;
+  uint8_t stringIndex_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
 struct EspUsbAudioFormat
@@ -1480,6 +1693,8 @@ struct EspUsbAudioVolumeRange
   int16_t resolution = 0;
 };
 
+struct EspUsbAudioState;
+namespace espusb { namespace internal { struct AudioTransport; } }
 class EspUsbAudioFunction;
 
 class EspUsbAudioPlaybackStream
@@ -1490,7 +1705,14 @@ public:
     return EspUsbAudioDirection::Playback;
   }
   bool addFormat(const EspUsbAudioFormat &format);
+  // Stopped only: release format settings; the stream remains selected.
+  // Add at least one format before the next begin(). PCM is clearBuffer().
+  esp_err_t clearFormats();
+  // Active PCM snapshot; false while idle/draining, leaving format unchanged.
+  bool currentFormat(EspUsbAudioFormat &format) const;
   int available() const;
+  size_t capacity() const;
+  size_t packetCapacity() const;
   size_t read(void *data, size_t length);
   bool clearBuffer();
   EspUsbAudioStreamStats stats() const;
@@ -1498,6 +1720,8 @@ public:
 
 private:
   friend class EspUsbAudioFunction;
+  friend struct EspUsbAudioState;
+  friend struct espusb::internal::AudioTransport;
   explicit EspUsbAudioPlaybackStream(EspUsbAudioFunction &function)
       : function_(function) {}
 
@@ -1515,13 +1739,23 @@ public:
     return EspUsbAudioDirection::Capture;
   }
   bool addFormat(const EspUsbAudioFormat &format);
+  // Stopped only: release format settings; the stream remains selected.
+  // Add at least one format before the next begin(). PCM is clearBuffer().
+  esp_err_t clearFormats();
+  // Active PCM snapshot; false while idle/draining, leaving format unchanged.
+  bool currentFormat(EspUsbAudioFormat &format) const;
   size_t write(const void *data, size_t length);
+  size_t availableForWrite() const;
+  size_t capacity() const;
+  size_t packetCapacity() const;
   bool clearBuffer();
   EspUsbAudioStreamStats stats() const;
   void resetStats();
 
 private:
   friend class EspUsbAudioFunction;
+  friend struct EspUsbAudioState;
+  friend struct espusb::internal::AudioTransport;
   explicit EspUsbAudioCaptureStream(EspUsbAudioFunction &function)
       : function_(function) {}
 
@@ -1531,6 +1765,27 @@ private:
   std::atomic<uint32_t> overrunBytes_{0};
   std::atomic<uint32_t> underrunCount_{0};
   std::atomic<uint32_t> underrunBytes_{0};
+};
+
+// Which PCM a full playback ring keeps when a received packet does not fit.
+enum class EspUsbAudioOverflowPolicy : uint8_t
+{
+  DropNewest, // keep the unread PCM, drop the part of the packet that does not fit
+  DropOldest, // push out the oldest unread PCM, keep the newest complete frames
+};
+
+struct EspUsbAudioConfig {
+  size_t eventCapacity = 8;
+  size_t playbackBufferFrames = 256;
+  size_t captureBufferFrames = 256;
+  uint8_t *playbackBuffer = nullptr;
+  uint8_t *captureBuffer = nullptr;
+  // Extents of optional CPU ring storage, kept alive through end().
+  // Must cover bufferFrames * largest registered PCM frame. Null uses 0.
+  size_t playbackBufferBytes = 0;
+  size_t captureBufferBytes = 0;
+  EspUsbAudioOverflowPolicy playbackOverflowPolicy =
+      EspUsbAudioOverflowPolicy::DropOldest;
 };
 
 class EspUsbAudioFunction : public EspUsbDeviceClass
@@ -1547,7 +1802,11 @@ public:
   bool hasPlaybackStream() const { return playbackEnabled_; }
   bool hasCaptureStream() const { return captureEnabled_; }
 
-  bool begin() override;
+  esp_err_t configure(const EspUsbAudioConfig &config);
+  const EspUsbAudioConfig &configuration() const { return config_; }
+  size_t eventCapacity() const;
+  esp_err_t startError() const override { return startError_; }
+  esp_err_t descriptorConfigurationError() const override;
   void end() override;
   bool isHid() const override { return false; }
   bool isAudio() const override { return true; }
@@ -1600,9 +1859,12 @@ public:
   void clearEvents();
 
 private:
+  friend struct EspUsbAudioState;
+  friend struct espusb::internal::AudioTransport;
   friend class EspUsbAudioPlaybackStream;
   friend class EspUsbAudioCaptureStream;
 
+  esp_err_t clearFormats(espusb::internal::AudioDirection direction);
   bool addFormat(espusb::internal::AudioDirection direction,
                  const EspUsbAudioFormat &format);
   bool buildGraph(uint8_t interfaceNumber, uint8_t endpointNumber);
@@ -1611,6 +1873,10 @@ private:
   void pushControlEvent(espusb::internal::AudioControlSelector selector,
                         uint8_t entityId, uint8_t channel, int32_t value);
 
+  EspUsbAudioState *state_ = nullptr;
+  EspUsbAudioConfig config_;
+  esp_err_t startError_ = ESP_OK;
+  std::atomic<bool> started_{false};
   bool playbackEnabled_ = false;
   bool captureEnabled_ = false;
   EspUsbAudioProtocol protocol_ = EspUsbAudioProtocol::Uac1;
@@ -1622,6 +1888,12 @@ private:
   espusb::internal::AudioEventQueue events_;
   uint8_t playbackAlternate_ = 0;
   uint8_t captureAlternate_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
 
 // Pixel format the camera advertises.
@@ -1637,13 +1909,23 @@ enum class EspUsbDeviceVideoFormat : uint8_t
   Yuy2,
 };
 
+enum class EspUsbVideoTransport : uint8_t { Isochronous, Bulk };
+struct EspUsbVideoConfig {
+  EspUsbVideoTransport transport = EspUsbVideoTransport::Isochronous;
+  size_t payloadBytes = 512; // Includes the two-byte UVC header.
+  uint16_t isochronousPacketBytes = 0; // 0: derive from payloadBytes and speed.
+  uint8_t *payloadBuffer = nullptr; // Optional internal DMA RAM, 64-byte aligned.
+  size_t payloadBufferBytes = 0;
+};
+struct EspUsbVideoState;
+namespace espusb { namespace internal { struct VideoTransport; } }
+
 // What the host actually committed to after negotiating with the device.
 //
 // UVC calls this probe/commit: the host proposes parameters, the device may
 // adjust them, and the committed set is what streaming then uses. The values
-// can differ from what was advertised - a host is allowed to ask for a slower
-// frame interval - so a sketch that cares should read them here rather than
-// assume its own configuration was taken.
+// expose the accepted payload limit; this implementation advertises one fixed
+// format, frame size and frame interval.
 struct EspUsbDeviceVideoCommit
 {
   uint8_t formatIndex = 0;
@@ -1652,7 +1934,7 @@ struct EspUsbDeviceVideoCommit
   uint32_t frameInterval = 0;
   uint32_t maxVideoFrameSize = 0;
   // Most the host will accept in one transfer, payload header included.
-  // TinyUSB caps its own payloads at CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE.
+  // Bounded by configuration().payloadBytes and the selected ISO packet size.
   uint32_t maxPayloadTransferSize = 0;
 };
 
@@ -1661,15 +1943,12 @@ struct EspUsbDeviceVideoCommit
 //
 // The device is the source; there is no host-to-device direction. Give it a
 // frame with sendFrame() and the class driver paces the payloads out of the
-// isochronous endpoint, calling the completion callback when the last one has
+// selected endpoint, calling the completion callback when the last one has
 // gone. One frame is in flight at a time.
 //
-// Speed is the thing to decide first. Full speed (S2, S3, and P4 in FS mode)
-// gives about 1 MB/s of isochronous bandwidth, so 320x240 YUY2 runs at about
-// 6 fps and only MJPEG reaches a usable rate; high speed (P4) gives about
-// 24 MB/s. Neither is a reason not to enumerate: a UVC device that streams
-// slowly is still a UVC device, and Windows binds usbvideo.sys to it with no
-// driver to install.
+// Available throughput depends on USB speed, endpoint packet size and the
+// controller FIFO budget. Advertising a frame rate does not guarantee that
+// an encoder or the selected transport can sustain it.
 class EspUsbDeviceVideo : public EspUsbDeviceClass
 {
 public:
@@ -1694,7 +1973,9 @@ public:
   // the uncompressed size for Yuy2, and an eighth of it for Mjpeg.
   bool setMaxFrameSize(uint32_t bytes);
 
-  bool begin() override;
+  esp_err_t configure(const EspUsbVideoConfig &config);
+  const EspUsbVideoConfig &configuration() const { return videoConfig_; }
+  esp_err_t startError() const override { return startError_; }
   void end() override;
   bool isHid() const override { return false; }
   bool isVideo() const override { return true; }
@@ -1719,34 +2000,27 @@ public:
   // wMaxPacketSize this function asks for at the given speed. Isochronous
   // bandwidth is reserved per frame interval, so this number is the streaming
   // rate: 1023 B/ms at full speed, 1024 B/125 us at high speed.
-  static uint16_t isochronousPacketSize(bool highSpeed);
-  // The class driver's payload staging buffer
-  // (CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE), which is the cap on the payload size
-  // committed to the host and therefore the floor for the endpoint above.
-  // Reported by the library rather than read from the macro so a sketch sees
-  // what the library was built with, not what its own command line says.
-  static uint16_t payloadBufferSize();
-  // True when the build streams over bulk instead of isochronous
-  // (CFG_TUD_VIDEO_STREAMING_BULK), which changes the descriptor shape and the
-  // bandwidth guarantee, not this API.
-  static bool bulkStreaming();
+  uint16_t isochronousPacketSize(bool highSpeed) const;
+  // Actual logical staging capacity, or zero before begin()/after end().
+  size_t payloadBufferSize() const;
+  // Per-Function runtime selection; configure while stopped, then begin().
+  bool bulkStreaming() const;
 
-  // The host selected a streaming alternate setting and is reading frames.
-  // False between commit and the alternate setting, and after unplug.
+  // True after commit and (for ISO) streaming alternate selection. False
+  // during cancellation/reconfiguration fences, stop and unplug.
   bool streaming() const;
-  // Hand one whole frame to the class driver. The buffer must stay valid and
-  // unmodified until the completion callback runs - it is read payload by
-  // payload, not copied. Fails while a frame is still in flight, before the
-  // host has started streaming, or on a null or oversized buffer.
-  //
-  // Call it from one context. TinyUSB's video driver keeps the frame pointer,
-  // size and offset in one unguarded structure, so two tasks arming frames at
-  // once is not something the endpoint claim alone makes safe. The claim here
-  // is atomic, so the second caller is refused rather than let through, but a
-  // sketch that arms from both its loop and the completion callback is racing
-  // over which frame goes next even when nothing breaks.
+  // Borrows one frame until onFrameResult returns ownership, on every terminal
+  // status. Keep it valid and unchanged until then. YUY2 requires the exact
+  // configured frame size; MJPEG accepts 1..maxFrameSize() bytes.
+  // Concurrent callers are serialized; a second pending frame is refused.
   bool sendFrame(const void *frame, size_t length);
-  // True between sendFrame() and its completion callback.
+  // Same submission/result contract as writeDirect; the frame itself does not
+  // require DMA alignment. A rejected submission has id=0 and borrows nothing.
+  EspUsbTransferSubmission submitFrame(const void *frame, size_t length);
+  // Asynchronous: ownership returns through onFrameResult, not this call.
+  // A stale/zero ticket returns ESP_ERR_NOT_FOUND.
+  esp_err_t cancelFrame(uint64_t id);
+  // True while the driver borrows a frame, including a cancellation fence.
   bool frameInFlight() const { return inFlight_.load(); }
 
   using FrameCompleteCallback = std::function<void()>;
@@ -1754,21 +2028,26 @@ public:
   // Runs on the USB device task when the last payload of a frame has gone.
   // Arming the next frame from inside it is the intended shape and is what
   // keeps the endpoint busy; keep everything else out of it.
-  void onFrameComplete(FrameCompleteCallback callback);
-  // Runs when the host commits its streaming parameters, before the first
-  // frame is asked for. A camera that can change resolution reads the
-  // committed frame index here.
-  void onCommit(CommitCallback callback);
+  // Receives Success, Cancelled, BusReset, TransferError or Stopped.
+  // actualBytes excludes UVC headers; actualBytesKnown can be false on abort.
+  // Callbacks run on the USB worker; registration is refused while started.
+  using FrameResultCallback = std::function<void(const EspUsbTransferResult &)>;
+  esp_err_t onFrameResult(FrameResultCallback callback);
+  esp_err_t onFrameComplete(FrameCompleteCallback callback);
+  // Runs when the host commits parameters. Recommit can cancel an old frame;
+  // only its result callback returns ownership, even after this callback.
+  esp_err_t onCommit(CommitCallback callback);
   // What the host committed to, or a zeroed struct before it has.
   EspUsbDeviceVideoCommit commit() const;
 
-  // TinyUSB's video callbacks land here. Public for the same reason
-  // EspUsbDevice::handleHidSetReport() is: the callbacks are extern "C" free
-  // functions, which cannot be befriended cleanly. Not part of the sketch API.
-  void handleFrameComplete();
-  void handleCommit(const EspUsbDeviceVideoCommit &commit);
-
 private:
+  friend struct EspUsbVideoState;
+  friend struct espusb::internal::VideoTransport;
+  void handleFrameResult(const EspUsbTransferResult &result);
+  void handleCommit(const EspUsbDeviceVideoCommit &commit);
+  EspUsbVideoConfig videoConfig_;
+  EspUsbVideoState *state_ = nullptr;
+  FrameResultCallback frameResultCallback_;
   const char *name_ = nullptr;
   uint8_t stringIndex_ = 0;
   uint8_t instance_ = 0;
@@ -1777,38 +2056,61 @@ private:
   uint16_t height_ = 240;
   uint8_t frameRate_ = 15;
   uint32_t maxFrameSize_ = 0;
-  bool running_ = false;
-  // Owned by whoever wins the exchange in sendFrame(), released by the
-  // completion callback. Atomic because those two run on different tasks.
+  std::atomic<bool> running_{false}, stopping_{false};
+  esp_err_t startError_ = ESP_OK;
+  // Published under the transport lock and read from application tasks.
   std::atomic<bool> inFlight_{false};
   FrameCompleteCallback frameCompleteCallback_;
   CommitCallback commitCallback_;
   EspUsbDeviceVideoCommit commit_;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
 
+struct EspUsbMscConfig {
+  size_t transferBytes = 512;
+  uint8_t *transferBuffer = nullptr;
+  const char *name = nullptr;
+};
+struct EspUsbMscState;
 class EspUsbDeviceMsc : public EspUsbDeviceClass
 {
 public:
   explicit EspUsbDeviceMsc(EspUsbDevice &device);
   ~EspUsbDeviceMsc() override;
 
-  bool begin() override;
   bool begin(uint32_t blockCount, uint16_t blockSize);
   void end() override;
+  esp_err_t startError() const override { return startError_; }
+  esp_err_t configure(const EspUsbMscConfig &config);
+  const EspUsbMscConfig &configuration() const { return config_; }
+  size_t transferCapacity() const;
+  bool mounted() const;
+  const char *functionName() const override { return config_.name; }
+  void assignFunctionIds(uint8_t, uint8_t index) override { stringIndex_ = index; }
   bool isHid() const override { return false; }
   bool isMsc() const override { return true; }
   uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
   uint8_t interfaceCount() const override { return 1; }
   uint8_t endpointCount() const override { return 1; }
 
-  void vendorID(const char *value);
-  void productID(const char *value);
-  void productRevision(const char *value);
+  esp_err_t vendorID(const char *value);
+  esp_err_t productID(const char *value);
+  esp_err_t productRevision(const char *value);
+  // false -> true while the Host has the device configured is reported once,
+  // as UNIT ATTENTION 06/28/00, to the next command but INQUIRY/REQUEST SENSE.
+  // true -> false fails the rest of a running READ/WRITE with 02/3A/00 and
+  // no further storage callbacks for it, even if the medium returns meanwhile.
+  // A callback already running is not interrupted. Same value: no change.
   void mediaPresent(bool value);
   void isWritable(bool value);
-  void onRead(EspUsbDeviceMscReadCallback callback);
-  void onWrite(EspUsbDeviceMscWriteCallback callback);
-  void onStartStop(EspUsbDeviceMscStartStopCallback callback);
+  esp_err_t onRead(EspUsbDeviceMscReadCallback callback);
+  esp_err_t onWrite(EspUsbDeviceMscWriteCallback callback);
+  esp_err_t onStartStop(EspUsbDeviceMscStartStopCallback callback);
 
   uint8_t maxLun() const;
   void inquiry(uint8_t vendor[8], uint8_t product[16], uint8_t revision[4]) const;
@@ -1820,6 +2122,12 @@ public:
   bool writable() const;
 
 private:
+  friend struct EspUsbMscState;
+  EspUsbMscState *state_ = nullptr;
+  EspUsbMscConfig config_;
+  uint8_t interfaceNumber_ = 0;
+  esp_err_t startError_ = ESP_OK;
+  uint8_t stringIndex_ = 0;
   static void copyPadded(uint8_t *dst, size_t size, const char *value);
 
   char vendor_[9] = "ESP32";
@@ -1827,11 +2135,21 @@ private:
   char revision_[5] = "1.0";
   uint32_t blockCount_ = 0;
   uint16_t blockSize_ = 0;
-  bool mediaPresent_ = false;
-  bool writable_ = true;
+  // Bit 0: present. Above it: removals so far, so a command can tell that
+  // the medium it began on went away even if another one is back now.
+  std::atomic<uint32_t> media_{0};
+  std::atomic<uint32_t> insertions_{0};
+  bool mediaUnchanged(uint32_t since) const { return (since & 1) && media_.load() == since; }
+  std::atomic<bool> writable_{true};
   EspUsbDeviceMscReadCallback readCallback_;
   EspUsbDeviceMscWriteCallback writeCallback_;
   EspUsbDeviceMscStartStopCallback startStopCallback_;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
 
 class EspUsbDeviceMscRamDisk
@@ -1901,6 +2219,7 @@ private:
   size_t size_ = 0;
   uint32_t blockCount_ = 0;
   uint16_t sectorsPerFat_ = 0;
+  uint8_t sectorsPerCluster_ = 1;
   uint16_t rootEntryCount_ = 64;
   uint16_t rootDirSectors_ = 0;
   uint16_t dataStartSector_ = 0;
@@ -1920,8 +2239,11 @@ public:
   explicit EspUsbDeviceMscSdCard(fs::SDFS &sd = SD);
 
   bool begin(uint8_t ssPin = SS, SPIClass &spi = SPI, uint32_t frequency = 4000000, const char *mountpoint = "/sd", uint8_t maxFiles = 5);
+  // Installs callbacks and geometry. Call msc.mediaPresent(true) to expose the
+  // card. Fails while the device runs.
   bool attach(EspUsbDeviceMsc &msc);
   void onEject(EjectCallback callback);
+  // Read-only is reported to the host as write protection (MODE SENSE WP).
   void readOnly(bool value);
   bool readOnly() const;
   uint32_t blockCount() const;
@@ -1938,6 +2260,7 @@ private:
   uint16_t blockSize_ = 512;
   bool mounted_ = false;
   bool readOnly_ = false;
+  EspUsbDeviceMsc *msc_ = nullptr;
   EjectCallback ejectCallback_;
 };
 #endif
@@ -2220,8 +2543,8 @@ private:
 
 enum class EspUsbDeviceDfuMode : uint8_t
 {
-  // Advertise that the device can be put into DFU mode, and answer exactly one
-  // request: DFU_DETACH. `dfu-util -e` sends it. The default action is to
+  // Advertise Runtime DFU, report its status/state, and accept DFU_DETACH.
+  // `dfu-util -e` sends DETACH. The default action is to
   // restart into the chip's ROM download loader, so a host tool can ask for
   // boot mode without a protocol of this library's own.
   Runtime,
@@ -2232,35 +2555,53 @@ enum class EspUsbDeviceDfuMode : uint8_t
   Download,
 };
 
+enum class EspUsbDfuStatus : uint8_t {
+  Ok = 0, Target, File, Write, Erase, CheckErased, Program, Verify,
+  Address, NotDone, Firmware, Vendor, UsbReset, PowerOnReset, Unknown, StalledPacket
+};
+struct EspUsbDfuConfig {
+  size_t transferBytes = 1024;
+  uint8_t *transferBuffer = nullptr; // Download only; CPU copy, no DMA alignment.
+  uint16_t detachTimeoutMs = 1000;
+  uint32_t downloadPollMs = 1;
+  uint32_t manifestPollMs = 250;
+  bool manifestationTolerant = false;
+};
+// Synchronous callbacks on the USB worker. Download's data is valid only until
+// the callback returns. A supplied backend owns verification and activation;
+// the built-in OTA Complete callback and automatic restart do not apply to it.
+struct EspUsbDfuBackend {
+  std::function<EspUsbDfuStatus(uint16_t block, const uint8_t *data, size_t bytes)> download;
+  std::function<EspUsbDfuStatus()> manifest;
+  std::function<void()> abort;
+};
+struct EspUsbDfuState;
+
 // A DFU function. Costs one interface and no endpoints: every DFU transfer
 // travels on EP0, which is why this is the one class that can be added to a
 // device whose endpoint budget is already spent.
 class EspUsbDeviceDfu : public EspUsbDeviceClass
 {
 public:
-  // Called instead of the default action when the host sends DFU_DETACH in
-  // Runtime mode. Runs on the usbd task: set a flag and act from loop().
-  using DetachCallback = std::function<void()>;
-  // Download progress, in bytes written so far.
-  //
-  // There is no second "total" argument because DFU 1.1 has no field for one:
-  // the host never tells the device how long the image is, so a percentage is
-  // not something this class can honestly offer. A sketch that wants one has to
-  // learn the size some other way.
+  // SETUP of a valid DFU_DETACH, on the USB worker. false stalls the request
+  // and changes nothing. Return quickly: no waiting, end() or storage writes.
+  using DetachCallback = std::function<bool()>;
+  // After the accepted DETACH's status stage, on the USB worker, once.
+  // Replaces the default restart into the ROM loader: the handler then owns
+  // leaving the bus (bitWillDetach). end()/reset do not withdraw an accepted
+  // DETACH; refuse in onDetach instead.
+  using DetachHandler = std::function<void()>;
   using ProgressCallback = std::function<void(size_t written)>;
-  // The image was written and verified, and the boot partition has moved to it.
-  // Return false to refuse it after all, which points the boot partition back
-  // at the running firmware and fails the transfer on the host.
   using CompleteCallback = std::function<bool()>;
-  // The download failed. `status` is the DFU status code reported to the host.
-  using ErrorCallback = std::function<void(uint8_t status)>;
-
+  using ErrorCallback = std::function<void(EspUsbDfuStatus status)>;
   explicit EspUsbDeviceDfu(EspUsbDevice &device,
                            EspUsbDeviceDfuMode mode = EspUsbDeviceDfuMode::Download,
                            const char *name = nullptr);
   ~EspUsbDeviceDfu() override;
-
-  bool begin() override;
+  esp_err_t configure(const EspUsbDfuConfig &config);
+  const EspUsbDfuConfig &configuration() const { return config_; }
+  esp_err_t setBackend(const EspUsbDfuBackend &backend);
+  esp_err_t startError() const override { return startError_; }
   void end() override;
   bool isHid() const override { return false; }
   bool isDfu() const override { return true; }
@@ -2269,64 +2610,61 @@ public:
   uint8_t endpointCount() const override { return 0; }
   const char *functionName() const override { return name_; }
   void assignFunctionIds(uint8_t instance, uint8_t stringIndex) override;
-
   EspUsbDeviceDfuMode mode() const { return mode_; }
-  // Block size this function declares (wTransferSize), which is
-  // CFG_TUD_DFU_XFER_BUFSIZE. Raise it from build_opt.h.
-  static uint16_t transferSize();
-
-  // Runtime mode only. Without one, DFU_DETACH restarts into the ROM download
-  // loader - which is what a host that sent DETACH asked for.
-  void onDetach(DetachCallback callback);
-
-  // Download mode only.
-  void onProgress(ProgressCallback callback);
-  void onComplete(CompleteCallback callback);
-  void onError(ErrorCallback callback);
-  // Restart into the newly written firmware once the host's download is
-  // verified. On by default: a DFU download that does not reach the new image
-  // has not finished, and the function declares itself manifestation-intolerant
-  // so the host already expects the device to reset. Turn it off to restart at
-  // a moment the sketch chooses, and note the device stays unusable for DFU
-  // until it does.
-  void restartWhenComplete(bool enable);
-  // Bytes written so far.
-  size_t written() const;
-  // The update this function drives, for a sketch that wants to inspect it.
-  EspUsbDeviceFirmwareUpdate &firmware();
-
-  // Internal (called from the tud_dfu_* callbacks on the usbd task).
-  void handleDetach();
-  void handleDownload(uint16_t blockNumber, const uint8_t *data, uint16_t length);
-  void handleManifest();
-  void handleAbort();
-  uint32_t pollTimeout(uint8_t state) const;
+  uint16_t transferSize() const { return uint16_t(config_.transferBytes); }
+  // Actual allocated Download buffer bytes; 0 before begin/end or in Runtime.
+  size_t transferCapacity() const;
+  // Runtime only, while stopped. Empty restores accept / default restart.
+  esp_err_t onDetach(DetachCallback callback);
+  esp_err_t setDetachHandler(DetachHandler handler);
+  esp_err_t onProgress(ProgressCallback callback);
+  // Built-in OTA only: false vetoes the image and restores the running boot partition.
+  esp_err_t onComplete(CompleteCallback callback);
+  esp_err_t onError(ErrorCallback callback);
+  // Built-in OTA only; true by default. Frozen while started.
+  esp_err_t restartWhenComplete(bool enable);
+  size_t written() const { return written_.load(); }
+  EspUsbDeviceFirmwareUpdate &firmware() { return firmware_; }
   void onBusDetached() override;
-
 private:
-  void failDownload(uint8_t status);
-
+  friend struct EspUsbDfuState;
+  void handleDetach();
+  EspUsbDfuStatus handleDownload(uint16_t block, const uint8_t *data, uint16_t bytes);
+  EspUsbDfuStatus handleManifest();
+  void handleAbort();
+  EspUsbDfuStatus failDownload(EspUsbDfuStatus status);
   EspUsbDeviceDfuMode mode_ = EspUsbDeviceDfuMode::Download;
   const char *name_ = nullptr;
-  uint8_t stringIndex_ = 0;
-  bool restartWhenComplete_ = true;
-  bool downloadOpen_ = false;
+  uint8_t stringIndex_ = 0, interface_ = 255;
+  EspUsbDfuConfig config_;
+  EspUsbDfuBackend backend_;
+  EspUsbDfuState *state_ = nullptr;
+  esp_err_t startError_ = ESP_OK;
+  bool restartWhenComplete_ = true, downloadOpen_ = false;
+  std::atomic<size_t> written_{0};
   EspUsbDeviceFirmwareUpdate firmware_;
   DetachCallback detachCallback_;
+  DetachHandler detachHandler_;
   ProgressCallback progressCallback_;
   CompleteCallback completeCallback_;
   ErrorCallback errorCallback_;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
+  void prepareToStop() override;
 };
 
-class EspUsbDeviceHidKeyboard : public EspUsbDeviceClass
+class EspUsbDeviceHidKeyboard : public EspUsbHidFunction
 {
 public:
   using OutputReportCallback = std::function<void(const EspUsbDeviceHidKeyboardOutputReport &)>;
   using ProtocolCallback = std::function<void(const EspUsbDeviceHidProtocolEvent &)>;
 
   explicit EspUsbDeviceHidKeyboard(EspUsbDevice &device);
+  ~EspUsbDeviceHidKeyboard() override { end(); }
 
-  bool begin() override;
   bool sendReport(const EspUsbDeviceBootKeyboardReport &report, uint32_t timeoutMs = 100);
   // Sends the whole held-key state as one report. Requires enableNkro() before
   // EspUsbDevice::begin(); fails otherwise (a missing enableNkro() is a setup
@@ -2335,16 +2673,24 @@ public:
   // boot protocol, which is a host-driven runtime condition the sketch cannot
   // control. The boot-report overload above stays valid and keeps working.
   bool sendReport(const EspUsbDeviceNkroKeyboardReport &report, uint32_t timeoutMs = 100);
-  bool pressUsage(uint8_t usage, uint8_t modifiers = 0, uint32_t holdMs = 10);
+  // press*/release* add to and remove from the held state, so keys combine:
+  // pressUsage(A) then pressUsage(B) holds both. A modifier usage (0xE0-0xE7)
+  // sets its modifier bit. Without NKRO six non-modifier keys can be held; a
+  // seventh fails with ESP_ERR_INVALID_SIZE and changes nothing. A usage the
+  // report cannot carry fails with ESP_ERR_INVALID_ARG, a character the layout
+  // cannot type with ESP_ERR_NOT_SUPPORTED. tap* releases only what it added.
+  bool pressUsage(uint8_t usage, uint8_t modifiers = 0, uint32_t timeoutMs = 100);
   bool pressKey(char key, uint32_t timeoutMs = 100);
   bool tapUsage(uint8_t usage, uint8_t modifiers = 0, uint32_t holdMs = 10);
   bool tapKey(char key, uint32_t holdMs = 10);
   bool write(const char *text, uint32_t interKeyDelayMs = 5);
   bool releaseUsage(uint8_t usage, uint32_t timeoutMs = 100);
+  // Releases the key and the modifiers the layout uses to type this character.
+  bool releaseKey(char key, uint32_t timeoutMs = 100);
   bool releaseAll(uint32_t timeoutMs = 100);
   void setLayout(EspUsbDeviceKeyboardLayout layout);
   EspUsbDeviceKeyboardLayout layout() const;
-  void onOutputReport(OutputReportCallback callback);
+  esp_err_t onOutputReport(OutputReportCallback callback);
   // Latest LED output report from the host. Updated whether or not an
   // onOutputReport() callback is installed, so a sketch can read Lock state even
   // when an integration layer owns the single callback slot. LEDs are state, not
@@ -2354,14 +2700,14 @@ public:
   // and the state is cleared on bus reset / unplug so a previous session's LEDs
   // are never read back as current.
   //
-  // Returns by value, not by reference: the host writes this from the TinyUSB
+  // Returns by value, not by reference: the host writes this from the USB
   // device task while the sketch reads it from its own task, so a reference would
   // hand out an object another task mutates. The raw LED byte is stored
   // atomically and the returned report is built from that one read, which makes a
   // torn combination of fields impossible. EspBle's ledState() returns by value
   // for the same reason.
   EspUsbDeviceHidKeyboardOutputReport ledState() const;
-  void onProtocol(ProtocolCallback callback);
+  esp_err_t onProtocol(ProtocolCallback callback);
   uint8_t protocol() const;
 
   // Opt-in N-key rollover. Call before EspUsbDevice::begin(). When enabled the
@@ -2369,7 +2715,7 @@ public:
   // International/LANG keys, so JIS layouts work), and press/release track any
   // number of simultaneous keys. The boot 6-key format is still sent when the
   // host selects boot protocol (BIOS). Default off (unchanged 6KRO behaviour).
-  void enableNkro(bool enable = true);
+  esp_err_t enableNkro(bool enable = true);
   bool nkroEnabled() const;
 
   // The state the host was last told about (NKRO only; stays cleared while NKRO
@@ -2400,10 +2746,14 @@ private:
   // Put nkroState_ on the wire. Every NKRO send goes through here so the bitmap
   // layout and the boot-protocol fold-down live in one place.
   bool sendNkroReport(uint32_t timeoutMs = 100);
+  bool isHeld(uint8_t usage) const;
+  uint8_t heldModifiers() const;
+  // Removes `usage` (0 = none) and the modifier bits in `modifiers`, then sends.
+  bool releaseState(uint8_t usage, uint8_t modifiers, uint32_t timeoutMs);
 
   EspUsbDeviceBootKeyboardReport report_;
   EspUsbDeviceKeyboardLayout layout_ = ESP_USB_DEVICE_KEYBOARD_LAYOUT_EN_US;
-  uint8_t protocol_ = 1;
+  std::atomic<uint8_t> protocol_{1};
   bool nkroEnabled_ = false;
   // The held-key state while NKRO is on. Holding the public report type itself
   // keeps the bitmap layout and the modifier routing defined in exactly one
@@ -2411,7 +2761,7 @@ private:
   // heldState() may have to apply a pending bus change before returning it.
   mutable EspUsbDeviceNkroKeyboardReport nkroState_;
   // Raw LED byte as the host last set it. One atomic byte rather than the whole
-  // report struct, because the writer is the TinyUSB device task and the reader
+  // report struct, because the writer is the USB worker and the reader
   // is the sketch: a single store/load cannot be observed half-applied, so
   // ledState() can rebuild the flags from one read without a lock.
   std::atomic<uint8_t> ledsRaw_{0};
@@ -2422,17 +2772,25 @@ private:
   mutable std::atomic<bool> busChangePending_{false};
   OutputReportCallback outputCallback_;
   ProtocolCallback protocolCallback_;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
-class EspUsbDeviceHidMouse : public EspUsbDeviceClass
+class EspUsbDeviceHidMouse : public EspUsbHidFunction
 {
 public:
   explicit EspUsbDeviceHidMouse(EspUsbDevice &device);
+  ~EspUsbDeviceHidMouse() override { end(); }
 
-  bool begin() override;
   bool sendReport(const EspUsbDeviceBootMouseReport &report, uint32_t timeoutMs = 100);
   bool sendState(uint32_t timeoutMs = 100);
-  bool move(int8_t x, int8_t y, int8_t wheel = 0, uint8_t buttons = 0, uint32_t timeoutMs = 100);
+  // KeepButtons sends the buttons held by press(), so press() then move() drags.
+  // A value 0-255 sets the held buttons, as press()/release() would.
+  static constexpr int16_t KeepButtons = -1;
+  bool move(int8_t x, int8_t y, int8_t wheel = 0, int16_t buttons = KeepButtons, uint32_t timeoutMs = 100);
   bool wheel(int8_t wheel, uint32_t timeoutMs = 100);
   bool press(uint8_t buttons, uint32_t timeoutMs = 100);
   bool release(uint8_t buttons, uint32_t timeoutMs = 100);
@@ -2449,14 +2807,22 @@ public:
 
 private:
   uint8_t buttons_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
-class EspUsbDeviceHidCustom : public EspUsbDeviceClass
+class EspUsbDeviceHidCustom : public EspUsbHidFunction
 {
 public:
+  // inputReportSize is the interrupt IN packet to declare, report ID byte
+  // included: up to 64 at full speed and 1024 at high speed. A longer report is
+  // still sent, over several packets.
   EspUsbDeviceHidCustom(EspUsbDevice &device, const uint8_t *reportDescriptor, uint16_t reportDescriptorLength, uint16_t inputReportSize = 64);
+  ~EspUsbDeviceHidCustom() override { end(); }
 
-  bool begin() override;
   bool sendReport(const void *data, size_t length, uint8_t reportId = 0, uint32_t timeoutMs = 100);
 
   uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
@@ -2464,41 +2830,42 @@ public:
   uint8_t endpointCount() const override { return 1; }
   const uint8_t *hidReportDescriptor() const override;
   uint16_t hidReportDescriptorLength() const override;
+  uint16_t hidInEndpointSize() const override;
+  uint16_t hidHighSpeedEndpointSize() const override;
 
 private:
   const uint8_t *reportDescriptor_ = nullptr;
   uint16_t reportDescriptorLength_ = 0;
   uint16_t inputReportSize_ = 64;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
 // Raw byte pipe over a HID interrupt endpoint. The one class here that needs no
 // host-side driver on any OS, which is why it is worth making fast.
 //
-// reportSize is the payload of one report, and the largest value it may take is
-// CFG_TUD_HID_EP_BUFSIZE - 1 (the report ID takes the first byte of the packet).
-// That ceiling is 511 on ESP32-P4 and 63 elsewhere; raise or lower it from
-// build_opt.h with -DCFG_TUD_HID_EP_BUFSIZE=<n>. A size larger than 63 is only
-// carried in one packet when the device enumerates at high speed - full speed
-// caps an interrupt endpoint at 64 bytes, and the report is then split across
-// packets of the one transfer rather than refused.
-//
-// Reports go out once per microframe at high speed (about 8,000/s), so 511 bytes
-// is roughly 4 MB/s of reserved, driverless bandwidth against 0.5 MB/s at 63.
-class EspUsbDeviceHidVendor : public EspUsbDeviceClass
+// reportSize selects runtime storage from the report descriptor. Large reports
+// may span bus packets; no build flags are needed. The interim core's transfer
+// length is uint16_t, leaving at most 65534 payload bytes plus the report ID.
+// Available memory and the host's report support remain practical bounds.
+class EspUsbDeviceHidVendor : public EspUsbHidFunction
 {
 public:
   using ReportCallback = std::function<void(const EspUsbDeviceHidReport &)>;
 
   explicit EspUsbDeviceHidVendor(EspUsbDevice &device, uint16_t reportSize = 63);
+  ~EspUsbDeviceHidVendor() override { end(); }
 
-  bool begin() override;
   bool sendInput(const void *data, size_t length, uint32_t timeoutMs = 100);
-  void onOutputReport(ReportCallback callback);
-  void onFeatureReport(ReportCallback callback);
+  esp_err_t onOutputReport(ReportCallback callback);
+  esp_err_t onFeatureReport(ReportCallback callback);
 
   // Payload bytes per report, as the report descriptor declares it.
   uint16_t reportSize() const { return reportSize_; }
-  // Largest reportSize this build accepts (CFG_TUD_HID_EP_BUFSIZE - 1).
+  // Interim transfer-length limit, independent of bus packet size/build flags.
   static uint16_t maxReportSize();
 
   uint16_t configurationDescriptor(uint8_t *dst, uint8_t interfaceNumber, uint8_t endpointNumber, uint16_t endpointSize) override;
@@ -2507,6 +2874,7 @@ public:
   uint8_t hidReportId() const override { return ESP_USB_DEVICE_HID_REPORT_ID_VENDOR; }
   const uint8_t *hidReportDescriptor() const override;
   uint16_t hidReportDescriptorLength() const override;
+  uint16_t hidInEndpointSize() const override;
   uint16_t hidHighSpeedEndpointSize() const override;
   void onHidSetReport(uint8_t reportId, uint8_t reportType, const uint8_t *data, uint16_t length) override;
 
@@ -2523,14 +2891,19 @@ private:
   // covers the fixed items plus a two-byte Report Count for sizes above 255.
   uint8_t reportDescriptor_[32] = {};
   uint8_t reportDescriptorLength_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
-class EspUsbDeviceHidGamepad : public EspUsbDeviceClass
+class EspUsbDeviceHidGamepad : public EspUsbHidFunction
 {
 public:
   explicit EspUsbDeviceHidGamepad(EspUsbDevice &device);
+  ~EspUsbDeviceHidGamepad() override { end(); }
 
-  bool begin() override;
   bool sendReport(const EspUsbDeviceGamepadReport &report, uint32_t timeoutMs = 100);
   bool send(int8_t x,
             int8_t y,
@@ -2552,14 +2925,19 @@ public:
 
 private:
   EspUsbDeviceGamepadReport report_;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
-class EspUsbDeviceHidConsumerControl : public EspUsbDeviceClass
+class EspUsbDeviceHidConsumerControl : public EspUsbHidFunction
 {
 public:
   explicit EspUsbDeviceHidConsumerControl(EspUsbDevice &device);
+  ~EspUsbDeviceHidConsumerControl() override { end(); }
 
-  bool begin() override;
   bool press(uint16_t usage, uint32_t timeoutMs = 100);
   bool release(uint32_t timeoutMs = 100);
   bool click(uint16_t usage, uint32_t holdMs = 10);
@@ -2575,14 +2953,20 @@ public:
 
 private:
   uint16_t usage_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
-class EspUsbDeviceHidSystemControl : public EspUsbDeviceClass
+class EspUsbDeviceHidSystemControl : public EspUsbHidFunction
 {
 public:
   explicit EspUsbDeviceHidSystemControl(EspUsbDevice &device);
+  ~EspUsbDeviceHidSystemControl() override { end(); }
 
-  bool begin() override;
+  // Standard usage IDs 0x81/0x82/0x83, or 0 to release; other values are refused.
   bool press(uint8_t usage, uint32_t timeoutMs = 100);
   bool release(uint32_t timeoutMs = 100);
   bool click(uint8_t usage, uint32_t holdMs = 10);
@@ -2598,6 +2982,11 @@ public:
 
 private:
   uint8_t usage_ = 0;
+
+protected:
+  // Lifecycle hooks run by EspUsbDevice::begin()/end(). Start and stop the
+  // device instead; calling these directly would leave it unable to start.
+  bool begin() override;
 };
 
 #endif

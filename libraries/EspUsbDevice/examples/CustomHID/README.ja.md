@@ -2,51 +2,83 @@
 
 > English: [README.md](README.md)
 
-任意の HID report descriptor を渡して、custom HID device を作る例です。
+スケッチで書いた HID report descriptor から、独自の HID device を作る例です。
 
-この example は vendor-defined usage page `0xff00` の 8 byte Input report を 1 秒ごとに
-Host へ送信します。Keyboard、Mouse、Gamepad、VendorHID の定型 class に当てはまらない
-小さな HID device を試すための出発点です。
+vendor 定義の usage page `0xff00` で、8 byte の Input report を1秒ごとに送ります。
+内蔵の Keyboard、Mouse、Gamepad、VendorHID に当てはまらない小さな HID device の出発点です。
 
 ## ハードウェア
 
-- USB device 対応の ESP32-S3 など Arduino-ESP32 board
-- EspUsbHost、HID parser、独自 Host application などの USB host
-- ログ確認用の Serial monitor 接続
+- ESP32-S3、ESP32-S2、ESP32-P4 の board。native USB OTG の口を Host へつなぐ
+- EspUsbHost、HID parser、独自の Host アプリなどの USB Host
+- ログ用の `Serial`（115200）の別の debug 接続
 
 ## 動作内容
 
-- `REPORT_DESCRIPTOR` を sketch 内で定義します。
-- `EspUsbDeviceHidCustom` に descriptor と input report size を渡します。
-- 1 秒ごとに 8 byte report を Host へ送信します。
-- Serial monitor に送信 counter を出力します。
+- スケッチの中で `reportDescriptor` を定義します。
+- descriptor と、interrupt IN の packet 長（8 byte）を `EspUsbDeviceHidCustom` に渡します。
+- `begin()` が descriptor から求めた Input / Output / Feature report の長さを表示します。
+- Host が構成を済ませている間、8 byte の report を1秒ごとに送ります。
+- 送った counter を表示します。
 
 ## 主要 API
 
-- `EspUsbDeviceHidCustom customHid(device, descriptor, descriptorLength, inputReportSize)` は custom HID function を登録します。
-- `customHid.sendReport(data, length)` は report ID なしの Input report を送信します。
-- `customHid.sendReport(data, length, reportId)` は report ID 付き descriptor 用に使います。
+- `EspUsbDeviceHidCustom customHid(device, descriptor, descriptorLength, inputReportSize)` は独自 HID の Function を登録します。
+  `inputReportSize`（既定 64）は、宣言する interrupt IN の `wMaxPacketSize` です。report ID の 1 byte を含みます。
+  full speed では 64 まで（大きい値は 64 になる）、high speed では 1024 までです。
+  これより長い report も、1回の転送の複数の packet で送れます。report の領域はこの値ではなく descriptor から決まります。
+- 他の HID Function と1つの HID interface を共有するときは、その interface の packet 長は、各 Function が求める値の最大（16 以上）になります。
+- `customHid.inputPacketSize()` は、Host と決まった速度での interrupt IN の `wMaxPacketSize` を返します（bus reset 前と `end()` 後は 0）。
+- `customHid.sendReport(data, length)` は report ID なしの Input report を送ります。
+- `customHid.sendReport(data, length, reportId)` は report ID を持つ descriptor で使います。他の HID Function と組み合わせたときは割り当てた ID を使います。
+- `customHid.inputReportCapacity()` / `outputReportCapacity()` / `featureReportCapacity()` は `begin()` が求めた長さを返します。
+  report ID を宣言していればその 1 byte を含みます（`begin()` 前は 0）。
+- `customHid.setFeatureReport(data, length, reportId)` は、Feature report を宣言した descriptor で、Host の GET_REPORT(Feature) が読む値を設定します。
 
 ## Descriptor
 
-この example の descriptor は次の report を定義します。
+この例の descriptor の内容：
 
-- usage page: vendor-defined `0xff00`
-- report ID: なし
-- input report size: 8 bytes
-- report count: 8
-- report size: 8 bits
+- usage page：vendor 定義 `0xff00`
+- report ID：なし
+- Input report：8 byte（Report Count 8、Report Size 8 bit）
+- Output / Feature report はないので、OUT endpoint 用の領域は確保しません
 
-descriptor と `inputReportSize` が一致していないと、Host 側 parser や endpoint MPS の期待と
-実際の report 長がずれます。まず小さい固定長 report から始めるのがおすすめです。
+`begin()` は descriptor を解析し（Report Size / Count / ID、Push/Pop）、途中で切れた item、Push/Pop の不整合、
+Report ID 0 の明示指定、番号付きと番号なしの report の混在、長すぎる report を拒否します。usage とその意味まで全部検査するものではありません。
+descriptor の配列は、動作中ずっと有効で変更しないまま保ってください。
+
+## 想定 Serial 出力
+
+```text
+USB custom HID ready (input=8 output=0 feature=0 bytes)
+CUSTOM_HID_TX counter=0
+CUSTOM_HID_TX counter=1
+```
 
 ## VendorHID との違い
 
-- `VendorHID` は定型の vendor-defined report descriptor と Output / Feature callback を持ちます。
-- `CustomHID` は descriptor を sketch 側で完全に定義します。
-- 独自 descriptor を検証したい場合は `CustomHID`、単純な独自バイナリ通信なら `VendorHID` が向いています。
+- `VendorHID` は定義済みの vendor 定義 descriptor と、Output / Feature の callback を持ちます。
+- `CustomHID` は descriptor をスケッチで自由に定義できます。
+- 独自の descriptor を確かめるには `CustomHID`、簡単な独自バイナリのやり取りには `VendorHID` を使います。
+
+## 確認の手順
+
+- `reportDescriptor` と、`sendReport()` に渡す byte 列を合わせて読みます。Host 側の reader で report ID、項目数、report 長を合わせます。
+- この例には Output や Feature のやり取りはありません。Output report を受けるには `VendorHID` を使うか、`EspUsbHidFunction` から独自のクラスを作ります。
+
+## v2 からの変更点
+
+- `device.ready()` が true の間だけ送ります。
+- descriptor は `begin()` で解析します。不正な descriptor は Host に届く前に `begin()` が失敗します（原因は `customHid.startError()`）。
+- `inputReportSize` は、宣言する interrupt IN の packet 長を決めます。複合 HID の interface でも high speed でも反映されます。v2 は `CFG_TUD_HID_EP_BUFSIZE` で buffer の大きさを決めていましたが、この設定は廃止です。
+  1 packet より長い report は、1回の転送の複数の packet で送ります。
+- 新しく `inputReportCapacity()` などの容量の照会、`inputPacketSize()`、`setFeatureReport()` が使えます。
+- `sendReport(data, length[, reportId])` は変わりません。
 
 ## 関連
 
-- [VendorHID](../VendorHID/) - 定型 vendor-defined HID
-- [Gamepad](../Gamepad/) - HID gamepad device
+- [VendorHID](../VendorHID/) - 定義済みの vendor 定義 HID
+- [Gamepad](../Gamepad/) - HID gamepad
+- [HID API ガイド](../../docs/classes/hid.ja.md)
+- [全サンプル](../README.md)

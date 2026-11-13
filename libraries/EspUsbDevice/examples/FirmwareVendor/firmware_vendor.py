@@ -38,7 +38,9 @@ def find_bulk_out(device):
 def status(device):
     data = device.ctrl_transfer(IN, REQUEST_STATUS, 0, 0, 8, timeout=5000)
     active = data[0]
-    error = data[1]
+    # Bytes 1..3 carry the device's last esp_err_t (low 24 bits). A v2 device
+    # filled only byte 1 and left 2..3 zero, which reads the same way.
+    error = int.from_bytes(bytes(data[1:4]), "little")
     written = int.from_bytes(bytes(data[4:8]), "little")
     return active, error, written
 
@@ -65,7 +67,7 @@ def main():
     time.sleep(0.05)
     active, error, _ = status(device)
     if not active:
-        sys.exit(f"device refused to start (error {error})")
+        sys.exit(f"device refused to start (error 0x{error:x})")
 
     started = time.time()
     # 16 KiB per transfer: the device drains its FIFO from loop(), so larger
@@ -80,7 +82,7 @@ def main():
     while time.time() < deadline:
         active, error, written = status(device)
         if error:
-            sys.exit(f"device reported error {error} after {written} bytes")
+            sys.exit(f"device reported error 0x{error:x} after {written} bytes")
         if written >= size:
             break
         time.sleep(0.05)

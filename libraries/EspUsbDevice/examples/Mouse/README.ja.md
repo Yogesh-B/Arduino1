@@ -2,37 +2,40 @@
 
 > English: [README.md](README.md)
 
-USB HID boot mouse device を作り、相対移動、wheel、button 状態を USB host へ送信する例です。
+USB HID boot mouse を作り、相対移動、wheel、ボタンの状態を USB Host へ送る例です。
 
 ## ハードウェア
 
-- USB device 対応の ESP32-S3 など Arduino-ESP32 board
-- PC、EspUsbHost を動かす別 ESP32、またはテスト治具などの USB host
-- ログ確認用の Serial monitor 接続
+- ESP32-S3、ESP32-S2、ESP32-P4 の board。native USB OTG の口を Host へつなぐ
+- PC、EspUsbHost を動かす別の ESP32、試験治具などの USB Host
+- ログ用の `Serial`（115200）の別の debug 接続
 
 ## 動作内容
 
-- `EspUsbDevice` を full-speed HID mouse として起動します。
-- 相対 `x` / `y` 移動量を送信します。
-- wheel 移動量を送信します。
-- Device 側で mouse button 状態を保持し、Host 側の `buttons` / `previousButtons`
-  event field と対応しやすい press/release API を使います。
-- left button の press / release を送信します。
+- 独自の VID/PID/文字列で `EspUsbDevice` を HID mouse として開始します。
+- Host が構成を済ませた後、1秒ごとに1段ずつ、右・下・左・上（各 30）、wheel +1、左ボタンの押下と解放を送ります。
+- ボタンの状態を Device 側で保持するので、press/release の呼び出しが Host 側 event の `buttons` と `previousButtons` に対応します。
+- 失敗したときは `device.lastErrorName()` と現在のボタンの bitmask を表示します。
+
+Host が構成を済ませるとすぐに動き始めます。動いても困らない画面で試してください。
 
 ## 主要 API
 
-- `mouse.move(x, y)` は相対移動を送信します。
-- `mouse.move(x, y, wheel, buttons)` は boot mouse report 全体を送信し、
-  現在の button 状態を置き換えます。
-- `mouse.wheel(delta)` は現在の button 状態を維持して wheel 移動を送信します。
-- `mouse.press(buttons)` は button bit を立てて新しい状態を送信します。
-- `mouse.release(buttons)` は button bit を下げて新しい状態を送信します。
-- `mouse.releaseAll()` はすべての button bit を下げます。
-- `mouse.click(button)` は press、delay、release を送信します。
-- `mouse.buttons()` は Device 側が保持している現在の button bitmask を返します。
-- `mouse.sendReport(report)` は raw boot mouse report を送信します。
+- `mouse.move(x, y)` は相対移動を送ります。`press()` で押したボタンは押したままなので、`press()` の後の `move()` はドラッグになります。
+- `mouse.move(x, y, wheel, buttons)` で `buttons` に 0〜255 を渡すと、`press()`/`release()` と同じように押下中のボタンを決めます。
+  既定値 `EspUsbDeviceHidMouse::KeepButtons`（-1）は今のボタンを保ちます。-1〜255 以外は `ESP_ERR_INVALID_ARG` で失敗します。
+- `mouse.wheel(delta)` は今のボタンを保ったまま wheel を送ります。
+- `mouse.press(buttons)` はボタンの bit を立てて新しい状態を送ります。
+- `mouse.release(buttons)` はボタンの bit を落として新しい状態を送ります。
+- `mouse.releaseAll()` はすべてのボタンを離します。
+- `mouse.click(button)` は押下、短い保持、解放を送ります。
+- `mouse.buttons()` は Device 側のボタンの bitmask を返します。
+- `mouse.sendReport(report)` は `EspUsbDeviceBootMouseReport` をそのまま送ります。`mouse.sendState()` は移動 0 で今のボタンを送り直します。
 
-## Button Bits
+report protocol では 4 byte（ボタン、X、Y、wheel）、boot protocol では 3 byte の boot 形式に変換して送ります。
+X/Y/wheel は送信が成功したら 0 に戻るので、Host の idle 再送で同じ移動が繰り返されません。
+
+## ボタンの bit
 
 | 定数 | bit |
 |------|-----|
@@ -46,12 +49,28 @@ USB HID boot mouse device を作り、相対移動、wheel、button 状態を US
 
 ```text
 USB mouse ready
-MOUSE_FAILED error=ESP_ERR_TIMEOUT
+MOUSE_FAILED ESP_ERR_TIMEOUT buttons=0x00
 ```
 
-この example は失敗時だけ Serial に出力します。移動や button の挙動は USB host 側で確認してください。
+表示するのは失敗だけです。移動とボタンは Host 側で確かめます。
+
+## 確認の手順
+
+- `move()` に渡すのは差分で、画面の座標ではありません。
+- `press()` したボタンは `release()` まで押されたままです。この例は押下が失敗しても解放を送りますが、
+  汎用の「解放待ち」の仕組みはないので、アプリ側でボタンの状態を回復してください。
+- true は「コピーして送信を始めた」という意味で、Host が読んだことは意味しません。
+
+## v2 からの変更点
+
+- `device.ready()` が true の間だけ送ります。Host が無いときに毎秒失敗を表示することはなくなりました。
+- 押下が失敗しても解放を送り、失敗の表示に `mouse.buttons()` を加えました。
+- `buttons` を省いた `move(x, y)` は、押下中のボタンを保つようになりました。v2 は `buttons` の既定が 0 で、move で押下中のボタンが離れました。離したいときは 0 を明示します。
+- `wheel()`、`press()`、`release()`、`click()`、`buttons()`、`sendReport()`/`sendState()` は変わりません。相対値は送信成功後に 0 へ戻るので、Host の idle 再送では移動 0 を送ります。
 
 ## 関連
 
-- [KeyboardMouse](../KeyboardMouse/) - keyboard と mouse の composite device
-- [Keyboard](../Keyboard/) - HID keyboard device
+- [KeyboardMouse](../KeyboardMouse/) - keyboard と mouse の複合
+- [Keyboard](../Keyboard/) - HID keyboard
+- [HID API ガイド](../../docs/classes/hid.ja.md)
+- [全サンプル](../README.md)

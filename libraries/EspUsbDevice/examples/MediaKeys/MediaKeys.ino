@@ -1,19 +1,16 @@
-#include "EspUsbDevice.h"
+#include <EspUsbDevice.h>
 
 EspUsbDevice device;
+// Two HID Functions in one interface, told apart by report ID.
 EspUsbDeviceHidConsumerControl media(device);
 EspUsbDeviceHidSystemControl systemControl(device);
 
-static uint32_t lastStepMs = 0;
-static uint8_t stepIndex = 0;
-
-struct MediaStep
-{
+struct MediaStep {
   const char *name;
-  uint16_t usage;
+  uint16_t usage;  // Consumer page usage ID.
 };
 
-static const MediaStep MEDIA_STEPS[] = {
+const MediaStep steps[] = {
     {"volume up", ESP_USB_DEVICE_CONSUMER_CONTROL_VOLUME_UP},
     {"volume down", ESP_USB_DEVICE_CONSUMER_CONTROL_VOLUME_DOWN},
     {"mute", ESP_USB_DEVICE_CONSUMER_CONTROL_MUTE},
@@ -21,54 +18,40 @@ static const MediaStep MEDIA_STEPS[] = {
     {"next track", ESP_USB_DEVICE_CONSUMER_CONTROL_NEXT_TRACK},
     {"previous track", ESP_USB_DEVICE_CONSUMER_CONTROL_PREVIOUS_TRACK},
 };
+uint8_t step = 0;
 
-static void sendMediaStep()
-{
-  const MediaStep &step = MEDIA_STEPS[stepIndex % (sizeof(MEDIA_STEPS) / sizeof(MEDIA_STEPS[0]))];
-  if (media.click(step.usage))
-  {
-    Serial.printf("MEDIA_KEY %s usage=0x%04x\n", step.name, step.usage);
-  }
-  else
-  {
-    Serial.printf("MEDIA_KEY_FAILED %s error=%s\n", step.name, device.lastErrorName());
-  }
-  stepIndex++;
+void sendMediaStep() {
+  const MediaStep &s = steps[step++ % (sizeof(steps) / sizeof(steps[0]))];
+  // click() sends the press and the release.
+  if (media.click(s.usage)) Serial.printf("MEDIA_KEY %s usage=0x%04x\n", s.name, s.usage);
+  else Serial.printf("MEDIA_KEY_FAILED %s %s\n", s.name, device.lastErrorName());
 }
 
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  delay(1500);
-
   EspUsbDeviceConfig config;
-  config.vid = 0x303a;
   config.pid = 0x4006;
   config.manufacturer = "EspUsb";
   config.product = "EspUsbDevice Media Keys";
   config.serialNumber = "espusb-media-keys";
-
-  if (!device.begin(config))
-  {
+  if (!device.begin(config)) {
     Serial.printf("USB_BEGIN_FAILED %s\n", device.lastErrorName());
     return;
   }
-
   Serial.println("USB media keys ready");
 }
 
-void loop()
-{
+void loop() {
+  static uint32_t last = 0;
   const uint32_t now = millis();
-  if (now - lastStepMs >= 3000)
-  {
-    lastStepMs = now;
+  if (device.ready() && uint32_t(now - last) >= 3000) {
+    last = now;
     sendMediaStep();
   }
 
-  // System control keys can affect the host power state. Send them only from
-  // an explicit user action in your own sketch.
-  //
+  // System Control can put the Host to sleep or power it off. Wire these to an
+  // explicit user action rather than a timer. They take Generic Desktop usages
+  // (0x81-0x83); WAKE_HOST is an ordinary input, not a remote wakeup.
   // systemControl.click(ESP_USB_DEVICE_SYSTEM_CONTROL_STANDBY);
   // systemControl.click(ESP_USB_DEVICE_SYSTEM_CONTROL_POWER_OFF);
   // systemControl.click(ESP_USB_DEVICE_SYSTEM_CONTROL_WAKE_HOST);

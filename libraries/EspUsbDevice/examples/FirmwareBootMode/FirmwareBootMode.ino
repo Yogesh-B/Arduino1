@@ -1,96 +1,76 @@
-#include "EspUsbDevice.h"
-
-// Entering the ROM download loader ("boot mode") from a running sketch, so the
-// whole flash can be rewritten over USB without anyone pressing BOOT.
-//
-// Three ways in, all reaching the same place:
-//
-//   1. Open the CDC port at 1200 baud and drop DTR. This is the gesture the
-//      Arduino IDE and arduino-cli already make, so it needs nothing new on the
-//      host:   arduino-cli upload ...   or   stty -F /dev/ttyACM0 1200
-//   2. dfu-util -e, through the DFU runtime interface. A standard host tool
-//      asking a standard question; costs one interface and no endpoints.
-//   3. Send 'b' on the CDC port, for a host script of your own.
-//
-// Then flash as usual:
-//
-//   esptool --port <port> write_flash 0x0 firmware.bin
-//
-// Which port the ROM comes back on differs per chip. On a one-connector
-// ESP32-S3 the shared PHY returns to USB Serial/JTAG, so the same cable keeps
-// working. On ESP32-P4 the loader answers on the USB Serial/JTAG port, which is
-// not the high-speed OTG connector. See docs/ota-over-usb.md, section 2.3.
-//
-// This replaces the whole flash, so it always works - including on firmware
-// with no OTA partition and firmware too broken to update itself. It is the
-// recovery path behind examples/FirmwareDFU and examples/FirmwareHTTP, not a
-// replacement for them.
+// Restart into the chip's ROM download loader ("boot mode") from a running
+// sketch, so esptool can rewrite the whole flash without touching the board.
+// Three requests lead there: a 1200-baud touch on the CDC port, DFU_DETACH
+// (`dfu-util -e`), or 'b' sent on the CDC port. Details: README.md / README.ja.md.
+#include <EspUsbDevice.h>
 
 EspUsbDevice device;
 EspUsbDeviceCdcSerial port(device, "Console");
 EspUsbDeviceDfu dfu(device, EspUsbDeviceDfuMode::Runtime, "Bootloader");
 
-// Set from USB callbacks, acted on in loop(). Every class callback in this
-// library runs on the usbd task, and restarting the chip from inside one cuts
-// off the transfer the host is still finishing.
-static volatile bool bootloaderRequested = false;
+// Set from USB callbacks (on the USB worker), acted on in loop(): restarting
+// inside a callback would cut off the transfer the host is still finishing.
+volatile bool bootloaderRequested = false;
+volatile bool romDfuRequested = false;
 
-void setup()
-{
-  Serial.begin(115200);
+void setup() {
+  Serial.begin(115200); // Separate debug connection.
   delay(1500);
 
-  // The 1200-baud touch. A host that merely opens the port at some other speed
-  // is not asking for anything, so nothing happens.
-  port.onLineCoding([](const EspUsbDeviceCdcLineCoding &coding)
-                    {
-                      if (coding.baud == 1200)
-                      {
-                        bootloaderRequested = true;
-                      }
-                    });
+  EspUsbBulkStreamConfig serialConfig;
+  serialConfig.rxCapacity = 64;
+  serialConfig.txCapacity = 256;
+  serialConfig.transferBytes = 64;
+  esp_err_t error = port.configure(serialConfig);
+  if (error != ESP_OK) { Serial.printf("CDC_CONFIGURE_FAILED %s\n", esp_err_to_name(error)); return; }
 
-  port.onRx([](size_t)
-            {
-              while (port.available() > 0)
-              {
-                if (port.read() == 'b')
-                {
-                  bootloaderRequested = true;
-                }
-              }
-            });
+  // The 1200-baud touch. A host that merely opens the port at another speed
+  // is not asking for anything, so nothing happens then.
+  port.onLineCoding([](const EspUsbDeviceCdcLineCoding &coding) {
+    if (coding.baud == 1200) bootloaderRequested = true;
+  });
 
-  // Without a callback, EspUsbDeviceDfu in Runtime mode restarts into the
-  // loader by itself, which is what a host that sent DFU_DETACH asked for.
-  // Taking the callback here only adds the log line - and shows where a sketch
-  // would refuse, or save state first.
-  dfu.onDetach([]()
-               {
-                 Serial.println("DFU_DETACH received");
-                 bootloaderRequested = true;
-               });
+  // DFU_DETACH. With no handler the Runtime function restarts into the ROM
+  // loader by itself ~100 ms after the request completes. Taking the handler
+  // moves that restart into loop(), which is where a sketch would log, save
+  // state, or shut peripherals down first. dfu.onDetach() could also refuse
+  // the request (return false = STALL) before it is accepted.
+  dfu.setDetachHandler([]() { bootloaderRequested = true; });
 
-  if (!device.begin())
-  {
+  if (!device.begin()) {
     Serial.printf("USB_BEGIN_FAILED %s\n", device.lastErrorName());
     return;
   }
-  Serial.println("Ready. Touch the CDC port at 1200 baud, run dfu-util -e, or send 'b'.");
+  Serial.println("Ready. Touch the CDC port at 1200 baud, run dfu-util -e, or send 'b'"
+                 " ('d' asks for the S2/S3 ROM DFU instead).");
 }
 
-void loop()
-{
-  if (bootloaderRequested)
-  {
+void loop() {
+  // Commands on the CDC port, read here rather than in a USB callback.
+  while (port.available() > 0) {
+    const int c = port.read();
+    if (c == 'b') bootloaderRequested = true;
+    if (c == 'd') romDfuRequested = true;
+  }
+
+  if (romDfuRequested) {
+    romDfuRequested = false;
+    Serial.println("Restarting into the ROM DFU device");
+    Serial.flush();
+    // Returns only when refused: ESP32-P4, or an ESP32-S3 whose USB_PHY_SEL
+    // eFuse is not burned (the connector would go dark).
+    device.rebootToRomDfu();
+    Serial.printf("ROM_DFU_UNSUPPORTED %s\n", device.lastErrorName());
+    port.printf("ROM DFU refused: %s\n", device.lastErrorName());
+  }
+
+  if (bootloaderRequested) {
     bootloaderRequested = false;
     Serial.println("Restarting into the ROM download loader");
     Serial.flush();
-    // Detaches the USB device, sets the target's download-boot flag and
-    // restarts. Does not return.
+    // Detaches from USB, sets the target's download-boot flag and restarts.
+    // Does not return on the chips this library supports.
     device.rebootToBootloader();
-    // Only reached on a target with no such register, which none of the chips
-    // this library supports is.
     Serial.printf("REBOOT_UNSUPPORTED %s\n", device.lastErrorName());
   }
   delay(20);

@@ -27,6 +27,7 @@ enum class AudioFormatError : uint8_t {
   PacketTooLarge,
   BufferTooSmall,
   FormatCapacity,
+  NoMemory,
   DuplicateFormat,
 };
 
@@ -51,6 +52,9 @@ struct AudioPcmFormat {
   uint8_t channels = 0;
   uint8_t subslotBytes = 0;
   uint8_t validBits = 0;
+  bool samePcm(const AudioPcmFormat &other) const {
+    return channels == other.channels && subslotBytes == other.subslotBytes && validBits == other.validBits;
+  }
 };
 
 struct AudioPacketRequirement {
@@ -73,12 +77,20 @@ AudioFormatError validateAudioFormat(const AudioPcmFormat &format,
 
 class AudioStreamModel {
 public:
-  static constexpr size_t MAX_FORMATS = 8;
-
   explicit AudioStreamModel(AudioDirection direction);
+  ~AudioStreamModel();
+  AudioStreamModel(const AudioStreamModel &) = delete;
+  AudioStreamModel &operator=(const AudioStreamModel &) = delete;
 
   bool addFormat(const AudioPcmFormat &format, UsbSpeed speed,
                  const AudioBusLimits &limits);
+  void clearFormats();
+  bool hasUniformPcmFormat() const;
+  size_t alternateCount() const;
+  const AudioPcmFormat *alternateFormat(uint8_t alternate) const;
+  size_t alternateRateCount(uint8_t alternate) const;
+  size_t maximumFrameBytes() const;
+  bool hasCompleteRateSets() const;
   AudioDirection direction() const { return direction_; }
   size_t formatCount() const { return formatCount_; }
   const AudioPcmFormat *format(size_t index) const;
@@ -86,7 +98,7 @@ public:
 
 private:
   AudioDirection direction_;
-  AudioPcmFormat formats_[MAX_FORMATS] = {};
+  AudioPcmFormat *formats_ = nullptr;
   size_t formatCount_ = 0;
   AudioFormatError error_ = AudioFormatError::None;
 };

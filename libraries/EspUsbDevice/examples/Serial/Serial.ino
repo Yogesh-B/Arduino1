@@ -1,49 +1,48 @@
-#include "EspUsbDevice.h"
+// USB CDC ACM serial port: echoes characters, sends a periodic tick, and logs
+// the Host's line coding, DTR/RTS and break requests on the debug Serial.
+#include <EspUsbDevice.h>
 
 EspUsbDevice device;
-EspUsbDeviceCdcSerial UsbSerial(device);
+EspUsbDeviceCdcSerial usbSerial(device, "EspUsbDevice Serial");
 
-static uint32_t lastMessageMs = 0;
-static uint32_t lineCodingCount = 0;
-static uint32_t lineStateCount = 0;
+uint32_t lastTickMs = 0;
+// Written on the USB worker, read in loop().
+volatile uint32_t lineCodingCount = 0, lineStateCount = 0;
 
-static void printLineCoding(const EspUsbDeviceCdcLineCoding &coding)
-{
+void printLineCoding(const EspUsbDeviceCdcLineCoding &coding) {
   Serial.printf("CDC_LINE_CODING baud=%lu stop=%u parity=%u data=%u\n",
-                static_cast<unsigned long>(coding.baud),
-                coding.stopBits,
-                coding.parity,
-                coding.dataBits);
+      (unsigned long)coding.baud, coding.stopBits, coding.parity, coding.dataBits);
 }
 
-static void printLineState(const EspUsbDeviceCdcLineState &state)
-{
-  Serial.printf("CDC_LINE_STATE dtr=%u rts=%u\n",
-                state.dtr ? 1 : 0,
-                state.rts ? 1 : 0);
-}
-
-void setup()
-{
-  Serial.begin(115200);
+void setup() {
+  Serial.begin(115200);  // Debug port; separate from the USB CDC data port.
   delay(1500);
 
-  UsbSerial.onLineCoding([](const EspUsbDeviceCdcLineCoding &coding)
-                         {
-                           lineCodingCount++;
-                           printLineCoding(coding);
-                         });
-
-  UsbSerial.onLineState([](const EspUsbDeviceCdcLineState &state)
-                        {
-                          lineStateCount++;
-                          printLineState(state);
-                        });
-
-  UsbSerial.onRx([](size_t available)
-                 {
-                   Serial.printf("CDC_RX available=%u\n", static_cast<unsigned>(available));
-                 });
+  EspUsbBulkStreamConfig buffers;
+  buffers.rxCapacity = 256;
+  buffers.txCapacity = 1024;
+  // Callbacks run on the USB worker: keep them short, never block or end().
+  // Like configure(), they are accepted only while the device is stopped.
+  if (usbSerial.configure(buffers) != ESP_OK ||
+      usbSerial.onLineCoding([](const EspUsbDeviceCdcLineCoding &coding) {
+        lineCodingCount++;
+        printLineCoding(coding);
+      }) != ESP_OK ||
+      usbSerial.onLineState([](const EspUsbDeviceCdcLineState &state) {
+        lineStateCount++;
+        Serial.printf("CDC_LINE_STATE dtr=%u rts=%u\n", state.dtr, state.rts);
+      }) != ESP_OK ||
+      usbSerial.onBreak([](uint16_t durationMs) {
+        Serial.printf("CDC_BREAK duration=%u\n", durationMs);
+      }) != ESP_OK ||
+      usbSerial.onRx([](size_t available) {
+        Serial.printf("CDC_RX available=%u\n", unsigned(available));
+      }) != ESP_OK) {
+    Serial.println("CDC configuration rejected");
+    return;
+  }
+  // write()/flush() wait for room up to this limit (default 1000 ms).
+  usbSerial.setTxTimeoutMs(100);
 
   EspUsbDeviceConfig config;
   config.vid = 0x303a;
@@ -51,51 +50,39 @@ void setup()
   config.manufacturer = "EspUsb";
   config.product = "EspUsbDevice Serial";
   config.serialNumber = "espusb-serial";
-
-  if (!device.begin(config))
-  {
+  if (!device.begin(config)) {
     Serial.printf("USB_BEGIN_FAILED %s\n", device.lastErrorName());
     return;
   }
-
-  Serial.println("USB CDC serial ready");
+  Serial.printf("USB CDC serial ready rx=%u tx=%u\n",
+      unsigned(usbSerial.readCapacity()), unsigned(usbSerial.writeCapacity()));
 }
 
-void loop()
-{
-  while (UsbSerial.available() > 0)
-  {
-    const int value = UsbSerial.read();
-    if (value < 0)
-    {
-      break;
-    }
-
-    const char c = static_cast<char>(value);
-    if (c == '\r')
-    {
+void loop() {
+  // Bytes arrive as a stream; a line or packet boundary is not preserved.
+  while (usbSerial.available() > 0) {
+    const int value = usbSerial.read();
+    if (value < 0) break;
+    const char c = char(value);
+    if (c == '\r') continue;
+    if (c == '\n') {
+      usbSerial.print("\r\n");
       continue;
     }
-    if (c == '\n')
-    {
-      UsbSerial.print("\r\n");
-      continue;
-    }
-    UsbSerial.print("echo: ");
-    UsbSerial.write(static_cast<uint8_t>(c));
-    UsbSerial.print("\r\n");
+    usbSerial.print("echo: ");
+    usbSerial.write(uint8_t(c));
+    usbSerial.print("\r\n");
   }
 
   const uint32_t now = millis();
-  if (UsbSerial.connected() && now - lastMessageMs >= 3000)
-  {
-    lastMessageMs = now;
-    UsbSerial.printf("tick=%lu line_coding=%lu line_state=%lu\r\n",
-                     static_cast<unsigned long>(now / 1000),
-                     static_cast<unsigned long>(lineCodingCount),
-                     static_cast<unsigned long>(lineStateCount));
-    UsbSerial.flush();
+  // connected() means configured and DTR=1 (a terminal has the port open).
+  if (usbSerial.connected() && now - lastTickMs >= 3000) {
+    lastTickMs = now;
+    const EspUsbDeviceCdcLineCoding coding = usbSerial.lineCoding();  // a copy
+    usbSerial.printf("tick=%lu baud=%lu line_coding=%lu line_state=%lu\r\n",
+        (unsigned long)(now / 1000), (unsigned long)coding.baud,
+        (unsigned long)lineCodingCount, (unsigned long)lineStateCount);
+    usbSerial.flush();  // Waits for the DMA/ZLP, not for the PC application.
   }
-
   delay(1);
 }

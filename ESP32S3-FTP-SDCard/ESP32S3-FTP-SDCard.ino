@@ -1,6 +1,7 @@
 /*
  * ESP32-S3 FTP Server with MicroSD Card (SPI)
- * 
+ * + Web Configuration Portal at 192.168.4.1
+ *
  * Board:  ESP32-S3-N16R8 (16MB Flash, 8MB PSRAM)
  * SD Card: 64GB exFAT via SPI-connected MicroSD module
  *
@@ -16,90 +17,80 @@
  *
  * NOTE: GPIOs 26-37 are reserved for PSRAM/Flash on N16R8 — do NOT use them.
  *
- * Dependencies: None beyond ESP32 Arduino Core 3.x (which supports exFAT).
+ * Dependencies: None beyond ESP32 Arduino Core 3.x (WebServer, Preferences,
+ *               WiFi, SD, SPI all included in the core).
  *
- * Usage:
- *   1. Update WiFi credentials below (or leave AP mode enabled).
- *   2. Upload to ESP32-S3.
- *   3. Connect with any FTP client to the ESP32's IP on port 21.
- *      Default credentials: esp32 / esp32ftp
+ * First boot / AP mode:
+ *   1. Connect to WiFi SSID "ESP32-FTP" (password: 12345678)
+ *   2. Open browser → http://192.168.4.1
+ *   3. Configure WiFi/FTP credentials and save.
+ *   4. Connect FTP client to ESP32 IP, port 21.
  */
 
 #include <WiFi.h>
 #include <SD.h>
 #include <SPI.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
 
-// ─────────────────────────── Configuration ───────────────────────────
+// ─────────────────────────── SPI / FTP Constants ───────────────────────────
 
-// WiFi — Station mode (connect to your router)
-const char *WIFI_SSID     = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#define SD_CS           10
+#define SD_MOSI         11
+#define SD_SCK          12
+#define SD_MISO         13
 
-// Set to true to create an Access Point instead of joining a network
-#define USE_AP_MODE false
-const char *AP_SSID     = "ESP32-FTP";
-const char *AP_PASSWORD = "12345678";
-
-// FTP credentials
-const char *FTP_USER = "esp32";
-const char *FTP_PASS = "esp32ftp";
-
-// SPI pins for MicroSD card module on ESP32-S3
-#define SD_CS   10
-#define SD_MOSI 11
-#define SD_SCK  12
-#define SD_MISO 13
-
-// FTP data port range for PASV mode
 #define PASV_PORT_START 50000
 #define PASV_PORT_END   50009
+#define MAX_CLIENTS     2
+#define BUF_SIZE        4096
 
-// Maximum simultaneous FTP clients
-#define MAX_CLIENTS 2
+// ─────────────────────────── Runtime Settings (from Preferences) ───────────
 
-// Transfer buffer size (uses PSRAM if available)
-#define BUF_SIZE 4096
+bool   useAPMode;
+String apSSID, apPassword;
+String staSSID, staPassword;
+String ftpUser, ftpPass;
+String mdnsHost;
 
-// ─────────────────────────── FTP Client State ───────────────────────────
+// ─────────────────────────── Globals ───────────────────────────────────────
 
-enum FtpState {
-  FTP_IDLE,
-  FTP_WAIT_USER,
-  FTP_WAIT_PASS,
-  FTP_LOGGED_IN
-};
+bool      sdMounted = false;
+Preferences prefs;
+WebServer webServer(80);
+WiFiServer ftpServer(21);
+SPIClass  sdSPI(FSPI);
+uint8_t  *transferBuf = nullptr;
 
-enum FtpTransfer {
-  TRANS_NONE,
-  TRANS_LIST,
-  TRANS_NLST,
-  TRANS_RETR,
-  TRANS_STOR
-};
+// ─────────────────────────── FTP State ─────────────────────────────────────
+
+enum FtpState    { FTP_IDLE, FTP_WAIT_USER, FTP_WAIT_PASS, FTP_LOGGED_IN };
+enum FtpTransfer { TRANS_NONE, TRANS_LIST, TRANS_NLST, TRANS_RETR, TRANS_STOR };
 
 struct FtpClient {
-  WiFiClient    control;
-  WiFiClient    data;
-  WiFiServer   *dataServer;
-  FtpState      state;
-  FtpTransfer   transfer;
-  String        cwd;           // current working directory
-  String        renamePath;    // for RNFR/RNTO
-  File          file;          // open file for RETR/STOR
-  bool          typeBinary;
-  bool          dataConnActive;
-  uint16_t      dataPort;
+  WiFiClient  control;
+  WiFiClient  data;
+  WiFiServer *dataServer;
+  FtpState    state;
+  FtpTransfer transfer;
+  String      cwd;
+  String      renamePath;
+  File        file;
+  bool        typeBinary;
+  bool        dataConnActive;
+  uint16_t    dataPort;
 
   void reset() {
-    state         = FTP_WAIT_USER;
-    transfer      = TRANS_NONE;
-    cwd           = "/";
-    renamePath    = "";
-    typeBinary    = true;
+    state          = FTP_WAIT_USER;
+    transfer       = TRANS_NONE;
+    cwd            = "/";
+    renamePath     = "";
+    typeBinary     = true;
     dataConnActive = false;
-    dataPort      = 0;
-    if (file) file.close();
-    if (data)  data.stop();
+    dataPort       = 0;
+    if (file)       file.close();
+    if (data)       data.stop();
     if (dataServer) {
       dataServer->close();
       delete dataServer;
@@ -108,18 +99,185 @@ struct FtpClient {
   }
 };
 
-// ─────────────────────────── Globals ───────────────────────────
+FtpClient clients[MAX_CLIENTS];
+uint16_t  nextPasvPort = PASV_PORT_START;
 
-WiFiServer ftpServer(21);
-FtpClient  clients[MAX_CLIENTS];
-uint16_t   nextPasvPort = PASV_PORT_START;
-uint8_t   *transferBuf  = nullptr;
+// ─────────────────────────── Web Config Portal ─────────────────────────────
 
-SPIClass sdSPI(FSPI);   // Use FSPI (SPI2) on ESP32-S3
+static const char CONFIG_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S3 FTP Config</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;padding:20px}
+  h1{text-align:center;padding:20px 0;color:#e94560;font-size:1.6em}
+  .card{background:#16213e;border-radius:10px;padding:20px;margin:14px auto;max-width:480px;box-shadow:0 4px 15px rgba(0,0,0,.4)}
+  h3{color:#0f3460;background:#e94560;padding:8px 12px;border-radius:6px;margin:-20px -20px 16px;font-size:1em}
+  label{display:block;margin:12px 0 4px;font-size:.85em;color:#aaa}
+  input[type=text],input[type=password]{width:100%;padding:9px;border:1px solid #0f3460;border-radius:5px;background:#0d1b2a;color:#eee;font-size:.95em}
+  .row{display:flex;gap:16px;margin:10px 0}
+  .row label{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.95em;color:#ccc}
+  .badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:.8em;font-weight:bold}
+  .ok{background:#1b5e20;color:#a5d6a7}.err{background:#b71c1c;color:#ef9a9a}
+  button{width:100%;padding:12px;background:#e94560;color:white;border:none;border-radius:6px;font-size:1em;cursor:pointer;margin-top:8px;transition:background .2s}
+  button:hover{background:#c73652}
+  .info{font-size:.8em;color:#888;margin-top:6px}
+  .sep{border:none;border-top:1px solid #0f3460;margin:14px 0}
+</style>
+</head>
+<body>
+<h1>🛜 ESP32-S3 FTP Server</h1>
 
-// ─────────────────────────── Helpers ───────────────────────────
+<div class="card">
+  <h3>📊 Status</h3>
+  <p>SD Card: <span class="badge %SD_CLASS%">%SD_STATUS%</span></p>
+  <p style="margin-top:8px">Mode: <span class="badge ok">%WIFI_MODE%</span></p>
+  <p style="margin-top:8px">IP: <b>%WIFI_IP%</b> &nbsp;|&nbsp; Hostname: <b>%MDNS_HOST%.local</b></p>
+  %SD_DETAIL%
+</div>
 
-// Resolve a path argument relative to the client's CWD
+<form action="/save" method="POST">
+<div class="card">
+  <h3>📡 WiFi Mode</h3>
+  <div class="row">
+    <label><input type="radio" name="mode" value="ap" %AP_CHK%> Access Point (AP)</label>
+    <label><input type="radio" name="mode" value="sta" %STA_CHK%> Station (join router)</label>
+  </div>
+  <hr class="sep">
+  <b style="color:#e94560;font-size:.85em">ACCESS POINT</b>
+  <label>SSID</label>
+  <input type="text" name="ap_ssid" value="%AP_SSID%" maxlength="32">
+  <label>Password <span class="info">(min 8 characters)</span></label>
+  <input type="password" name="ap_pass" value="%AP_PASS%" maxlength="64">
+  <hr class="sep">
+  <b style="color:#e94560;font-size:.85em">STATION (ROUTER)</b>
+  <label>SSID</label>
+  <input type="text" name="sta_ssid" value="%STA_SSID%" maxlength="32">
+  <label>Password</label>
+  <input type="password" name="sta_pass" value="%STA_PASS%" maxlength="64">
+</div>
+
+<div class="card">
+  <h3>🔐 FTP Credentials</h3>
+  <label>Username</label>
+  <input type="text" name="ftp_user" value="%FTP_USER%" maxlength="32">
+  <label>Password</label>
+  <input type="password" name="ftp_pass" value="%FTP_PASS%" maxlength="64">
+  <hr class="sep">
+  <label>Device Hostname <span class="info">(.local — use instead of IP address)</span></label>
+  <input type="text" name="mdns" value="%MDNS_HOST%" maxlength="32" pattern="[a-zA-Z0-9\-]+" title="Letters, numbers and hyphens only">
+  <p class="info" style="margin-top:6px">📂 FTP: <b>ftp://%MDNS_HOST%.local</b> &nbsp;|&nbsp; 🌐 Web: <b>http://%MDNS_HOST%.local</b></p>
+</div>
+
+<div style="max-width:480px;margin:0 auto">
+  <button type="submit">💾 Save &amp; Restart</button>
+</div>
+</form>
+
+<p style="text-align:center;margin-top:20px;font-size:.75em;color:#555">ESP32-S3 FTP Server &mdash; Arduino Core 3.x</p>
+</body>
+</html>
+)rawliteral";
+
+static const char SAVED_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="4;url=/">
+<title>Saved</title>
+<style>body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center}
+.box{background:#16213e;padding:40px;border-radius:12px}h2{color:#e94560}p{color:#aaa;margin-top:12px}</style>
+</head>
+<body>
+<div class="box">
+  <h2>✅ Settings Saved!</h2>
+  <p>Device is restarting…</p>
+  <p style="font-size:.8em;margin-top:20px">Redirecting in 4 s</p>
+</div>
+</body>
+</html>
+)rawliteral";
+
+// ── Load settings from NVS Preferences ──────────────────────────────────────
+void loadPrefs() {
+  prefs.begin("ftpcfg", false);
+  useAPMode   = prefs.getBool  ("ap_mode",  true);
+  apSSID      = prefs.getString("ap_ssid",  "ESP32-FTP");
+  apPassword  = prefs.getString("ap_pass",  "12345678");
+  staSSID     = prefs.getString("sta_ssid", "");
+  staPassword = prefs.getString("sta_pass", "");
+  ftpUser     = prefs.getString("ftp_user", "esp32");
+  ftpPass     = prefs.getString("ftp_pass", "esp32ftp");
+  mdnsHost    = prefs.getString("mdns",     "esp32ftp");
+}
+
+// ── Build the config page with live values ───────────────────────────────────
+String buildPage() {
+  String html = FPSTR(CONFIG_HTML);
+
+  if (sdMounted) {
+    html.replace("%SD_CLASS%",  "ok");
+    html.replace("%SD_STATUS%", "Mounted ✓");
+    String detail = "<p class='info' style='margin-top:8px'>Size: "
+                  + String((unsigned long)(SD.cardSize() / (1024*1024))) + " MB &nbsp;|&nbsp; Used: "
+                  + String((unsigned long)(SD.usedBytes() / (1024*1024))) + " MB</p>";
+    html.replace("%SD_DETAIL%", detail);
+  } else {
+    html.replace("%SD_CLASS%",  "err");
+    html.replace("%SD_STATUS%", "Not Mounted ✗");
+    html.replace("%SD_DETAIL%", "<p class='info' style='margin-top:8px;color:#ef9a9a'>Check SD card wiring &amp; format (FAT32/exFAT)</p>");
+  }
+
+  html.replace("%WIFI_MODE%", useAPMode ? "Access Point" : "Station");
+  html.replace("%WIFI_IP%",   useAPMode
+                                ? WiFi.softAPIP().toString()
+                                : WiFi.localIP().toString());
+
+  html.replace("%AP_CHK%",   useAPMode ? "checked" : "");
+  html.replace("%STA_CHK%",  useAPMode ? "" : "checked");
+  html.replace("%AP_SSID%",  apSSID);
+  html.replace("%AP_PASS%",  apPassword);
+  html.replace("%STA_SSID%", staSSID);
+  html.replace("%STA_PASS%", staPassword);
+  html.replace("%FTP_USER%", ftpUser);
+  html.replace("%FTP_PASS%", ftpPass);
+  html.replace("%MDNS_HOST%", mdnsHost);
+  return html;
+}
+
+void handleRoot() {
+  webServer.send(200, "text/html", buildPage());
+}
+
+void handleSave() {
+  if (webServer.hasArg("mode"))     prefs.putBool  ("ap_mode",  webServer.arg("mode") == "ap");
+  if (webServer.hasArg("ap_ssid")) prefs.putString("ap_ssid",  webServer.arg("ap_ssid"));
+  if (webServer.hasArg("ap_pass")) prefs.putString("ap_pass",  webServer.arg("ap_pass"));
+  if (webServer.hasArg("sta_ssid"))prefs.putString("sta_ssid", webServer.arg("sta_ssid"));
+  if (webServer.hasArg("sta_pass"))prefs.putString("sta_pass", webServer.arg("sta_pass"));
+  if (webServer.hasArg("ftp_user"))prefs.putString("ftp_user", webServer.arg("ftp_user"));
+  if (webServer.hasArg("ftp_pass"))prefs.putString("ftp_pass", webServer.arg("ftp_pass"));
+  if (webServer.hasArg("mdns"))    prefs.putString("mdns",     webServer.arg("mdns"));
+
+  Serial.println("[Web] Settings saved — restarting...");
+  webServer.send(200, "text/html", FPSTR(SAVED_HTML));
+  delay(600);
+  ESP.restart();
+}
+
+void handleNotFound() {
+  webServer.sendHeader("Location", "/", true);
+  webServer.send(302, "text/plain", "");
+}
+
+// ─────────────────────────── FTP Helpers ───────────────────────────────────
+
 String resolvePath(const String &cwd, const String &arg) {
   String path;
   if (arg.length() == 0) {
@@ -132,41 +290,29 @@ String resolvePath(const String &cwd, const String &arg) {
     path += arg;
   }
 
-  // Normalize: collapse "//", resolve ".."
-  String result;
-  int len = path.length();
-  // Split by '/' and rebuild
   String parts[32];
-  int depth = 0;
-  int start = 0;
+  int depth = 0, start = 0, len = path.length();
   for (int i = 0; i <= len; i++) {
     if (i == len || path[i] == '/') {
       String seg = path.substring(start, i);
       start = i + 1;
       if (seg == "" || seg == ".") continue;
-      if (seg == "..") {
-        if (depth > 0) depth--;
-        continue;
-      }
+      if (seg == "..") { if (depth > 0) depth--; continue; }
       if (depth < 32) parts[depth++] = seg;
     }
   }
   if (depth == 0) return "/";
-  result = "";
-  for (int i = 0; i < depth; i++) {
-    result += "/" + parts[i];
-  }
+  String result;
+  for (int i = 0; i < depth; i++) result += "/" + parts[i];
   return result;
 }
 
-// Format a file entry for LIST (Unix ls -l style)
 String formatListEntry(File &entry) {
   String name = entry.name();
-  // Strip leading path — just the basename
   int lastSlash = name.lastIndexOf('/');
   if (lastSlash >= 0) name = name.substring(lastSlash + 1);
 
-  char line[256];
+  char line[280];
   if (entry.isDirectory()) {
     snprintf(line, sizeof(line),
              "drwxr-xr-x 1 esp32 esp32 %10u Jan  1  2025 %s\r\n",
@@ -179,10 +325,8 @@ String formatListEntry(File &entry) {
   return String(line);
 }
 
-// Allocate next PASV port (round-robin)
 uint16_t allocPasvPort() {
-  uint16_t p = nextPasvPort;
-  nextPasvPort++;
+  uint16_t p = nextPasvPort++;
   if (nextPasvPort > PASV_PORT_END) nextPasvPort = PASV_PORT_START;
   return p;
 }
@@ -194,23 +338,18 @@ void sendReply(FtpClient &c, int code, const char *msg) {
   snprintf(buf, sizeof(buf), "%d %s\r\n", code, msg);
   c.control.print(buf);
 }
-
 void sendReply(FtpClient &c, int code, const String &msg) {
   sendReply(c, code, msg.c_str());
 }
 
 bool openDataConnection(FtpClient &c) {
-  if (c.dataServer) {
-    // PASV mode — wait briefly for client to connect
-    unsigned long start = millis();
-    while (!c.dataServer->hasClient() && millis() - start < 5000) {
-      delay(1);
-    }
-    if (c.dataServer->hasClient()) {
-      c.data = c.dataServer->accept();
-      c.dataConnActive = true;
-      return true;
-    }
+  if (!c.dataServer) return false;
+  unsigned long start = millis();
+  while (!c.dataServer->hasClient() && millis() - start < 5000) delay(1);
+  if (c.dataServer->hasClient()) {
+    c.data = c.dataServer->accept();
+    c.dataConnActive = true;
+    return true;
   }
   return false;
 }
@@ -226,35 +365,21 @@ void closeDataConnection(FtpClient &c) {
 }
 
 void handleCommand(FtpClient &c, const String &line) {
-  // Parse command and argument
   String cmd, arg;
   int sp = line.indexOf(' ');
-  if (sp > 0) {
-    cmd = line.substring(0, sp);
-    arg = line.substring(sp + 1);
-    arg.trim();
-  } else {
-    cmd = line;
-  }
+  if (sp > 0) { cmd = line.substring(0, sp); arg = line.substring(sp + 1); arg.trim(); }
+  else         { cmd = line; }
   cmd.toUpperCase();
 
-  // ── Pre-auth commands ──
+  // ── Pre-auth ──────────────────────────────────────────────────────────────
   if (cmd == "USER") {
-    if (arg == FTP_USER) {
-      c.state = FTP_WAIT_PASS;
-      sendReply(c, 331, "Password required");
-    } else {
-      sendReply(c, 530, "Unknown user");
-    }
+    if (arg == ftpUser) { c.state = FTP_WAIT_PASS; sendReply(c, 331, "Password required"); }
+    else                { sendReply(c, 530, "Unknown user"); }
     return;
   }
-
   if (cmd == "PASS") {
-    if (c.state != FTP_WAIT_PASS) {
-      sendReply(c, 503, "Login with USER first");
-      return;
-    }
-    if (arg == FTP_PASS) {
+    if (c.state != FTP_WAIT_PASS) { sendReply(c, 503, "Login with USER first"); return; }
+    if (arg == ftpPass) {
       c.state = FTP_LOGGED_IN;
       sendReply(c, 230, "Login successful");
       Serial.println("[FTP] Client logged in");
@@ -264,118 +389,75 @@ void handleCommand(FtpClient &c, const String &line) {
     }
     return;
   }
+  if (cmd == "QUIT") { sendReply(c, 221, "Goodbye"); c.control.stop(); return; }
+  if (c.state != FTP_LOGGED_IN) { sendReply(c, 530, "Please login first"); return; }
 
-  if (cmd == "QUIT") {
-    sendReply(c, 221, "Goodbye");
-    c.control.stop();
-    return;
-  }
-
-  // Everything below requires login
-  if (c.state != FTP_LOGGED_IN) {
-    sendReply(c, 530, "Please login first");
-    return;
-  }
-
-  // ── System / Feature commands ──
-  if (cmd == "SYST") {
-    sendReply(c, 215, "UNIX Type: L8");
-  }
+  // ── System ────────────────────────────────────────────────────────────────
+  if      (cmd == "SYST") { sendReply(c, 215, "UNIX Type: L8"); }
   else if (cmd == "FEAT") {
-    c.control.print("211-Features:\r\n");
-    c.control.print(" SIZE\r\n");
-    c.control.print(" PASV\r\n");
-    c.control.print(" UTF8\r\n");
-    c.control.print("211 End\r\n");
+    c.control.print("211-Features:\r\n SIZE\r\n PASV\r\n UTF8\r\n211 End\r\n");
   }
   else if (cmd == "OPTS") {
-    if (arg.startsWith("UTF8")) {
-      sendReply(c, 200, "UTF8 set to on");
-    } else {
-      sendReply(c, 501, "Option not understood");
-    }
+    sendReply(c, arg.startsWith("UTF8") ? 200 : 501,
+              arg.startsWith("UTF8") ? "UTF8 set to on" : "Option not understood");
   }
-  else if (cmd == "NOOP") {
-    sendReply(c, 200, "OK");
-  }
+  else if (cmd == "NOOP") { sendReply(c, 200, "OK"); }
   else if (cmd == "TYPE") {
-    if (arg == "I") {
-      c.typeBinary = true;
-      sendReply(c, 200, "Type set to I (binary)");
-    } else if (arg == "A") {
-      c.typeBinary = false;
-      sendReply(c, 200, "Type set to A (ASCII)");
-    } else {
-      sendReply(c, 504, "Type not supported");
-    }
+    if      (arg == "I") { c.typeBinary = true;  sendReply(c, 200, "Type set to I (binary)"); }
+    else if (arg == "A") { c.typeBinary = false; sendReply(c, 200, "Type set to A (ASCII)"); }
+    else                 { sendReply(c, 504, "Type not supported"); }
   }
 
-  // ── Directory navigation ──
+  // ── Directory navigation ──────────────────────────────────────────────────
   else if (cmd == "PWD" || cmd == "XPWD") {
-    String reply = "\"" + c.cwd + "\" is current directory";
-    sendReply(c, 257, reply);
+    sendReply(c, 257, "\"" + c.cwd + "\" is current directory");
   }
   else if (cmd == "CWD" || cmd == "XCWD") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
     File dir = SD.open(path);
     if (dir && dir.isDirectory()) {
-      c.cwd = path;
-      sendReply(c, 250, "Directory changed to " + c.cwd);
-      dir.close();
+      c.cwd = path; sendReply(c, 250, "Directory changed to " + c.cwd); dir.close();
     } else {
-      sendReply(c, 550, "Directory not found");
-      if (dir) dir.close();
+      sendReply(c, 550, "Directory not found"); if (dir) dir.close();
     }
   }
   else if (cmd == "CDUP" || cmd == "XCUP") {
-    c.cwd = resolvePath(c.cwd, "..");
-    sendReply(c, 250, "Directory changed to " + c.cwd);
+    c.cwd = resolvePath(c.cwd, ".."); sendReply(c, 250, "Directory changed to " + c.cwd);
   }
 
-  // ── PASV mode ──
+  // ── PASV ─────────────────────────────────────────────────────────────────
   else if (cmd == "PASV") {
-    // Close any existing data listener
-    if (c.dataServer) {
-      c.dataServer->close();
-      delete c.dataServer;
-    }
+    if (c.dataServer) { c.dataServer->close(); delete c.dataServer; }
     uint16_t port = allocPasvPort();
-    c.dataPort = port;
+    c.dataPort   = port;
     c.dataServer = new WiFiServer(port);
     c.dataServer->begin();
 
-    IPAddress ip = WiFi.localIP();
-    if (USE_AP_MODE) ip = WiFi.softAPIP();
-
+    IPAddress ip = useAPMode ? WiFi.softAPIP() : WiFi.localIP();
     char buf[80];
     snprintf(buf, sizeof(buf),
              "Entering Passive Mode (%d,%d,%d,%d,%d,%d)",
-             ip[0], ip[1], ip[2], ip[3],
-             port >> 8, port & 0xFF);
+             ip[0], ip[1], ip[2], ip[3], port >> 8, port & 0xFF);
     sendReply(c, 227, buf);
   }
 
-  // ── LIST / NLST ──
+  // ── LIST / NLST ──────────────────────────────────────────────────────────
   else if (cmd == "LIST" || cmd == "NLST") {
-    String path = resolvePath(c.cwd, arg);
-    // Remove -la or similar flags from arg
-    if (path.startsWith("-")) path = c.cwd;
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
+    String path = resolvePath(c.cwd, arg.startsWith("-") ? "" : arg);
 
     File dir = SD.open(path);
     if (!dir || !dir.isDirectory()) {
-      sendReply(c, 550, "Directory not found");
-      if (dir) dir.close();
-      return;
+      sendReply(c, 550, "Directory not found"); if (dir) dir.close(); return;
     }
 
     sendReply(c, 150, "Opening data connection for directory list");
-
     if (!openDataConnection(c)) {
-      sendReply(c, 425, "Cannot open data connection");
-      dir.close();
-      return;
+      sendReply(c, 425, "Cannot open data connection"); dir.close(); return;
     }
 
+    int count = 0;
     File entry = dir.openNextFile();
     while (entry) {
       if (cmd == "LIST") {
@@ -386,247 +468,228 @@ void handleCommand(FtpClient &c, const String &line) {
         if (sl >= 0) name = name.substring(sl + 1);
         c.data.print(name + "\r\n");
       }
+      count++;
       entry.close();
       entry = dir.openNextFile();
     }
     dir.close();
-
     closeDataConnection(c);
+    Serial.printf("[FTP] LIST sent %d entries\n", count);
     sendReply(c, 226, "Directory listing complete");
   }
 
-  // ── SIZE ──
+  // ── SIZE ─────────────────────────────────────────────────────────────────
   else if (cmd == "SIZE") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
     File f = SD.open(path);
-    if (f && !f.isDirectory()) {
-      sendReply(c, 213, String((unsigned long)f.size()));
-      f.close();
-    } else {
-      sendReply(c, 550, "File not found");
-      if (f) f.close();
-    }
+    if (f && !f.isDirectory()) { sendReply(c, 213, String((unsigned long)f.size())); f.close(); }
+    else                       { sendReply(c, 550, "File not found"); if (f) f.close(); }
   }
 
-  // ── RETR (download) ──
+  // ── RETR (download) ──────────────────────────────────────────────────────
   else if (cmd == "RETR") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
     File f = SD.open(path, FILE_READ);
     if (!f || f.isDirectory()) {
-      sendReply(c, 550, "File not found");
-      if (f) f.close();
-      return;
+      sendReply(c, 550, "File not found"); if (f) f.close(); return;
     }
 
     sendReply(c, 150, "Opening data connection for " + arg +
               " (" + String((unsigned long)f.size()) + " bytes)");
-
     if (!openDataConnection(c)) {
-      sendReply(c, 425, "Cannot open data connection");
-      f.close();
-      return;
+      sendReply(c, 425, "Cannot open data connection"); f.close(); return;
     }
 
-    Serial.printf("[FTP] RETR %s (%lu bytes)\n", path.c_str(),
-                  (unsigned long)f.size());
-
+    Serial.printf("[FTP] RETR %s (%lu bytes)\n", path.c_str(), (unsigned long)f.size());
     unsigned long sent = 0;
     while (f.available()) {
       int n = f.read(transferBuf, BUF_SIZE);
       if (n <= 0) break;
       c.data.write(transferBuf, n);
       sent += n;
-      yield();   // feed watchdog
-    }
-    f.close();
-    closeDataConnection(c);
-
-    Serial.printf("[FTP] Sent %lu bytes\n", sent);
-    sendReply(c, 226, "Transfer complete");
-  }
-
-  // ── STOR (upload) ──
-  else if (cmd == "STOR") {
-    String path = resolvePath(c.cwd, arg);
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) {
-      sendReply(c, 550, "Cannot create file");
-      return;
-    }
-
-    sendReply(c, 150, "Opening data connection for upload");
-
-    if (!openDataConnection(c)) {
-      sendReply(c, 425, "Cannot open data connection");
-      f.close();
-      return;
-    }
-
-    Serial.printf("[FTP] STOR %s\n", path.c_str());
-
-    unsigned long received = 0;
-    while (c.data.connected() || c.data.available()) {
-      if (c.data.available()) {
-        int n = c.data.read(transferBuf, BUF_SIZE);
-        if (n > 0) {
-          f.write(transferBuf, n);
-          received += n;
-        }
-      } else {
-        delay(1);
-      }
       yield();
     }
     f.close();
     closeDataConnection(c);
+    Serial.printf("[FTP] Sent %lu bytes\n", sent);
+    sendReply(c, 226, "Transfer complete");
+  }
 
+  // ── STOR (upload) ────────────────────────────────────────────────────────
+  else if (cmd == "STOR") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
+    String path = resolvePath(c.cwd, arg);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { sendReply(c, 550, "Cannot create file"); return; }
+
+    sendReply(c, 150, "Opening data connection for upload");
+    if (!openDataConnection(c)) {
+      sendReply(c, 425, "Cannot open data connection"); f.close(); return;
+    }
+
+    Serial.printf("[FTP] STOR %s\n", path.c_str());
+    unsigned long received = 0;
+    while (c.data.connected() || c.data.available()) {
+      if (c.data.available()) {
+        int n = c.data.read(transferBuf, BUF_SIZE);
+        if (n > 0) { f.write(transferBuf, n); received += n; }
+      } else { delay(1); }
+      yield();
+    }
+    f.close();
+    closeDataConnection(c);
     Serial.printf("[FTP] Received %lu bytes\n", received);
     sendReply(c, 226, "Transfer complete");
   }
 
-  // ── DELE (delete file) ──
+  // ── DELE ─────────────────────────────────────────────────────────────────
   else if (cmd == "DELE") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
-    if (SD.remove(path.c_str())) {
-      sendReply(c, 250, "File deleted");
-    } else {
-      sendReply(c, 550, "Delete failed");
-    }
+    sendReply(c, SD.remove(path.c_str()) ? 250 : 550,
+              SD.remove(path.c_str()) ? "File deleted" : "Delete failed");
   }
 
-  // ── MKD (make directory) ──
+  // ── MKD ──────────────────────────────────────────────────────────────────
   else if (cmd == "MKD" || cmd == "XMKD") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
-    if (SD.mkdir(path.c_str())) {
-      sendReply(c, 257, "\"" + path + "\" directory created");
-    } else {
-      sendReply(c, 550, "Cannot create directory");
-    }
+    if (SD.mkdir(path.c_str())) sendReply(c, 257, "\"" + path + "\" directory created");
+    else                        sendReply(c, 550, "Cannot create directory");
   }
 
-  // ── RMD (remove directory) ──
+  // ── RMD ──────────────────────────────────────────────────────────────────
   else if (cmd == "RMD" || cmd == "XRMD") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
-    if (SD.rmdir(path.c_str())) {
-      sendReply(c, 250, "Directory removed");
-    } else {
-      sendReply(c, 550, "Cannot remove directory");
-    }
+    sendReply(c, SD.rmdir(path.c_str()) ? 250 : 550,
+              SD.rmdir(path.c_str()) ? "Directory removed" : "Cannot remove directory");
   }
 
-  // ── RNFR / RNTO (rename) ──
+  // ── RNFR / RNTO ──────────────────────────────────────────────────────────
   else if (cmd == "RNFR") {
+    if (!sdMounted) { sendReply(c, 550, "SD card not mounted"); return; }
     String path = resolvePath(c.cwd, arg);
     File f = SD.open(path);
-    if (f) {
-      c.renamePath = path;
-      f.close();
-      sendReply(c, 350, "Ready for destination name");
-    } else {
-      sendReply(c, 550, "File not found");
-    }
+    if (f) { c.renamePath = path; f.close(); sendReply(c, 350, "Ready for destination name"); }
+    else   { sendReply(c, 550, "File not found"); }
   }
   else if (cmd == "RNTO") {
-    if (c.renamePath.length() == 0) {
-      sendReply(c, 503, "RNFR required first");
-      return;
-    }
+    if (c.renamePath.length() == 0) { sendReply(c, 503, "RNFR required first"); return; }
     String path = resolvePath(c.cwd, arg);
-    if (SD.rename(c.renamePath.c_str(), path.c_str())) {
-      sendReply(c, 250, "Renamed OK");
-    } else {
-      sendReply(c, 550, "Rename failed");
-    }
+    sendReply(c, SD.rename(c.renamePath.c_str(), path.c_str()) ? 250 : 550,
+              SD.rename(c.renamePath.c_str(), path.c_str()) ? "Renamed OK" : "Rename failed");
     c.renamePath = "";
   }
 
-  // ── Unsupported ──
   else {
     sendReply(c, 502, "Command not implemented");
     Serial.printf("[FTP] Unknown command: %s\n", cmd.c_str());
   }
 }
 
-// ─────────────────────────── Setup ───────────────────────────
+// ─────────────────────────── Setup ─────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n========================================");
-  Serial.println("  ESP32-S3 FTP Server + MicroSD Card");
+  Serial.println("  ESP32-S3 FTP Server + Web Config");
   Serial.println("========================================\n");
 
-  // ── Allocate transfer buffer (prefer PSRAM) ──
+  // ── Load saved settings ──────────────────────────────────────────────────
+  loadPrefs();
+  Serial.printf("[CFG] Mode: %s\n", useAPMode ? "AP" : "STA");
+  Serial.printf("[CFG] FTP user: %s\n", ftpUser.c_str());
+
+  // ── Allocate transfer buffer (prefer PSRAM) ──────────────────────────────
   if (psramFound()) {
     transferBuf = (uint8_t *)ps_malloc(BUF_SIZE);
-    Serial.printf("[MEM] PSRAM found: %u KB free. Buffer in PSRAM.\n",
-                  ESP.getFreePsram() / 1024);
+    Serial.printf("[MEM] PSRAM: %u KB free. Buffer in PSRAM.\n", ESP.getFreePsram() / 1024);
   } else {
     transferBuf = (uint8_t *)malloc(BUF_SIZE);
-    Serial.println("[MEM] No PSRAM, using internal RAM for buffer.");
+    Serial.println("[MEM] No PSRAM — buffer in internal RAM.");
   }
-  if (!transferBuf) {
-    Serial.println("[MEM] FATAL: cannot allocate transfer buffer!");
-    while (1) delay(1000);
-  }
+  if (!transferBuf) { Serial.println("[MEM] FATAL: cannot allocate buffer!"); while (1) delay(1000); }
 
-  // ── Init SD card over SPI ──
+  // ── Init SD card ─────────────────────────────────────────────────────────
   Serial.println("[SD]  Initializing SD card...");
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
-  if (!SD.begin(SD_CS, sdSPI, 40000000)) {  // 40 MHz SPI clock
-    Serial.println("[SD]  *** SD card mount FAILED! ***");
-    Serial.println("      Check wiring and card format (FAT32/exFAT).");
-    Serial.println("      ESP32 Arduino Core 3.x supports exFAT.");
-    while (1) delay(1000);
+  if (!SD.begin(SD_CS, sdSPI, 40000000)) {
+    Serial.println("[SD]  *** SD card mount FAILED ***");
+    Serial.println("      Check wiring and format (FAT32/exFAT).");
+    Serial.println("      FTP will work but all file operations will return errors.");
+    sdMounted = false;
+  } else {
+    sdMounted = true;
+    uint8_t cardType = SD.cardType();
+    const char *types[] = {"NONE", "MMC", "SD", "SDHC", "UNKNOWN"};
+    int ti = (cardType <= 3) ? cardType : 4;
+    Serial.printf("[SD]  Card type : %s\n", types[ti]);
+    Serial.printf("[SD]  Card size : %llu MB\n", SD.cardSize()  / (1024*1024));
+    Serial.printf("[SD]  Total     : %llu MB\n", SD.totalBytes()/ (1024*1024));
+    Serial.printf("[SD]  Used      : %llu MB\n", SD.usedBytes() / (1024*1024));
   }
 
-  uint8_t cardType = SD.cardType();
-  const char *types[] = {"NONE", "MMC", "SD", "SDHC", "UNKNOWN"};
-  int ti = (cardType <= 3) ? cardType : 4;
-  Serial.printf("[SD]  Card type: %s\n", types[ti]);
-  Serial.printf("[SD]  Card size: %llu MB\n", SD.cardSize() / (1024 * 1024));
-  Serial.printf("[SD]  Total:     %llu MB\n", SD.totalBytes() / (1024 * 1024));
-  Serial.printf("[SD]  Used:      %llu MB\n", SD.usedBytes() / (1024 * 1024));
-
-  // ── WiFi ──
-  if (USE_AP_MODE) {
-    Serial.printf("[WiFi] Starting Access Point: %s\n", AP_SSID);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+  // ── WiFi ─────────────────────────────────────────────────────────────────
+  if (useAPMode) {
+    Serial.printf("[WiFi] Starting AP: %s\n", apSSID.c_str());
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apSSID.c_str(), apPassword.c_str());
+    delay(500);
     Serial.printf("[WiFi] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
   } else {
-    Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+    Serial.printf("[WiFi] Connecting to %s", staSSID.c_str());
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    int timeout = 40;  // 20 seconds
-    while (WiFi.status() != WL_CONNECTED && timeout-- > 0) {
-      delay(500);
-      Serial.print(".");
-    }
+    WiFi.begin(staSSID.c_str(), staPassword.c_str());
+    int timeout = 40;
+    while (WiFi.status() != WL_CONNECTED && timeout-- > 0) { delay(500); Serial.print("."); }
     Serial.println();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] *** Connection FAILED! Restarting... ***");
-      ESP.restart();
+      Serial.println("[WiFi] *** Failed to connect! Falling back to AP mode ***");
+      useAPMode = true;
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(apSSID.c_str(), apPassword.c_str());
+      delay(500);
+      Serial.printf("[WiFi] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+    } else {
+      Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
     }
-    Serial.printf("[WiFi] Connected! IP: %s\n",
-                  WiFi.localIP().toString().c_str());
   }
 
-  // ── Start FTP server ──
-  ftpServer.begin();
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    clients[i].dataServer = nullptr;
-    clients[i].reset();
+  // ── Web server ───────────────────────────────────────────────────────────
+  if (MDNS.begin(mdnsHost.c_str())) {
+    MDNS.addService("ftp",  "tcp", 21);
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("[mDNS] Hostname: %s.local\n", mdnsHost.c_str());
+  } else {
+    Serial.println("[mDNS] Failed to start — use IP address instead");
   }
-  Serial.println("\n[FTP] Server started on port 21");
-  Serial.printf("[FTP] Login: %s / %s\n", FTP_USER, FTP_PASS);
-  Serial.println("[FTP] Ready for connections!\n");
+
+  webServer.on("/",        HTTP_GET,  handleRoot);
+  webServer.on("/save",    HTTP_POST, handleSave);
+  webServer.onNotFound(handleNotFound);
+  webServer.begin();
+  Serial.println("[Web] Config portal at http://" +
+                 (useAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()));
+
+  // ── FTP server ───────────────────────────────────────────────────────────
+  ftpServer.begin();
+  for (int i = 0; i < MAX_CLIENTS; i++) { clients[i].dataServer = nullptr; clients[i].reset(); }
+  Serial.println("[FTP] Server started on port 21");
+  Serial.printf("[FTP] Login: %s / %s\n", ftpUser.c_str(), ftpPass.c_str());
+  Serial.println("[FTP] Ready!\n");
 }
 
-// ─────────────────────────── Loop ───────────────────────────
+// ─────────────────────────── Loop ──────────────────────────────────────────
 
 void loop() {
-  // ── Accept new control connections ──
+  webServer.handleClient();
+
+  // ── Accept new FTP connections ───────────────────────────────────────────
   if (ftpServer.hasClient()) {
     WiFiClient newClient = ftpServer.accept();
     bool accepted = false;
@@ -642,12 +705,12 @@ void loop() {
       }
     }
     if (!accepted) {
-      newClient.println("421 Server busy, max clients reached\r\n");
+      newClient.println("421 Server busy\r");
       newClient.stop();
     }
   }
 
-  // ── Process each client ──
+  // ── Process FTP clients ──────────────────────────────────────────────────
   for (int i = 0; i < MAX_CLIENTS; i++) {
     FtpClient &c = clients[i];
     if (!c.control || !c.control.connected()) {
@@ -659,22 +722,18 @@ void loop() {
       continue;
     }
 
-    // Read and process commands (one line at a time)
     if (c.control.available()) {
       String line = c.control.readStringUntil('\n');
       line.trim();
       if (line.length() > 0) {
-        // Don't log passwords
-        if (line.startsWith("PASS") || line.startsWith("pass")) {
+        if (line.startsWith("PASS") || line.startsWith("pass"))
           Serial.printf("[FTP] Client %d -> PASS ****\n", i);
-        } else {
+        else
           Serial.printf("[FTP] Client %d -> %s\n", i, line.c_str());
-        }
         handleCommand(c, line);
       }
     }
   }
 
-  delay(1);  // small yield
+  delay(1);
 }
-

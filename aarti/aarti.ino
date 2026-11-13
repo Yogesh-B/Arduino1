@@ -18,7 +18,7 @@ const int BUZZER_PIN = 7;
 // =========================================================================
 // VOLUME SETTING  (1 = whisper quiet, 100 = full blast)
 // =========================================================================
-int VOLUME = 20;
+int VOLUME = 100;
 
 const bool ENABLE_TEMPLE_BELL = true;
 
@@ -312,6 +312,6 @@ void setup() {
 }
 
 void loop() {
-  delay(5000);
+  delay(3000);
   playAartiTone();
 }

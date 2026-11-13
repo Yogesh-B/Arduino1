@@ -1,59 +1,93 @@
 # TODO
 
-更新日: 2026-09-16（UVC カメラ class を実装し Windows 実機で検証。あわせて isochronous IN の送信 FIFO 予算を `begin()` で検査するようにした）
+v3 の残作業の一覧です。各項目に「何をすれば完了か」を書きます。
+試験の仕組みは [tests/README.ja.md](tests/README.ja.md)、リリース手順は [docs/development/release.ja.md](docs/development/release.ja.md) にあります。
 
-## 未完了
+- ここに書いたことを、実装や検証が済んだ扱いにしません。
+- 別の機種や別の Host での成功を、その項目の代わりにしません。
 
-- [ ] （任意）P4 2台 HS peer 構成で HS の Audio を自動テスト化する。UAC2 自体は S3 の FS peer で検証済みなので、残るのは HS リンク上の isochronous packet サイズと interval の検証。
-- [ ] （検討）UAC2 で 1 方向あたり複数 sample rate を宣言できるようにする。現状 descriptor builder は 1 stream = 1 format 固定（`UnsupportedFormatCount`）で、Clock Source の `RANGE` は複数 subrange を返せる実装がありながら 1 つしか出せない。実装すれば peer テストで rate 切り替えも検証できる。
-- [ ] USBVendor の custom vendor code / GUID / Microsoft OS 2.0 descriptor 内容の差し替え API。構造の選択（`config.msOs20Layout`：interface 1 本なら flat 162 byte、2 本以上なら subsets 178 byte。Windows 実機で対照確認済み）は実装したが、vendor code・GUID・feature descriptor の中身は固定のまま。
-- [ ] WebUSB / libusb / WinUSB のサンプル Host 側コード（WebUSB ページ、libusb スクリプトなど）。手動確認手順自体は `tests/manual/README.ja.md` に整備済み（BOS / landing URL の確認、libusb / WinUSB / WebUSB での interface claim）。
-- [ ] OTA 経路の残り。設計・切り分け・実機で確認した事実は [docs/ota-over-usb.ja.md](docs/ota-over-usb.ja.md) に集約済み。DFU class / `rebootToBootloader()` / firmware sink は実装済み（下記「完了」参照）。残り:
-  - [ ] [wch-protocols](https://github.com/ch32-riscv-ug/wch-protocols) からの還元項目のうち F1〜F3（[`references/usb-library-feedback.ja.md`](https://github.com/ch32-riscv-ug/wch-protocols/blob/main/references/usb-library-feedback.ja.md)）。回答は [docs/CHANGE_REQUESTS.ja.md](docs/CHANGE_REQUESTS.ja.md) の第 2 回。D1〜D4 は実測して処理済み（下記「完了」）。残りは API 追加を伴うので設計から:
-    - [ ] F1 zero-copy TX: `CFG_TUD_VENDOR_TXRX_BUFFERED=0` のとき呼び出し側 buffer を直接 `usbd_edpt_xfer()` へ。完了まで所有権は呼び出し側。先方実測 209→247 Mbps、送出 core の task 負荷 57〜66%→7%
-    - [ ] F2 TX 完了 callback（完了 byte 数、usbd task context、callback 内から次 buffer 投入可）
-    - [ ] F3 non-buffered 時の direct RX callback（現在の `onRx(size)` は buffered 専用）
-    - いずれも buffered 既定の挙動は変えない方針。D1 と違って RAM と API 表面が増えるので、採否は自前の実測後に判断する
-  - [ ] （任意）`EspUsbDeviceDfu` を dfu-util 本体でも確認。PC 相手の end-to-end は P4 実機で確認済みだが、host 側は自前の pyusb DFU host（このマシンに dfu-util が未インストールで、導入は sudo が要る system 変更のため）。プロトコルは同じなので優先度は低い。
-  - [ ] `rebootToRomDfu()` の ESP32-S2 での確認。S3 では「`USB_PHY_SEL` eFuse が要る／未焼成なら拒否」まで実測して決着した（下記「完了」）。S2 は ROM の唯一の USB が OTG なので eFuse 不要のはずだが、リグに S2 が無いため未検証。
-- [ ] UVC（`EspUsbDeviceVideo`）の残り。Windows 11 で MJPEG と非圧縮 YUY2 のストリーミングまで実機検証済み（`tests/manual/windows_uvc`）。残っているのは:
-  - [ ] 複数 format / 複数 frame size の宣言。現状は 1 format・1 サイズ・1 レート固定で、ホストは選択の余地がない。**具体的な需要が出た**: EspUsbHost の UVC host は「必要最小限の alternate を選ぶ」選択ロジックを持つが、相手になるカメラが 1 format しか出さないので検証できない（2026-09-17、先方から）。複数 format・複数 alternate を出せるようになれば、そのロジックのペアテストが組める。descriptor builder は frame descriptor を配列で出せる形にすれば済むが、probe/commit で選ばれた frame index を sketch へ渡す経路（`onCommit()` は既にある）と、`sendFrame()` 側のサイズ検証をどう変えるかの設計が要る。
-  - [ ] P4 high speed での実機検証。FS（S3）は済んでいるが、HS では isochronous の packet size と FIFO 予算の計算が別経路（`transmitFifoFits(highSpeed=true)`）で、実機で通していない。P4 の native USB が PC に直結したリグが要る。
-  - [ ] macOS / Linux での確認。UVC は標準クラスなので動く見込みだが、測っていない。
-  - [ ] （任意）bulk streaming（`CFG_TUD_VIDEO_STREAMING_BULK=1`）の実機確認。descriptor は `tests/single/video_descriptor` が両形態を見ているが、bulk で実際に流したことはない。
-  - [ ] （検討）streaming interface の alternate を複数出せるようにする。**複数 format とは別の話**で、こちらはパケットサイズの違う alt 1 / alt 2 / ... を並べること。需要は EspUsbHost の `selectVideoAlternate()`（交渉した `dwMaxPayloadTransferSize` を賄える**最小の** alternate を選ぶ）と、high-bandwidth の段を「ESP-IDF 5.4 では使えない値」として格下げする分岐で、**alt が 1 段しかないとどちらも通りません**（2026-09-17、先方から）。実装上の注意が 1 つ: TinyUSB の `videod_open()` は `TUP_DCD_EDPT_ISO_ALLOC` の経路で streaming interface 内の isochronous endpoint を走査し、**最大のパケットサイズ 1 つで FIFO を確保**します（`ep_size = TU_MAX(...)`）。つまり alt を増やしても FIFO は最大値ぶん要り、S2/S3 の約 656 byte の天井はそのまま効きます。high-bandwidth（1 マイクロフレームに 2〜3 トランザクション）は high speed 限定なので P4 が要ります。
-  - [ ] （検討）`peer/` に UVC のテストを足す。現状 UVC の自動テストは `single/video_descriptor`（descriptor をホスト無しで走査）だけで、**実際に流れることを見ているのは `tests/manual/windows_uvc` の手動実行だけ**。EspUsbHost に UVC host 対応が入れば 2 台構成で自動化できる。先方が 2026-09-17 に `EspUsbDeviceVideo` を相手に 8/8 のペアテストを組んでいて、そのうち `camera_can_be_replugged_while_streaming`（ストリーミング中に `device.end()` → `begin()`）はこちらに無い観点。先方の実測では `armfail=0` で `sendFrame()` は一度も拒否されず、こちら側の欠陥は出ていない。
-  - [ ] （検討）frame descriptor を連続形式から離散形式へ。現状は `bFrameIntervalType = 0`、min = max = 宣言レート、`dwFrameIntervalStep = 0` の連続レンジで 1 レートを表している（38 byte）。離散 1 件なら 30 byte で、意味も「対応するのはこの 1 レートだけ」と正確になる。利点は 2 つ。(1) 256 byte の configuration descriptor に収まる解像度が 3 → 4 に増える（arduino-esp32 3.3.x の `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE` が 256 なので、ESP32 を host にする構成ではここが天井）。(2) **`dwFrameIntervalStep = 0` の連続レンジは、granularity を素直に `(value - min) % step` で判定する host 実装だとゼロ除算になりうる**（EspUsbHost 側が UVC host 対応を書く過程で指摘。先方は step 0 を「範囲内なら何でも可」として扱う実装にした）。ただし **Windows 11 の usbvideo と EspUsbHost の両方が現行の形を受理**していて、実害は観測していない。descriptor を変えるので、変更するなら Windows 実機での再検証（`tests/manual/windows_uvc`）と `tests/single/video_descriptor` の期待値更新が要る。
-- [ ] （検討）無効にしたクラスを使ったときに、はっきり失敗させる。現状は `CFG_TUD_NCM=0` のまま `EspUsbDeviceNet` を使ってもビルドが通り、Arduino コアの TinyUSB にシンボルが解決されて「設定の異なる 2 つのスタックが混ざったデバイス」になる（2026-09-18 実測、`examples/UsbNetwork` で確認）。**今日この形の失敗を 3 件見ている**（isochronous FIFO、EspUsbHost の claim 未 release、これ）ので、黙って壊れるより `begin()` が `ESP_ERR_NOT_SUPPORTED` を返す方がよい。各クラスの `begin()` に `#if !CFG_TUD_xxx` の分岐を置けば済むが、クラスごとに 8 箇所あるので機械的に入れるより、`EspUsbDeviceClass` 側に「自分のドライバが有効か」を返す仮想関数を置く形を検討する。
-- [ ] CCID の拡張検討: 複数 slot、extended APDU / chaining、`ccidIdentifyCard()` が使う UID 経路のような ATR 以外の識別、PIN pad。いずれも現状は class descriptor で非対応と宣言しているので Host からは要求されない。
-- [ ] Keyboard macro / Serial-to-keyboard / Button mouse などの応用 example。
-- [ ] （ESP32KeyBridge 側の作業）`src/ESP32KeyBridgeEspUsbDevice.h` の出力 adapter を NKRO 対応にする。`EspUsbDeviceNkroKeyboardReport` を受ける `sendReport()` overload と `heldState()` が両ライブラリに揃ったので、6KRO へ落ちる理由はもう無い。`buildHidKeyboardRolloverReport()` の使い道（bitmap 版ビルダーを足すか、adapter 側で `KeySet` から直接 bitmap を組むか）を決め、重複送信の抑制は adapter 側に置く（ライブラリ側は抑制しない契約）。BLE 出力 adapter も同時に。
+## 機種と Core
 
-## 完了
+- [ ] **ESP32-S2 の ROM DFU への移行**
+  - S2 の USB の動作は、S3 との FS 直結の両方向（`s3_s2`、`s2_s3`）と Linux PC（`s2_pc`）で確かめています。
+  - 完了の条件：S2 の native USB を PC につないだ状態で `rebootToRomDfu()` を呼び、ROM の DFU（303a:0002）として列挙し、`dfu-util` で書き込める。
+- [ ] **ESP32-S31 への対応（新しい組 P4X–S31）**
+  - いまは未対応です。build には Arduino-ESP32 4.0.0-RC1 以降が要ります。
+  - S31 の USB（データシート v0.5 §4.2.2.6）：OTG は HS の 1 本だけ（HS／FS で Host と Device。endpoint 1〜15、IN は EP0 を含め 8 本、FIFO 4 KB）。FS の OTG はなく、USB-Serial/JTAG（FS、GPIO33/34）が別にある。
+  - 結線：S31-Function-CoreBoard-1 の Type-A（HS OTG）と、新しい P4X の HS の口を、普通の A–C ケーブルで直結する。Type-A の VBUS は TPS2051C の EN が 5 V 固定で常時出るので、P4X の HS の口が VBUS を出さないこと（2-4 と同じ WT9932P4X-TINY なら出さない見込み）を到着時に確かめる。S31 の VBUS が P4X へ回り込むので、電源は両方の port をまとめて切る。制御は両方とも USB-Serial/JTAG。
+  - 完了の条件：
+    - 使う Core の版を固定し、S31 の target / FQBN / SDK / toolchain で library が compile できる。
+    - S31 の HS port の能力を `src/internal/EspUsbDwc2Platform.cpp` の port 表に、資料と register の値で確かめて登録する。PHY と cache の処理も確かめる。`tests/sketch_support/probe_link.h` の HS の判定に S31 を加える。
+    - combo `p4x_s31_hs`（P4X Host → S31 Device）で、`tests/peer/` の共通の probe と HS 専用の probe が通る。
+    - EspUsbHost を S31 で Host として動かし、combo `s31_p4x_hs`（S31 Host → P4X Device）でも全件が通る。Device の成功だけで逆向きも対応済みにしない。
+- [ ] **HS 直結の組の整理**
+  - 2-3（P4 v1.3）⇄ 2-4（P4X）の HS 直結は、当面残す。
+  - 完了の条件：`s31_p4x_hs` で P4X の HS の Device 試験が全件、安定して通るようになったら、2-3 ⇄ 2-4 を撤去するか決める。撤去したら、P4 v1.3 の Device 試験は 2-1 の FS loopback だけになることを tests/TEST_PLAN に書く。
+- [ ] **Arduino-ESP32 4 系の互換性**
+  - 基準は 3.3.12 のままにします。4 系は別の profile と combo にします。
+  - 完了の条件：
+    - 4 系の版（最初は 4.0.0-RC1）を固定した profile で、全 example と代表の probe が compile できる。
+    - S3 と P4 / P4X で、列挙、CDC / Vendor の往復、開始と終了の短い実機試験が通る。
+    - Core の差で直した点と、確かめた版を README に書く。RC での結果を 4 系全体の対応にはしない。正式版が出たら同じ手順でやり直す。
 
-- [x] USB DFU class（`EspUsbDeviceDfu`）。`Download` と `Runtime` の 2 形態。endpoint 消費 0（全転送が EP0）で、endpoint 予算を使い切った device にも足せる。TinyUSB の `class/dfu/dfu_device.c` / `dfu_rt_device.c` を vendoring 対象に追加（48 file / source 14）。実機検証は `tests/peer/usb_dfu`（S3 2 台）: DFU interface が endpoint 0 本で keyboard の隣に現れること、functional descriptor の wire 上の中身、bad magic → `errWRITE`、検証失敗 → `errVERIFY`、CLRSTATUS からの復帰、boot partition が動かないこと。descriptor 側は `tests/single/dfu_descriptor`（55 check）。
-- [x] `EspUsbDeviceFirmwareUpdate`。転送路非依存の OTA partition writer。`esp_ota_begin(OTA_WITH_SEQUENTIAL_WRITES)` なので erase は書き込みの進行に合わせて起きる（先頭で partition 全体を erase すると数秒かかり、USB callback の中では致命的）。
-- [x] `EspUsbDevice::rebootToBootloader()` / `rebootToRomDfu()`。S3 rev v0.2 と P4 rev v1.3 で、USB stack を動かした状態から download loader への到達を実機確認（`esptool --before no-reset` が button も DTR/RTS reset も無しで接続）。フラグは次回起動に残らないことも確認済み。Arduino-ESP32 の `usb_persist_restart()` はこのライブラリでは link できない（`tud_descriptor_bos_cb` / `tud_vendor_control_xfer_cb` の二重定義）ことを実際の build で確認し、`docs/ota-over-usb.ja.md` 2.5 に記録。
-- [x] `EspUsbDeviceMscFirmwareDisk`。データ領域が OTA partition そのものの FAT12 ボリューム。イメージは RAM に載らない（RAM 側は boot sector + FAT×2 + root dir + スクラッチのみ）。cluster size は FAT12 の 4084 cluster に収まる最小を 4KiB 以上から自動選択し、cluster 境界が flash の erase 境界に一致する。firmware 領域は昇順書き込みのみ受理し、逆戻り・穴あきは `ESP_ERR_INVALID_STATE` で中止。検証は `tests/single/msc_firmware_disk`（block callback を直接叩く 40 check）。
-- [x] UF2 block の受理（`EspUsbDeviceMscFirmwareDisk`）。順不同書き込み・重複 block・family ID 不一致を実機確認。内部は新 API `EspUsbDeviceFirmwareUpdate::beginRandomAccess()` / `writeAt()`（`esp_ota_write_with_offset`）。
-- [x] example `FirmwareDFU` / `FirmwareHTTP` / `FirmwareBootMode` / `FirmwareMSC` / `FirmwareCDC` / `FirmwareVendor`。
-- [x] Windows が DFU / vendor interface に自分で WinUSB を当てるようにした（Zadig 不要）。ESP32-P4 + Windows 11 で 4 本の対照実測（DFU 単体: Error→WINUSB、DFU+vendor: DFU の子が problem=28→WINUSB）。DFU 側は compatible ID のみで GUID 不要であることも同じ実測で確認。`bcdUSB` は BOS がある構成でのみ 0x0201。
-- [x] wch-protocols 還元 D2〜D4。D2（usbd task の core 固定）は `config.taskCoreId` として公開したが**既定は変えず**（P4 HS 実測で固定なし 28.61 / core 0 固定 28.90 MB/s と差が出ない。効くのは producer が重い構成で、先方の E107 が 44→52 Msps の実例）。D3（buffered write の端数が flush まで出ない）は実在を確認し `waitWritable()` が待つ前に flush するよう修正、`flush()` の必要性を応用ガイドに明記。D4 は応用ガイド 2.3 に「全ターゲットで DMA、slave はサポート構成でない」と明記。あわせて「host が libusb 完了 callback 内で処理すると device の不具合に見える停止が起きる」も記載。
-- [x] `rebootToBootloader()` の S3 での PHY 返却。native USB を PC に直結した S3 で実測し、**修正前はコネクタが沈黙する**（チップは loader にいるのに host から USB が消える）ことを確認。`RTC_CNTL_USB_CONF_REG` が RTC ドメインで software reset を生き延びるのが原因。修正後は同じコネクタで `303a:1001` に戻り、Windows の `esptool --port COM12` が stub flasher まで通る。`tests/manual/s3_single_cable`。
-- [x] `rebootToRomDfu()` の S3 での挙動を実測し、`USB_PHY_SEL` eFuse 未焼成なら再起動せず拒否するようにした（実測: persist flag だけでは ROM の DFU が pin の無い controller に載り、何も列挙されない）。
-- [x] bulk IN の送信 FIFO 2 packet 化（wch-protocols CR-13 / D1）。自前実測で 22.98→28.93 MB/s（P4 HS、一方向、32 MiB×3 の最良）。DFIFO 収支を自動計算し収まるときだけ有効。`EspUsbBulkInBuffering::{Auto,Single,Double}`、`bulkInDoubleBuffered()`、`tests/single/bulk_in_fifo`。
+## PC OS との互換性
 
-- [x] UAC2 の peer テスト。`tests/peer/usb_audio_uac2`（S3 2台・FS）を追加し、EspUsbHost 2.7.1 の UAC2 host に対して end-to-end でカバーした。2.1.0 リリース前検証の peer 一式実行（実機 2 台構成）で通過済み。device 側の control 状態（Feature Unit の master / logical channel）、Clock Source entity への sample rate request、双方向 streaming、explicit feedback endpoint による pacing を検証する。rate 切り替えは descriptor builder が方向ごとに alternate setting を 1 つしか出さないため対象外。
-- [x] endpoint の per-speed descriptor 化（FS=64 / HS bulk=512、device_qualifier / other_speed 対応）。v2 で実装済み——negotiated speed に応じた endpoint packet size、device qualifier、other-speed configuration を返す。`tests/unit/descriptor_model`（FS/HS MPS 選択・other-speed・device qualifier）と `tests/manual/p4_hs_bulk`（`PASS link: USB High-Speed`、MPS 512/64）で検証。`docs/DESIGN_NOTES.ja.md`「bulk エンドポイントサイズと HS 準拠」は当時の経緯。
-- [x] USB Audio composite device。`peer/composite_hid_audio`（S3 UAC1 HID+Audio：`dup=0`・全 claim・keyboard 入力・PCM playback、3/3）で実機確認済み。HID / CDC / Vendor との descriptor build は `unit/composite_constraints` で固定。可否と制約（class 数ではなく S3 の非 control IN endpoint 上限で決まる）は `tests/TEST_PLAN.ja.md`「複合デバイス（composite）テスト」に記録。
-- [x] 複合時の HID 採番衝突の修正（実機確認済み）。(1) HID を EP1 duplex + `reserve_endpoints=true` で core のビットマスクに登録、(2) `espUsbDeviceLoadHidDescriptor` で HID interface number を core 採番値へ書き換え。HID+MSC が 3/3 pass。`docs/DESIGN_NOTES.ja.md`「複合時の HID 採番衝突」、`tests/peer/composite_hid_msc` 参照。
-- [x] vendor RX callback（`tud_vendor_rx_cb` → `onRx`）が発火しない件の修正（実機確認済み）。原因は本ライブラリが旧 API の 1 引数 `tud_vendor_rx_cb(uint8_t)` で定義しており、Arduino-ESP32 TinyUSB の 3 引数宣言（`uint8_t, const uint8_t*, uint32_t`）と食い違い、`extern "C"` 外だったため C++ マングル名の別関数になって weak default を上書きできていなかった（複合固有ではなく standalone でも未発火）。header と同じ 3 引数へ修正し C シンボルで override。`composite_cdc_msc_vendor` はポーリングを撤去し `onRx` のみで echo が往復（`onrx>=1` を検証）。`docs/DESIGN_NOTES.ja.md`「複合時の vendor RX callback が発火しない」参照。
-- [x] HID + bulk Vendor（`EspUsbDeviceVendor`）の複合対応（実機確認済み）。原因は `espUsbDeviceLoadHidDescriptor` が `configDescriptor_` の「HID 以降すべて」（末尾の Vendor interface 含む）を HID blob にコピーしており、`espUsbDeviceLoadVendorDescriptor` 経由の登録と合わせて Vendor interface が二重記述されていた。HID interface 部分だけをコピー・採番するよう修正（`hidInterfacesLength_`/`hidInterfaceCount_`）。`peer/composite_hid_vendor` 3/3 pass。`docs/DESIGN_NOTES.ja.md`「複合時の HID + bulk Vendor 二重記述」参照。
-- [x] all-in-one composite example（`examples/CompositeHidCdcMsc`：HID keyboard + CDC serial + MSC FAT RAM disk）。1 つの `EspUsbDevice` に 3 function を登録し `begin()` 1 回で複合起動。S3 の FIFO-IN 3 本上限に収まる最大構成（4 クラス目は P4 が必要な旨を README に明記）。CDC で `type <text>` → keyboard 入力のデモ付き。
-- [x] CDC-NCM USB ネットワークデバイス（`EspUsbDeviceNet`）+ lwIP/esp_netif 統合（実 PC で ping 疎通確認済み）。`USB_INTERFACE_CUSTOM` スロットで NCM descriptor 発行 → 内蔵 netd が claim。esp_netif で DHCP サーバ/クライアント/静的を off-able に切替（要件）。TX は mutex+セマフォで usbd タスクに直列化。NCM のみ（ECM は core 再ビルドが必要で対象外）。example `examples/UsbNetwork`（NCM+DHCP+HTTP）、手動/pytest テスト `tests/manual/usb_ncm`。`docs/DESIGN_NOTES.ja.md`「CDC-NCM ネットワークデバイス」参照。device→host 連続送信での恒久停止は 2.1.0 の DMA モード化で修正済み（`tests/peer/usb_ncm_soak`）。
-- [x] NCM の 2 台 peer テスト。`tests/peer/usb_ncm` として既に存在（enumeration の endpoint 構造、双方向 frame 統計と DHCP lease、device 側 web server が実際に応答したこと）。EspUsbHost 側の NCM 実装は済んでおり、この項目の記述が古いままだった。
-- [x] CCID スマートカードリーダー（`EspUsbDeviceCcid`）。EspUsbHost 2.7.1 の CCID host API に対する device 側。リーダーがライブラリ、カードがスケッチ（`insertCard()` / `onApdu()`）。TinyUSB に CCID driver が無く同梱 source は upstream verbatim なので、application class driver hook から登録する。hook は `internal/EspUsbDeviceAppDriver` に置いてポインタを読むだけにし、CCID を使わないスケッチに driver がリンクされないようにした（直接名指しすると全スケッチ +2396 byte）。example `SmartCardReader`、peer test `tests/peer/usb_ccid`、host unit test `tests/unit/ccid_descriptor`。実機 2 台での実行済み——追加当日の実機実行で slot change 通知の取りこぼしを発見・修正し、2.1.0 リリース前検証の peer 一式実行で通過。`docs/DESIGN_NOTES.ja.md`「CCID スマートカードリーダー」参照。
-- [x] EspBle へ NKRO API の変更依頼（`keys[]` → `bitmap[]` 改名ほか）。A〜E すべて 1.0.0 リリース前に対応済み。Host 側 `EspBleHidKeyboardState` にも同じ問題があり破壊的変更で改名され、EspUsbHost も 2.7.0 で追従。「bitmap を持つメンバは `bitmap`、usage 配列は `keys`」が姉妹 3 ライブラリ共通の規則になった（`EspBle/docs/DECISIONS.ja.md` 19）。依頼文書はクローズに伴い削除し、決定は `docs/DESIGN_NOTES.ja.md`「姉妹ライブラリとの HID keyboard API 対称性」に集約。
-- [x] NKRO の状態送信 API。`sendReport(const EspUsbDeviceNkroKeyboardReport &)` で保持キー全体を 1 レポート送信、`heldState()` で最後に Host へ伝えた状態を公開。内部状態を公開型 1 個（`nkroState_`）に統一して private `setKeyBit()` を廃止し、bitmap レイアウトと modifier 振り分けの定義を 1 箇所に。`enableNkro()` 未実行時は失敗（boot protocol 時は従来どおり畳む）、重複送信の抑制は呼び出し側の責務。併せて `releaseUsage()` が modifier usage を落とさない穴と、増分 API が範囲外 usage を黙って無視する点も修正。EspBle と同一形状。host unit test `tests/unit/nkro_report` と peer test `tests/peer/hid_keyboard_nkro` で検証。`docs/DESIGN_NOTES.ja.md`「N-key rollover」参照。
-- [x] NKRO の peer テスト。`tests/peer/hid_keyboard_nkro` に状態送信 API の検証を追加（1 レポートで 10 usages + modifier、`heldState()` 一致、`releaseAll()` の modifier クリア、`enableNkro()` 未実行時の失敗）。EspUsbHost は以前から bitmap レポートをパースできており、DESIGN_NOTES の「未検証」記述が古かった。EspUsbHost は modifier を key event ではなく `event.modifiers` で返すため、modifier の assert は `mod=` フィールドで行う。
-- [x] LED 状態の getter `ledState()` 追加。`onOutputReport()` は単一 slot で、統合レイヤが callback を占有するとスケッチ側から Lock 状態を読めなかった。LED は event でなく状態なので listener 基盤は新設せず getter で解決。callback の有無に関係なく更新し、`begin()` で初期化する。`tests/peer/hid_keyboard` に callback あり／なし両方の検証を追加。`onProtocol()` / `onOutputReport()` の listener 化自体は保留（Device 側は EspBle も単一 slot で一貫しており、やるなら両者同時）。`docs/DESIGN_NOTES.ja.md`「LED output report の観測」参照。
+- [ ] **Windows / macOS / Linux での class の動作**
+  - いまは Linux PC で MSC の媒体交換と DFU DETACH を pyusb で確かめただけです。Windows と macOS は未確認です。
+  - 完了の条件（各 OS で）：
+    - 各 class が OS 標準の driver に bind する：CDC ACM、HID（Keyboard / Mouse / Gamepad / Consumer / System）、MIDI、MSC、UAC1 / UAC2、UVC、CDC-NCM、CCID、DFU。
+    - CDC の送受信、HID の入力、MSC の mount / 書込み / eject、Audio の再生と録音、UVC の表示、NCM の通信、CCID の APDU、DFU tool での書込みができる。
+    - Vendor が WinUSB / libusb / WebUSB で claim でき、MS OS 2.0 descriptor で Windows が driver を自動で当てる。
+    - UAC2 の FS feedback（10.14、3 byte）を Windows と macOS の UAC2 driver が受け付ける。
+    - 結果を OS の版とともに README の対応表に書く。v2 での PC の結果を v3 の結果として扱わない。
+
+## 実媒体
+
+- [ ] **SD card の MSC helper**
+  - 完了の条件：実際の SD card を `EspUsbDeviceMscSdCard` で公開し、PC から mount・読書き・eject ができ、Device 側から内容が一致する。抜去と再挿入の通知も確かめる。
+- [ ] **OTA（firmware update）の実機**
+  - いまは DFU を RAM backend でしか確かめていません。
+  - 完了の条件：DFU、MSC の firmware disk（`EspUsbDeviceMscFirmwareDisk`）、CDC / Vendor / HTTP の各経路で、実際の OTA partition へ書き込み、検証し、再起動後に新しい firmware が動く。途中の中断と検証失敗で、元の firmware が残ることも確かめる。
+
+## Host ライブラリ（EspUsbHost）側の未解決事項
+
+Device 側に回避の動作は加えません。Host 側で直し、Device の試験で確かめます。
+
+- [ ] **MSC の data STALL の後の CSW の回収**
+  - EspUsbHost が data STALL の後に CSW を読まずに終わり、後の command が一件ずれる。reset recovery もしない。
+  - 完了の条件：Host の現行版で再現し、HALT 解除 → CSW 回収 → 後の command が正しく進むことを、Device の MSC 抜去（02/3A/00）の試験で確かめる。
+- [ ] **P4 の同期 Vendor IN（`vendorReadSync()`）の cache 処理**
+  - P4 で、受信の最後の byte が化ける。Host の同期経路に DMA 前の cache 処理がない。
+  - 完了の条件：EspUsbHost で修正が公開され、P4 の loopback で同期経路の往復が通る。
+- [ ] **NCM の `networkClose()` の後の Host 再開始**
+  - `networkClose()` → Device の終了 → Host の終了の順にすると、次の Host の開始が失敗する。
+  - 完了の条件：Host 側で原因を切り分けて直し、その順序を含む回帰試験を `tests/` に足して通す。
+
+- [ ] **SET_CONFIGURATION で endpoint を開けない Device を列挙すると Host が panic する**
+  - P4X の EspUsbHost 2.10.1 で、送信 FIFO に収まらない構成の Device（P4 HS で Vendor 6 個）を列挙すると、ROM 内で Load access fault になった。Device 側はこの構成を `begin()` で拒否するようにしたので、この Device からは再現しない。
+  - 完了の条件：構成の失敗を返す Device（試験用に意図的に作る）で Host 側を再現し、Host が panic せずに列挙の失敗として扱うように直す。
+
+## 実装の確認事項
+
+- [ ] **Audio の format の上限が HS でも FS の値**
+  - `addFormat()` は、format の packet 長を FS の上限（1023 byte / packet）で検査する。HS でしか表せない大きな format（高 rate・多 channel）は使えない。
+  - 完了の条件：HS の上限（1024 byte / microframe）で検査するか、FS の上限を仕様として残すかを決める。HS で検査する場合は、FS へ fallback したときの扱い（その format を広告しない、または `begin()` で拒否）も決め、HS 直結の audio 試験で確かめる。残す場合は Audio の文書に制限として書く。
+
+- [ ] **ESP32-P4 の FS controller の pin の切替え**
+  - FS controller の pin（GPIO26/27 と 24/25）の入れ替えは、例（P4FullSpeedDevice）がスケッチから ESP-IDF の HAL（`usb_wrap_ll_phy_select`）を呼ぶ形のままで、ライブラリの API はない。
+  - 完了の条件：`EspUsbDeviceConfig` で選べるようにするかを決める。する場合は、PHY の初期化の中で切り替え、P4 の FS で列挙を確かめる。
+
+## リリース
+
+- [ ] **全体の回帰試験と全 example の compile**
+  - 完了の条件：リリースする commit で、`tests/` の `--combo all` が全件通り、`tools/build_check.py` が全 profile で通る。
+
+## examples
+
+- [ ] **examples の実機確認**
+  - いまは build（`tools/build_check.py`）だけを確かめています。
+  - 完了の条件：
+    - 各 example を、README に書いた board と結線で実機に書き込み、README の手順どおりに動く。
+    - PC を相手にする example は、Windows / macOS / Linux のうち確かめた OS を README に書く。
+    - M5 系（`*M5`）、SD card、HTTP など外部の機材が要る example は、その機材で確かめる。
+    - 確かめていない example と profile を一覧にして README に残す。

@@ -2,94 +2,104 @@
 
 > English: [README.md](README.md)
 
-USB Mass Storage Class device を作り、RAM 上の小さな block device を USB host へ公開する例です。
+USB Mass Storage Class（MSC）デバイスを作り、RAM 上の小さな block device を USB ホストへ公開する例です。
 
-この example は SCSI / READ(10) / WRITE(10) の疎通確認用です。`EspUsbDeviceMscRamDisk`
-が read/write callback と block 範囲チェックを受け持つため、最小構成ではユーザーが
-MSC callback をすべて書く必要はありません。
+SCSI / READ(10) / WRITE(10) の立ち上げ確認用です。`EspUsbDeviceMscRamDisk` が read/write callback と block 範囲の確認を受け持つので、MSC の callback を全部手で書く必要はありません。
+`msc.onRead()` / `onWrite()` を直接書く例は [MscCdcBlocks](../MscCdcBlocks/MscCdcBlocks.ino) を参照してください。
 
 ## ハードウェア
 
-- USB device 対応の ESP32-S3 など Arduino-ESP32 board
-- PC、EspUsbHost を動かす別 ESP32、またはテスト治具などの USB host
-- ログ確認用の Serial monitor 接続
+- ESP32-S3 / ESP32-S2 / ESP32-P4 の board。ホストへは **native USB OTG** の口でつなぐ
+- USB ホスト（PC、EspUsbHost を動かす別の ESP32、試験治具など）
+- ログ用の別の Serial 接続（USB-UART や board の debug 口）
 
 ## 動作内容
 
-- `EspUsbDevice` を full-speed MSC device として起動します。
-- 16 block x 512 bytes の RAM disk を公開します。
-- `INQUIRY` の vendor / product / revision を設定します。
-- `TEST UNIT READY`、`READ CAPACITY(10)`、`READ(10)`、`WRITE(10)` を処理します。
-- `START STOP UNIT` を受け取ったときに Serial へログを出します。
+- `EspUsbDevice` を MSC デバイスとして開始する（S2/S3 は FS、P4 は HS）
+- 16 block × 512 byte の RAM disk を公開する。中身は 0 で、block 0 の末尾だけ `55 AA`
+- SCSI INQUIRY の vendor / product / revision 文字列を設定する
+- `INQUIRY`、`TEST UNIT READY`、`READ CAPACITY(10)`、`READ(10)`、`WRITE(10)` など（一覧は [MSC ガイド](../../docs/classes/msc.ja.md)）に応答する
+- `START STOP UNIT`（取り出し）を Serial に表示する
 
-## 重要な制限と方針
+## 使い方
 
-この example の RAM disk は FAT でフォーマットされていません。PC に接続すると OS が
-初期化やフォーマットを求める場合があります。これは MSC transport の疎通確認用であり、
-通常の USB メモリとしてファイルを読み書きする example ではありません。
+1. スケッチを書き込み（`arduino-cli compile --profile esp32s3` など）、Serial monitor を 115200 で開く。
+2. native USB の口をホストへつなぐ。`USB MSC RAM disk ready` が出る。
+3. PC では 8 KiB の未フォーマットのリムーバブルドライブに見える。Linux なら `lsblk` で `sdX` を探し、`sudo dd if=/dev/sdX bs=512 count=1 | xxd | tail -2` で読むと、最後の 2 byte が `55 aa`。
+4. ドライブを取り出す（`eject /dev/sdX`、ファイルマネージャーの「取り出し」）と `MSC_START_STOP ...` が出る。
 
-MSC は block device と filesystem が分かれます。OS からマウントできるストレージに
-するには、次のどちらかが必要です。
+## 重要な制限と方向性
 
-- RAM buffer に有効な FAT image を用意する。
-- SD card などの block storage を `onRead()` / `onWrite()` に接続する。
+この RAM disk はフォーマットされていません。PC につなぐと、OS が初期化やフォーマットを求めることがあります。中身の問題であり、USB 接続の失敗ではありません。このスケッチは MSC の転送を確かめるもので、ファイル単位の読み書きの例ではありません。内容は reset で消えます。
 
-このライブラリ側では、まず block device helper を用意して MSC の準備負担を下げます。
-FAT image を組み立てる helper は別段階で追加する候補です。
+MSC は block device と filesystem を分けて扱います。ホストが mount できる storage にするには次のどちらかを使います。
 
-内蔵 flash、SPIFFS、LittleFS を直接 USB MSC として公開する方針は避けます。USB MSC は
-sector 単位の block device を Host に見せる仕組みですが、SPIFFS / LittleFS は ESP32
-側の filesystem API であり、抽象度が合いません。また内蔵 flash は firmware 領域や
-erase block、書き換え耐性との兼ね合いが大きく、ユーザー向け example として安全に
-見せにくいためです。
+- RAM に正しい FAT image を置く — [MSCFatRamDisk](../MSCFatRamDisk/)
+- `onRead()` / `onWrite()` の先を SD カードなどの block storage にする — [MSCSdCard](../MSCSdCard/)
 
-実用的な永続ストレージ example は SD card を優先します。SD は元から block device で、
-FAT と USB MSC の相性もよいです。ただし Host が SD を MSC として使っている間は、
-ESP32 側から同じ filesystem を同時に mount / 書き込みしないでください。eject や
-`START STOP UNIT` を受けた後に ESP32 側へ制御を戻す排他設計が必要です。
+内蔵 flash、SPIFFS、LittleFS を MSC として直接公開しないでください。MSC はホストに生の sector を渡しますが、SPIFFS や LittleFS は ESP32 が mount する filesystem です。内蔵 flash には firmware の partition、消去単位、書込み寿命の問題もあります。
+例外として意図的に用意しているのが [FirmwareMSC](../FirmwareMSC/) で、data 領域が OTA partition そのものになっており、firmware image だけを受け付けます。
 
-## RAM disk の実用用途
+どの媒体でも、所有者は一つです。ホストが使っている間、スケッチは同じ filesystem を mount したり書いたりしてはいけません。取り出し（`START STOP UNIT`）の後でスケッチ側へ戻します。
 
-RAM disk はテスト専用ではありません。FAT image helper を追加すると、Host から一時的に
-ファイルを置ける小さな USB drive として使えます。
+## RAM disk の実用的な使い道
 
-- PC から firmware image を置き、eject 後に ESP32 側で firmware update に使う。
-- PC から設定ファイルを置き、ESP32 側で読み取って反映する。
-- PC から受け取ったファイルを Wi-Fi 経由で別サーバーへ転送する。
-- ESP32 側で生成したログや診断データを RAM 上の FAT image に置き、Host へ渡す。
+RAM disk は試験専用ではありません。FAT の補助クラスと組み合わせると、ホストから機器へファイルを渡す小さな一時ドライブになります。
 
-安全に扱うため、Host が書き込み中の FAT image を ESP32 側が同時に読む設計にはしません。
-ファイル一覧や内容の解析は、Host 側の sync / eject / stop を確認した後に行う方針です。
+- 設定ファイルを置いてもらい、ESP32 側で読む
+- PC から受け取ったファイルを Wi-Fi で転送する
+- ログや診断データをホストへ見せる
 
-今後の helper は次の分担を想定します。
+FAT image を解析するのは、ホストが同期・取り出し・停止した後にしてください。書込み中に読んではいけません。
 
-- `EspUsbDeviceMscRamDisk`: raw block I/O、テスト、一時 buffer。
-- `EspUsbDeviceMscFatRamDisk`: RAM 上に小さい FAT image を作り、Host とファイル受け渡しする。
-- `EspUsbDeviceMscSdCard`: SD card を USB MSC block device として公開する。
-- flash / SPIFFS / LittleFS 直接公開: 標準 example では扱わない。
+| 補助クラス | 用途 |
+|---|---|
+| `EspUsbDeviceMscRamDisk` | 生の block I/O、試験、一時 buffer（この例） |
+| `EspUsbDeviceMscFatRamDisk` | ファイル受け渡し用の小さな RAM 上の FAT image |
+| `EspUsbDeviceMscSdCard` | SPI 接続の SD カードを MSC の block device にする |
+| `EspUsbDeviceMscFirmwareDisk` | ドラッグ＆ドロップでの firmware 更新 |
 
-## 主要 API
+## 主な API
 
-- `EspUsbDeviceMsc msc(device)` は MSC function を登録します。
-- `msc.vendorID()`、`productID()`、`productRevision()` は SCSI inquiry 文字列を設定します。
-- `msc.mediaPresent(true)` は media が挿入済みであることを Host に返します。
-- `msc.isWritable(true)` は Host からの write を許可します。
-- `msc.onStartStop(callback)` は eject / start / stop 要求を受け取ります。
-- `EspUsbDeviceMscRamDisk disk(storage, blocks, blockSize)` は外部 buffer を block device として扱います。
-- `disk.attach(msc)` は MSC read/write callback を設定し、`msc.begin(blocks, blockSize)` を呼びます。
-- `disk.clear()`、`readBlock()`、`writeBlock()`、`writeByte()` は example やテスト用の小さな初期化に使えます。
+- `EspUsbDeviceMsc msc(device)` — MSC Function を登録する。
+- `msc.configure(EspUsbMscConfig)` — Function 名と DMA の staging 容量（`transferBytes`、既定 512）を設定する。停止中に呼び、`esp_err_t` を返す。
+- `msc.vendorID()`、`productID()`、`productRevision()` — INQUIRY の文字列（8 / 16 / 4 文字まで）。
+- `msc.mediaPresent(true)` — 媒体を「挿入済み」にする。RAM disk の補助クラスは**これを呼ばない**ので自分で呼ぶ。
+- `msc.isWritable(true)` — ホストからの書込みを許す。`false` で書込み保護。
+- `msc.onStartStop(callback)` — 取り出し・開始・停止の要求を受ける。USB worker 上で呼ばれるので、すぐ戻る。
+- `EspUsbDeviceMscRamDisk disk(storage, blocks, blockSize)` — 外部の buffer（内部 RAM でも PSRAM でもよい）を block device にする。
+- `disk.attach(msc)` — read/write callback を登録し、`msc.begin(blocks, blockSize)` を呼ぶ。これは容量の設定だけで、staging buffer は `device.begin()` が確保する。
+- `disk.clear()`、`readBlock()`、`writeBlock()`、`writeByte()` — 試験用の初期化に便利。
+- `device.begin()` が失敗したら、`device.lastErrorName()` と `msc.startError()` で理由が分かる。
 
-## 想定 Serial 出力
+## Serial の出力例
 
 ```text
-USB MSC RAM disk ready blocks=16 block_size=512 bytes=8192
+USB MSC RAM disk ready blocks=16 block_size=512 bytes=8192 staging=512
 MSC_START_STOP pc=0 start=0 eject=1
 ```
 
-Host や OS によっては `START STOP UNIT` が送られないため、2 行目は出ない場合があります。
+2 行目はホストや OS によって出ないことがあります。
+
+## 確認の手順
+
+- 最初は例を変更せずに動かし、ログを上の手順と照らし合わせます。filesystem の mount を期待するのではなく、列挙・容量・生の読み出しのどこまで成功したかを見ます。
+- block は LBA と媒体の block 長で扱い、ファイルにはその上の filesystem が必要です。USB の接続や boot 署名だけでは、filesystem が正しいとは言えません。
+- HS（ESP32-P4）では `transferBytes` を 512 の倍数にします。そうでないと `device.begin()` が `ESP_ERR_INVALID_SIZE` で失敗します。
+- この例のエラー表示は説明用で、再試行や回復の方針ではありません。
+
+## v2 からの変更点
+
+- staging buffer は `CFG_TUD_MSC_EP_BUFSIZE` ではなく、Function ごとの `msc.configure()`（`transferBytes`）で指定します。旧 macro はコンパイルエラーになります。
+- `onStartStop()`、`vendorID()` などの setter は `esp_err_t` を返し、停止中だけ成功します。
+- 開始の失敗時に `device.lastErrorName()` に加えて `msc.startError()` も表示します。準備完了の行には確保した staging 容量（`msc.transferCapacity()`）も出します。
+- 媒体を挿し直す（`mediaPresent(false)` → `true`）と、ホストへ UNIT ATTENTION（06/28/00）を 1 回返すようになりました。
+- それ以外の動作は v2 と同じです（VID/PID 303a:4007、同じ disk）。
 
 ## 関連
 
-- [Keyboard](../Keyboard/) - HID keyboard device
-- [Mouse](../Mouse/) - HID mouse device
-- [KeyboardMouse](../KeyboardMouse/) - keyboard と mouse の composite device
+- [MSCFatRamDisk](../MSCFatRamDisk/) — RAM の FAT image でファイルを受け渡す
+- [MSCSdCard](../MSCSdCard/) — SD カードを USB storage にする
+- [MscCdcBlocks](../MscCdcBlocks/MscCdcBlocks.ino) — callback を手で書き、CDC と併用する
+- [MSC API ガイド](../../docs/classes/msc.ja.md)
+- [スケッチ](MSC.ino) / [全サンプル](../README.md) / [サンプルの進め方](../../docs/example-workflow.ja.md)
