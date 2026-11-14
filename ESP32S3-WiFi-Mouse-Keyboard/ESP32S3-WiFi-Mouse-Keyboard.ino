@@ -129,7 +129,7 @@ bool isUSBReady() {
 #endif
 }
 
-void hidMouseMove(int8_t dx, int8_t dy, int8_t wheel = 0) {
+inline void hidMouseMove(int8_t dx, int8_t dy, int8_t wheel) {
 #if USE_ESP_USB_DEVICE
   if (usbDevice.ready()) {
     usbMouse.move(dx, dy, wheel);
@@ -137,6 +137,10 @@ void hidMouseMove(int8_t dx, int8_t dy, int8_t wheel = 0) {
 #else
   usbMouse.move(dx, dy, wheel);
 #endif
+}
+
+inline void hidMouseMove(int8_t dx, int8_t dy) {
+  hidMouseMove(dx, dy, 0);
 }
 
 void hidMouseClick(uint8_t btn) {
@@ -215,7 +219,7 @@ void hidKeyboardWriteString(const String &str) {
 #endif
 }
 
-void hidKeyboardTapSpecial(uint8_t usage, uint8_t modifiers = 0) {
+inline void hidKeyboardTapSpecial(uint8_t usage, uint8_t modifiers) {
 #if USE_ESP_USB_DEVICE
   if (usbDevice.ready()) {
     usbKeyboard.tapUsage(usage, modifiers);
@@ -225,6 +229,10 @@ void hidKeyboardTapSpecial(uint8_t usage, uint8_t modifiers = 0) {
   delay(10);
   usbKeyboard.release(usage);
 #endif
+}
+
+inline void hidKeyboardTapSpecial(uint8_t usage) {
+  hidKeyboardTapSpecial(usage, 0);
 }
 
 void hidKeyboardCombo(uint8_t modifiers, uint8_t usage) {
