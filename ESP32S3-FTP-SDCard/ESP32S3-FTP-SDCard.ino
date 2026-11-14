@@ -41,10 +41,12 @@
 #define SD_SCK          12
 #define SD_MISO         13
 
-#define PASV_PORT_START 50000
-#define PASV_PORT_END   50009
-#define MAX_CLIENTS     2
-#define BUF_SIZE        4096
+#define PASV_PORT_START  50000
+#define PASV_PORT_END    50009
+#define MAX_CLIENTS      2
+#define BUF_SIZE_PSRAM   (4 * 1024 * 1024)   // 4 MB — used when PSRAM available
+#define BUF_SIZE_IRAM    (4 * 1024)           // 4 KB — fallback to internal RAM
+size_t  bufSize = BUF_SIZE_IRAM;             // actual size, set at runtime
 
 // ─────────────────────────── Runtime Settings (from Preferences) ───────────
 
@@ -137,6 +139,7 @@ static const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   <p>SD Card: <span class="badge %SD_CLASS%">%SD_STATUS%</span></p>
   <p style="margin-top:8px">Mode: <span class="badge ok">%WIFI_MODE%</span></p>
   <p style="margin-top:8px">IP: <b>%WIFI_IP%</b> &nbsp;|&nbsp; Hostname: <b>%MDNS_HOST%.local</b></p>
+  <p style="margin-top:8px">Memory: <span class="badge ok">%MEM_STATUS%</span></p>
   %SD_DETAIL%
 </div>
 
@@ -238,6 +241,14 @@ String buildPage() {
   html.replace("%WIFI_IP%",   useAPMode
                                 ? WiFi.softAPIP().toString()
                                 : WiFi.localIP().toString());
+
+  String memStatus = "Buffer " + String((unsigned long)(bufSize / 1024)) + " KB";
+  if (psramFound()) {
+    memStatus += " in PSRAM (" + String((unsigned long)(ESP.getFreePsram() / 1024)) + " KB free)";
+  } else {
+    memStatus += " in RAM";
+  }
+  html.replace("%MEM_STATUS%", memStatus);
 
   html.replace("%AP_CHK%",   useAPMode ? "checked" : "");
   html.replace("%STA_CHK%",  useAPMode ? "" : "checked");
@@ -504,12 +515,27 @@ void handleCommand(FtpClient &c, const String &line) {
 
     Serial.printf("[FTP] RETR %s (%lu bytes)\n", path.c_str(), (unsigned long)f.size());
     unsigned long sent = 0;
+    size_t readBlock = (bufSize >= 524288) ? 524288 : bufSize; // up to 512 KB per SD read
     while (f.available()) {
-      int n = f.read(transferBuf, BUF_SIZE);
+      size_t toRead = f.available();
+      if (toRead > readBlock) toRead = readBlock;
+      int n = f.read(transferBuf, toRead);
       if (n <= 0) break;
-      c.data.write(transferBuf, n);
-      sent += n;
-      yield();
+
+      size_t written = 0;
+      while (written < (size_t)n && c.data.connected()) {
+        size_t chunk = (size_t)n - written;
+        if (chunk > 16384) chunk = 16384; // 16 KB TCP chunk
+        size_t w = c.data.write(transferBuf + written, chunk);
+        if (w == 0) {
+          delay(1);
+        } else {
+          written += w;
+        }
+        yield();
+      }
+      sent += written;
+      if (!c.data.connected()) break;
     }
     f.close();
     closeDataConnection(c);
@@ -531,13 +557,36 @@ void handleCommand(FtpClient &c, const String &line) {
 
     Serial.printf("[FTP] STOR %s\n", path.c_str());
     unsigned long received = 0;
+    size_t bufFilled = 0;
     while (c.data.connected() || c.data.available()) {
       if (c.data.available()) {
-        int n = c.data.read(transferBuf, BUF_SIZE);
-        if (n > 0) { f.write(transferBuf, n); received += n; }
-      } else { delay(1); }
+        size_t spaceLeft = bufSize - bufFilled;
+        int avail = c.data.available();
+        size_t toRead = (avail < (int)spaceLeft) ? (size_t)avail : spaceLeft;
+        int n = c.data.read(transferBuf + bufFilled, toRead);
+        if (n > 0) {
+          bufFilled += n;
+          received += n;
+        }
+        // Write out to SD when buffer fills or when >= 64KB accumulated and socket is drained
+        if (bufFilled >= bufSize || (bufFilled >= 65536 && !c.data.available())) {
+          f.write(transferBuf, bufFilled);
+          bufFilled = 0;
+        }
+      } else {
+        if (bufFilled > 0) {
+          f.write(transferBuf, bufFilled);
+          bufFilled = 0;
+        }
+        delay(1);
+      }
       yield();
     }
+    if (bufFilled > 0) {
+      f.write(transferBuf, bufFilled);
+      bufFilled = 0;
+    }
+    f.flush();
     f.close();
     closeDataConnection(c);
     Serial.printf("[FTP] Received %lu bytes\n", received);
@@ -606,11 +655,24 @@ void setup() {
 
   // ── Allocate transfer buffer (prefer PSRAM) ──────────────────────────────
   if (psramFound()) {
-    transferBuf = (uint8_t *)ps_malloc(BUF_SIZE);
-    Serial.printf("[MEM] PSRAM: %u KB free. Buffer in PSRAM.\n", ESP.getFreePsram() / 1024);
-  } else {
-    transferBuf = (uint8_t *)malloc(BUF_SIZE);
-    Serial.println("[MEM] No PSRAM — buffer in internal RAM.");
+    bufSize = BUF_SIZE_PSRAM;
+    transferBuf = (uint8_t *)ps_malloc(bufSize);
+    // If contiguous 4MB block allocation fails, step down (2MB, 1MB, etc.)
+    while (!transferBuf && bufSize > BUF_SIZE_IRAM) {
+      bufSize /= 2;
+      transferBuf = (uint8_t *)ps_malloc(bufSize);
+    }
+    if (transferBuf) {
+      Serial.printf("[MEM] PSRAM found! Allocated %u KB (%u MB) buffer in PSRAM.\n",
+                    (unsigned)(bufSize / 1024), (unsigned)(bufSize / (1024 * 1024)));
+      Serial.printf("[MEM] Remaining free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
+    }
+  }
+  if (!transferBuf) {
+    bufSize = BUF_SIZE_IRAM;
+    transferBuf = (uint8_t *)malloc(bufSize);
+    Serial.printf("[MEM] Fallback: Allocated %u KB buffer in internal RAM.\n",
+                  (unsigned)(bufSize / 1024));
   }
   if (!transferBuf) { Serial.println("[MEM] FATAL: cannot allocate buffer!"); while (1) delay(1000); }
 
