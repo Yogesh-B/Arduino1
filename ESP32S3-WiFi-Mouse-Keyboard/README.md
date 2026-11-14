@@ -7,6 +7,8 @@ Turns an **ESP32-S3** into a wireless USB trackpad and remote keyboard. Plug the
 ## ✨ Features
 
 - **Driverless USB HID:** Plugs into any PC as a standard USB Composite Mouse & Keyboard device. No companion drivers or software needed on the computer.
+- **🌀 Circle Mouse Motion (20px Radius):** Toggleable motion feature (`🌀 Circle: ON/OFF`) on both the dashboard and fullscreen overlay. Keeps the mouse arrow rounding smoothly in a 20-pixel radius circle with mathematically guaranteed **zero coordinate drift**, perfect for screen wake / mouse jiggler tasks.
+- **Stealth RGB LED:** Onboard RGB NeoPixel LED is permanently off at all times (boot, AP, STA, and runtime).
 - **Modern Web Dashboard:** Styled with the dark aesthetic from the SD Card FTP sketch (`#1a1a2e`, `#16213e`, `#e94560`, clean card panels, live status badges).
 - **Multi-Touch Trackpad:**
   - **1-Finger Drag:** Smooth cursor navigation with velocity-sensitive acceleration.

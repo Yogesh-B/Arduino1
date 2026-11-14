@@ -29,6 +29,7 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
   .tool-btn:hover{background:#1a4d8f}
   .tool-btn.accent{background:#e94560}
   .tool-btn.accent:hover{background:#c73652}
+  .tool-btn.active-jiggle{background:#1b5e20;color:#a5d6a7;border:1px solid #4caf50;box-shadow:0 0 8px rgba(76,175,80,.6)}
   .speed-select{background:#0f3460;color:#fff;border:none;border-radius:6px;padding:6px 8px;font-size:.8em;outline:none}
 
   /* ── Trackpad Area ── */
@@ -93,7 +94,8 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
     <!-- Normal Top Bar -->
     <div class="card-header" id="tp-card-header">
       <div class="card-title">🎯 Touch Trackpad</div>
-      <div style="display:flex;align-items:center;gap:8px">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <button id="circleBtn" class="tool-btn" onclick="toggleCircleMotion()" title="Keep mouse rounding in a circle of 20px radius">🌀 Circle: OFF</button>
         <select id="speedSelect" class="speed-select" onchange="setSpeed(this.value)">
           <option value="0.75">0.75x</option>
           <option value="1.0">1.0x</option>
@@ -109,7 +111,7 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
     <!-- Fullscreen Floating Header -->
     <div class="fs-overlay-top">
       <button class="tool-btn accent" onclick="focusVirtualKeyboard()">⌨️ Pop Keyboard</button>
-      <span style="font-size:.85em;color:#aaa">ESP32-S3 Fullscreen</span>
+      <button id="circleBtnFs" class="tool-btn" onclick="toggleCircleMotion()">🌀 Circle: OFF</button>
       <button class="tool-btn" onclick="toggleFullscreen()">✕ Exit</button>
     </div>
 
@@ -278,6 +280,9 @@ function connectWS() {
   ws.onmessage = function(e) {
     if (e.data.startsWith('CLIENTS:')) {
       document.getElementById('ws-client-count').innerText = e.data.substring(8);
+    } else if (e.data.startsWith('JIGGLER:')) {
+      var state = (e.data.substring(8) === '1');
+      updateCircleUI(state);
     }
   };
 }
@@ -286,6 +291,30 @@ connectWS();
 function wsSend(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(msg);
+  }
+}
+
+// ────────────────── Circle Motion (20px) ──────────────────
+var circleActive = false;
+
+function toggleCircleMotion() {
+  circleActive = !circleActive;
+  wsSend('J:' + (circleActive ? '1' : '0'));
+  updateCircleUI(circleActive);
+}
+
+function updateCircleUI(active) {
+  circleActive = active;
+  var b1 = document.getElementById('circleBtn');
+  var b2 = document.getElementById('circleBtnFs');
+  var text = active ? '🌀 Circle: ON' : '🌀 Circle: OFF';
+  if (b1) {
+    b1.innerText = text;
+    if (active) b1.classList.add('active-jiggle'); else b1.classList.remove('active-jiggle');
+  }
+  if (b2) {
+    b2.innerText = text;
+    if (active) b2.classList.add('active-jiggle'); else b2.classList.remove('active-jiggle');
   }
 }
 

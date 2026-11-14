@@ -68,16 +68,25 @@
   static USBHIDKeyboard usbKeyboard;
 #endif
 
-// ─────────────────────────── RGB LED Feedback ──────────────────────────────
+// ─────────────────────────── RGB LED Control (Always OFF) ──────────────────
 #ifndef RGB_BUILTIN
 #define RGB_BUILTIN 48
 #endif
 
-inline void setLED(uint8_t r, uint8_t g, uint8_t b) {
-  neopixelWrite(RGB_BUILTIN, r, g, b);
-  neopixelWrite(48, r, g, b);
-  neopixelWrite(38, r, g, b);
+inline void turnOffLED() {
+  neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+  neopixelWrite(48, 0, 0, 0);
+  neopixelWrite(38, 0, 0, 0);
 }
+
+// ─────────────────────────── Circle Mouse Motion (20px Radius) ─────────────
+bool          circleMotionActive = false;
+unsigned long lastCircleTick     = 0;
+int           circleStep         = 0;
+const int     CIRCLE_STEPS       = 60;    // 60 steps per revolution
+const float   CIRCLE_RADIUS      = 20.0f; // 20px radius
+float         circleLastX        = CIRCLE_RADIUS;
+float         circleLastY        = 0.0f;
 
 // ─────────────────────────── Preferences & Network ─────────────────────────
 Preferences prefs;
@@ -347,6 +356,15 @@ void handleWebSocketMessage(uint8_t clientId, const String &msg) {
       uint8_t usage = (uint8_t)msg.substring(comma + 1).toInt();
       hidKeyboardCombo(mod, usage);
     }
+  } else if (cmd == 'J' && msg.charAt(1) == ':') {
+    // Circle Mouse Motion: "J:1" or "J:0"
+    circleMotionActive = (msg.charAt(2) == '1');
+    if (circleMotionActive) {
+      circleStep  = 0;
+      circleLastX = CIRCLE_RADIUS;
+      circleLastY = 0.0f;
+    }
+    wsServer.broadcast("JIGGLER:" + String(circleMotionActive ? "1" : "0"));
   }
 }
 
@@ -354,8 +372,8 @@ void handleWebSocketMessage(uint8_t clientId, const String &msg) {
 void setup() {
   Serial.begin(115200);
 
-  // Turn off onboard NeoPixel
-  setLED(0, 0, 0);
+  // Turn off onboard NeoPixel (Always OFF)
+  turnOffLED();
 
   delay(600);
   Serial.println("\n╔════════════════════════════════════════════════════════╗");
@@ -377,10 +395,8 @@ void setup() {
     WiFi.softAP(apSSID.c_str(), apPassword.c_str());
     delay(400);
     Serial.printf("[WiFi] AP Mode Active! IP: %s\n", WiFi.softAPIP().toString().c_str());
-    setLED(0, 16, 32); // Cyan indicator for AP Mode
   } else {
     Serial.printf("[WiFi] Connecting to router SSID '%s'...", staSSID.c_str());
-    setLED(32, 24, 0); // Yellow indicator while connecting
     WiFi.mode(WIFI_STA);
     WiFi.begin(staSSID.c_str(), staPassword.c_str());
 
@@ -398,10 +414,8 @@ void setup() {
       WiFi.softAP(apSSID.c_str(), apPassword.c_str());
       delay(400);
       Serial.printf("[WiFi] Fallback AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-      setLED(0, 16, 32);
     } else {
       Serial.printf("[WiFi] Connected! Station IP: %s\n", WiFi.localIP().toString().c_str());
-      setLED(0, 32, 0); // Green indicator for connected Station
     }
   }
 
@@ -425,6 +439,7 @@ void setup() {
   wsServer.onMessage(handleWebSocketMessage);
   wsServer.onConnect([](uint8_t clientId) {
     Serial.printf("[WS] Client #%u connected\n", clientId);
+    wsServer.sendText(clientId, "JIGGLER:" + String(circleMotionActive ? "1" : "0"));
     wsServer.broadcast("CLIENTS:" + String(wsServer.activeClients()));
   });
   wsServer.onDisconnect([](uint8_t clientId) {
@@ -446,4 +461,23 @@ void setup() {
 void loop() {
   webServer.handleClient();
   wsServer.loop();
+
+  // ── Continuous Circle Mouse Motion (20px radius, zero drift) ────────────
+  if (circleMotionActive && isUSBReady()) {
+    unsigned long now = millis();
+    if (now - lastCircleTick >= 25) { // 25ms interval = ~1.5 seconds per 360° circle
+      lastCircleTick = now;
+      circleStep = (circleStep + 1) % CIRCLE_STEPS;
+      float angle   = 2.0f * PI * (float)circleStep / (float)CIRCLE_STEPS;
+      float targetX = CIRCLE_RADIUS * cos(angle);
+      float targetY = CIRCLE_RADIUS * sin(angle);
+      int dx = (int)round(targetX - circleLastX);
+      int dy = (int)round(targetY - circleLastY);
+      if (dx != 0 || dy != 0) {
+        hidMouseMove((int8_t)dx, (int8_t)dy);
+        circleLastX += (float)dx;
+        circleLastY += (float)dy;
+      }
+    }
+  }
 }
