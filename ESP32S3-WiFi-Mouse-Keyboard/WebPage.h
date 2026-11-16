@@ -120,8 +120,8 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
       <div class="touch-dot" id="touchDot"></div>
       <div id="tp-label">
         <b>Touch &amp; Drag</b>: Move Cursor<br>
-        <b>Tap</b>: Left Click &nbsp;|&nbsp; <b>2-Finger Tap</b>: Right Click &nbsp;|&nbsp; <b>3-Finger Tap</b>: Middle Click<br>
-        <b>2-Finger Drag ↕</b>: Scroll &nbsp;|&nbsp; <b>2-Finger Drag ↔</b>: H-Scroll &nbsp;|&nbsp; <b>Double-Tap Hold</b>: Drag
+        <b>Tap</b>: Left Click &nbsp;|&nbsp; <b>2-Finger Tap</b>: Right Click<br>
+        <b>2-Finger Drag (↕/↔)</b>: Scroll &nbsp;|&nbsp; <b>Double-Tap Hold</b>: Drag
       </div>
     </div>
 
@@ -390,8 +390,6 @@ var lastTapTime = 0;
 var isDragging = false;
 var lastScrollY = 0;
 var lastScrollX = 0;      // For 2-finger horizontal scroll
-var scrollAxis = null;    // 'v' (vertical) | 'h' (horizontal) | null (undecided)
-var SCROLL_AXIS_LOCK_PX = 10; // pixels moved before axis is locked
 
 tp.addEventListener('touchstart', function(e) {
   e.preventDefault();
@@ -419,14 +417,9 @@ tp.addEventListener('touchstart', function(e) {
     touchDot.style.top = (t.clientY - rect.top) + 'px';
     touchDot.style.opacity = '1';
   } else if (touches.length === 2) {
-    // 2-finger: record both axes for axis detection
+    // 2-finger scroll initial position
     lastScrollY = (touches[0].clientY + touches[1].clientY) / 2;
     lastScrollX = (touches[0].clientX + touches[1].clientX) / 2;
-    scrollAxis = null; // reset axis lock each new 2-finger gesture
-    touchStartTime = now;
-    totalMoveDist = 0;
-  } else if (touches.length === 3) {
-    // 3-finger: record start
     touchStartTime = now;
     totalMoveDist = 0;
   }
@@ -461,44 +454,22 @@ tp.addEventListener('touchmove', function(e) {
     var rect = tp.getBoundingClientRect();
     touchDot.style.left = (t.clientX - rect.left) + 'px';
     touchDot.style.top = (t.clientY - rect.top) + 'px';
-
   } else if (touches.length === 2) {
-    // ── 2-finger scroll: detect axis and scroll ──────────────
-    var midX = (touches[0].clientX + touches[1].clientX) / 2;
-    var midY = (touches[0].clientY + touches[1].clientY) / 2;
-    var sdx = midX - lastScrollX;
-    var sdy = midY - lastScrollY;
-
-    // Lock axis once movement exceeds threshold
-    if (scrollAxis === null) {
-      var dist = Math.abs(sdx) + Math.abs(sdy);
-      if (dist >= SCROLL_AXIS_LOCK_PX) {
-        scrollAxis = Math.abs(sdx) > Math.abs(sdy) ? 'h' : 'v';
-      }
+    // 2-finger scroll (vertical & horizontal)
+    var currentScrollY = (touches[0].clientY + touches[1].clientY) / 2;
+    var currentScrollX = (touches[0].clientX + touches[1].clientX) / 2;
+    var sdy = currentScrollY - lastScrollY;
+    var sdx = currentScrollX - lastScrollX;
+    if (Math.abs(sdy) >= 8) {
+      var wheelStep = sdy > 0 ? 1 : -1;
+      wsSend('W:' + wheelStep);
+      lastScrollY = currentScrollY;
     }
-
-    if (scrollAxis === 'v') {
-      // Vertical scroll (W command)
-      if (Math.abs(sdy) >= 8) {
-        wsSend('W:' + (sdy > 0 ? 1 : -1));
-        lastScrollY = midY;
-        lastScrollX = midX;
-      }
-    } else if (scrollAxis === 'h') {
-      // Horizontal scroll (X command)
-      if (Math.abs(sdx) >= 8) {
-        wsSend('X:' + (sdx > 0 ? 1 : -1));
-        lastScrollX = midX;
-        lastScrollY = midY;
-      }
+    if (Math.abs(sdx) >= 8) {
+      var hStep = sdx > 0 ? 1 : -1;
+      wsSend('X:' + hStep);
+      lastScrollX = currentScrollX;
     }
-    totalMoveDist += Math.abs(sdx) + Math.abs(sdy);
-  } else if (touches.length === 3) {
-    // Track 3-finger movement to distinguish tap vs swipe
-    var cx = (touches[0].clientX + touches[1].clientX + touches[2].clientX) / 3;
-    var cy = (touches[0].clientY + touches[1].clientY + touches[2].clientY) / 3;
-    if (touchStartX === undefined) { touchStartX = cx; touchStartY = cy; }
-    totalMoveDist = Math.abs(cx - touchStartX) + Math.abs(cy - touchStartY);
   }
 }, {passive:false});
 
@@ -514,31 +485,16 @@ tp.addEventListener('touchend', function(e) {
     return;
   }
 
-  var elapsed = now - touchStartTime;
-
-  // ── 3-Finger Tap → Middle Click ─────────────────────────
-  // Fires when the LAST finger lifts and all 3 were down briefly
-  if (e.changedTouches.length >= 1 && (e.touches.length + e.changedTouches.length) >= 3
-      && totalMoveDist < 15 && elapsed < 280) {
-    if (e.touches.length === 0) {  // All fingers lifted
-      wsSend('C:3');  // Middle click
-      return;
-    }
-  }
-
-  // ── 2-Finger Tap → Right Click ──────────────────────────
-  if (e.changedTouches.length === 2 && e.touches.length === 0
-      && totalMoveDist < 12 && elapsed < 280) {
-    wsSend('C:2');
-    return;
-  }
-
-  // ── 1-Finger Tap → Left Click ───────────────────────────
-  if (totalMoveDist < 8 && elapsed < 240) {
+  // Detect Taps (movement < 8px, duration < 240ms)
+  if (totalMoveDist < 8 && (now - touchStartTime < 240)) {
     if (e.touches.length === 0 && e.changedTouches.length === 1) {
+      // 1-Finger Tap -> Left Click
       wsSend('C:1');
       lastTapTime = now;
     }
+  } else if (e.changedTouches.length === 2 && totalMoveDist < 12 && (now - touchStartTime < 280)) {
+    // 2-Finger Tap -> Right Click
+    wsSend('C:2');
   }
 }, {passive:false});
 

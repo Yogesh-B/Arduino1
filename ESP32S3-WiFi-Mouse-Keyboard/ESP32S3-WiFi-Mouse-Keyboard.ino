@@ -15,9 +15,7 @@
  *       - 1-finger tap: left click
  *       - 1-finger double-tap & hold: click-and-drag (select text / move windows)
  *       - 2-finger tap: right click (context menu)
- *       - 2-finger drag vertical: vertical scroll wheel
- *       - 2-finger drag horizontal: horizontal scroll (Shift+Wheel)
- *       - 3-finger tap: middle click (open link in new tab / close tab)
+ *       - 2-finger drag: scroll wheel (vertical & horizontal)
  *   • Fullscreen Mode:
  *       - Stretches trackpad across full phone screen (100vw x 100vh)
  *       - Floating overlay controls (Exit, Pop-up Keyboard, Thumb Left/Right click)
