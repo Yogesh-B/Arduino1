@@ -56,6 +56,7 @@ String ap_ssid      = "ESP32_NAT_Router";
 String ap_password  = "12345678";
 String sta_mac_str  = "";   // empty = use chip default
 String ap_mac_str   = "";   // empty = use chip default
+int    sta_channel  = 1;    // matched to uplink to prevent single-radio channel switching
 
 // ── Helpers: MAC parse / format ──────────────────────────────────────────────
 
@@ -83,12 +84,15 @@ void loadConfig() {
     ap_password  = prefs.getString("ap_pwd",   "12345678");
     sta_mac_str  = prefs.getString("sta_mac",  "");
     ap_mac_str   = prefs.getString("ap_mac",   "");
+    sta_channel  = prefs.getInt("sta_ch",      1);
+    if (sta_channel < 1 || sta_channel > 14) sta_channel = 1;
     prefs.end();
 }
 
 void saveConfig(const String& ss, const String& sp,
                 const String& as_, const String& ap,
-                const String& smac, const String& amac) {
+                const String& smac, const String& amac,
+                int ch = 1) {
     prefs.begin("rtr", false);
     prefs.putString("sta_ssid", ss);
     prefs.putString("sta_pwd",  sp);
@@ -96,6 +100,9 @@ void saveConfig(const String& ss, const String& sp,
     prefs.putString("ap_pwd",   ap);
     prefs.putString("sta_mac",  smac);
     prefs.putString("ap_mac",   amac);
+    if (ch >= 1 && ch <= 14) {
+        prefs.putInt("sta_ch", ch);
+    }
     prefs.end();
 }
 
@@ -188,11 +195,22 @@ static void forwardDNStoClients() {
 static void onWiFiEvent(WiFiEvent_t event) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            Serial.printf("[WiFi] STA connected  →  IP: %s  GW: %s  DNS: %s\n",
+            Serial.printf("[WiFi] STA connected  →  IP: %s  GW: %s  DNS: %s  (CH %d)\n",
                           WiFi.localIP().toString().c_str(),
                           WiFi.gatewayIP().toString().c_str(),
-                          WiFi.dnsIP().toString().c_str());
-            delay(200);   // let lwIP settle
+                          WiFi.dnsIP().toString().c_str(),
+                          WiFi.channel());
+            // Update and persist channel if it changed, so subsequent boots match immediately
+            {
+                int cur_ch = WiFi.channel();
+                if (cur_ch > 0 && cur_ch != sta_channel) {
+                    sta_channel = cur_ch;
+                    prefs.begin("rtr", false);
+                    prefs.putInt("sta_ch", sta_channel);
+                    prefs.end();
+                    Serial.printf("[WiFi] SoftAP channel saved to match uplink: %d\n", sta_channel);
+                }
+            }
             enableNAPT();
             forwardDNStoClients();
             break;
@@ -319,14 +337,15 @@ button:hover,.btn:hover{background:#1d4ed8;}
 
 <div class='status'>
 <b>Status</b><br>
-STA: <span class='%STA_CLASS%'>%STA_STATUS%</span><br>
+STA: <span class='%STA_CLASS%'>%STA_STATUS%</span> &nbsp; (Channel: %CHANNEL%)<br>
 STA IP: %STA_IP% &nbsp; GW: %STA_GW%<br>
 DNS: %STA_DNS%<br>
-NAT: <span class='%NAT_CLASS%'>%NAT_STATUS%</span><br>
+NAT: <span class='%NAT_CLASS%'>%NAT_STATUS%</span> &nbsp; | &nbsp; 802.11n HT40<br>
 AP Clients: %AP_CLIENTS%
 </div>
 
 <form action='/save' method='POST'>
+<input type='hidden' name='sta_ch' id='sta_ch' value='%STA_CH%'>
 
 <h3>Uplink &mdash; connects TO this AP</h3>
 <label>Target SSID</label>
@@ -397,7 +416,7 @@ function doScan(){
     var h='';
     for(var i=0;i<nets.length;i++){
       var n=nets[i];
-      h+='<div class="net" onclick="pickNet(this)" data-ssid="'+n.ssid.replace(/"/g,'&quot;')+'">'
+      h+='<div class="net" onclick="pickNet(this)" data-ssid="'+n.ssid.replace(/"/g,'&quot;')+'" data-ch="'+n.ch+'">'
         + barsHTML(n.rssi)
         + '<div class="net-info">'
         + '<div class="net-ssid">'+(n.ssid||'<i style="color:#64748b">[Hidden]</i>')+'</div>'
@@ -419,6 +438,8 @@ function pickNet(el){
   document.querySelectorAll('.net').forEach(function(e){e.classList.remove('sel');});
   el.classList.add('sel');
   document.getElementById('sta_ssid').value=el.getAttribute('data-ssid');
+  var ch=el.getAttribute('data-ch');
+  if(ch) document.getElementById('sta_ch').value=ch;
 }
 </script>
 </body></html>
@@ -443,8 +464,11 @@ void handleRoot() {
 
     // Live status
     bool connected = (WiFi.status() == WL_CONNECTED);
+    int ch = connected ? WiFi.channel() : sta_channel;
     page.replace("%STA_CLASS%",  connected ? "ok" : "fail");
     page.replace("%STA_STATUS%", connected ? "Connected" : "Disconnected");
+    page.replace("%CHANNEL%",    String(ch));
+    page.replace("%STA_CH%",     String(sta_channel));
     page.replace("%STA_IP%",     connected ? WiFi.localIP().toString()  : "—");
     page.replace("%STA_GW%",     connected ? WiFi.gatewayIP().toString(): "—");
     page.replace("%STA_DNS%",    connected ? WiFi.dnsIP().toString()    : "—");
@@ -467,6 +491,8 @@ void handleSave() {
     String ap   = server.arg("ap_pwd");
     String smac = server.arg("sta_mac");
     String amac = server.arg("ap_mac");
+    int    sch  = server.arg("sta_ch").toInt();
+    if (sch < 1 || sch > 14) sch = sta_channel;
 
     // Validate MACs if provided
     uint8_t tmp[6];
@@ -488,7 +514,7 @@ void handleSave() {
     smac.toUpperCase();
     amac.toUpperCase();
 
-    saveConfig(ss, sp, as_, ap, smac, amac);
+    saveConfig(ss, sp, as_, ap, smac, amac, sch);
     server.send(200, "text/html",
         "<html><body><h2>&#x2705; Saved! Rebooting in 2 seconds...</h2></body></html>");
     delay(2000);
@@ -538,8 +564,16 @@ void setup() {
         IPAddress(192, 168, 4, 1),   // Gateway (itself)
         IPAddress(255, 255, 255, 0)  // Subnet
     );
-    WiFi.softAP(ap_ssid.c_str(), ap_password.c_str(), 1, 0, 8);
-    // channel=1, hidden=false, max_clients=8
+    // Start SoftAP on stored channel to align with uplink (eliminates channel-hop penalty)
+    WiFi.softAP(ap_ssid.c_str(), ap_password.c_str(), sta_channel, 0, 8);
+
+    // ── Speed Optimizations (CPU frequency & antenna power left as default) ──
+    // 1. Enable 40 MHz channel bandwidth (HT40) to boost raw PHY rate up to 150 Mbps
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+    esp_wifi_set_bandwidth(WIFI_IF_AP,  WIFI_BW_HT40);
+
+    // 2. Disable slow legacy 802.11b rates on SoftAP to conserve airtime
+    esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
 
     Serial.printf("[AP]  Started → SSID: \"%s\"  IP: %s\n",
                   ap_ssid.c_str(), WiFi.softAPIP().toString().c_str());
@@ -587,4 +621,5 @@ void setup() {
 
 void loop() {
     server.handleClient();
+    delay(2);  // cooperative yield to background lwIP/Wi-Fi tasks
 }

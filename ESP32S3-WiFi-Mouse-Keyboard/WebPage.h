@@ -120,8 +120,8 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
       <div class="touch-dot" id="touchDot"></div>
       <div id="tp-label">
         <b>Touch &amp; Drag</b>: Move Cursor<br>
-        <b>Tap</b>: Left Click &nbsp;|&nbsp; <b>2-Finger Tap</b>: Right Click<br>
-        <b>2-Finger Drag</b>: Scroll Wheel &nbsp;|&nbsp; <b>Double-Tap Hold</b>: Drag
+        <b>Tap</b>: Left Click &nbsp;|&nbsp; <b>2-Finger Tap</b>: Right Click &nbsp;|&nbsp; <b>3-Finger Tap</b>: Middle Click<br>
+        <b>2-Finger Drag ↕</b>: Scroll &nbsp;|&nbsp; <b>2-Finger Drag ↔</b>: H-Scroll &nbsp;|&nbsp; <b>Double-Tap Hold</b>: Drag
       </div>
     </div>
 
@@ -149,8 +149,13 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
       <div class="card-title">📱 Mobile Software Keyboard</div>
       <button class="tool-btn accent" onclick="focusVirtualKeyboard()">⌨️ Open Keyboard</button>
     </div>
-    <p class="info" style="margin-bottom:8px">Focus the input box below to bring up your phone's native keyboard. Keystrokes are sent instantly to the PC.</p>
-    <input type="text" id="liveInput" class="input-box" placeholder="Tap here to type live on PC..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <p class="info" style="margin-bottom:8px">Focus the box below — every key (including Enter, Esc, Ctrl combos) goes straight to the PC. Nothing stays in the box.</p>
+    <!-- type=search suppresses Enter→submit; inputmode=text keeps full keyboard -->
+    <input type="search" inputmode="text" id="liveInput" class="input-box"
+           placeholder="▶ Tap here — keyboard captured for PC"
+           autocomplete="off" autocorrect="off" autocapitalize="off"
+           spellcheck="false" enterkeyhint="send"
+           style="caret-color:transparent">
   </div>
 
   <!-- Text Paste & Send -->
@@ -384,6 +389,9 @@ var totalMoveDist = 0;
 var lastTapTime = 0;
 var isDragging = false;
 var lastScrollY = 0;
+var lastScrollX = 0;      // For 2-finger horizontal scroll
+var scrollAxis = null;    // 'v' (vertical) | 'h' (horizontal) | null (undecided)
+var SCROLL_AXIS_LOCK_PX = 10; // pixels moved before axis is locked
 
 tp.addEventListener('touchstart', function(e) {
   e.preventDefault();
@@ -411,8 +419,14 @@ tp.addEventListener('touchstart', function(e) {
     touchDot.style.top = (t.clientY - rect.top) + 'px';
     touchDot.style.opacity = '1';
   } else if (touches.length === 2) {
-    // 2-finger scroll initial position
+    // 2-finger: record both axes for axis detection
     lastScrollY = (touches[0].clientY + touches[1].clientY) / 2;
+    lastScrollX = (touches[0].clientX + touches[1].clientX) / 2;
+    scrollAxis = null; // reset axis lock each new 2-finger gesture
+    touchStartTime = now;
+    totalMoveDist = 0;
+  } else if (touches.length === 3) {
+    // 3-finger: record start
     touchStartTime = now;
     totalMoveDist = 0;
   }
@@ -447,15 +461,44 @@ tp.addEventListener('touchmove', function(e) {
     var rect = tp.getBoundingClientRect();
     touchDot.style.left = (t.clientX - rect.left) + 'px';
     touchDot.style.top = (t.clientY - rect.top) + 'px';
+
   } else if (touches.length === 2) {
-    // 2-finger scroll
-    var currentScrollY = (touches[0].clientY + touches[1].clientY) / 2;
-    var sdy = currentScrollY - lastScrollY;
-    if (Math.abs(sdy) >= 8) {
-      var wheelStep = sdy > 0 ? 1 : -1;
-      wsSend('W:' + wheelStep);
-      lastScrollY = currentScrollY;
+    // ── 2-finger scroll: detect axis and scroll ──────────────
+    var midX = (touches[0].clientX + touches[1].clientX) / 2;
+    var midY = (touches[0].clientY + touches[1].clientY) / 2;
+    var sdx = midX - lastScrollX;
+    var sdy = midY - lastScrollY;
+
+    // Lock axis once movement exceeds threshold
+    if (scrollAxis === null) {
+      var dist = Math.abs(sdx) + Math.abs(sdy);
+      if (dist >= SCROLL_AXIS_LOCK_PX) {
+        scrollAxis = Math.abs(sdx) > Math.abs(sdy) ? 'h' : 'v';
+      }
     }
+
+    if (scrollAxis === 'v') {
+      // Vertical scroll (W command)
+      if (Math.abs(sdy) >= 8) {
+        wsSend('W:' + (sdy > 0 ? 1 : -1));
+        lastScrollY = midY;
+        lastScrollX = midX;
+      }
+    } else if (scrollAxis === 'h') {
+      // Horizontal scroll (X command)
+      if (Math.abs(sdx) >= 8) {
+        wsSend('X:' + (sdx > 0 ? 1 : -1));
+        lastScrollX = midX;
+        lastScrollY = midY;
+      }
+    }
+    totalMoveDist += Math.abs(sdx) + Math.abs(sdy);
+  } else if (touches.length === 3) {
+    // Track 3-finger movement to distinguish tap vs swipe
+    var cx = (touches[0].clientX + touches[1].clientX + touches[2].clientX) / 3;
+    var cy = (touches[0].clientY + touches[1].clientY + touches[2].clientY) / 3;
+    if (touchStartX === undefined) { touchStartX = cx; touchStartY = cy; }
+    totalMoveDist = Math.abs(cx - touchStartX) + Math.abs(cy - touchStartY);
   }
 }, {passive:false});
 
@@ -471,16 +514,31 @@ tp.addEventListener('touchend', function(e) {
     return;
   }
 
-  // Detect Taps (movement < 8px, duration < 240ms)
-  if (totalMoveDist < 8 && (now - touchStartTime < 240)) {
+  var elapsed = now - touchStartTime;
+
+  // ── 3-Finger Tap → Middle Click ─────────────────────────
+  // Fires when the LAST finger lifts and all 3 were down briefly
+  if (e.changedTouches.length >= 1 && (e.touches.length + e.changedTouches.length) >= 3
+      && totalMoveDist < 15 && elapsed < 280) {
+    if (e.touches.length === 0) {  // All fingers lifted
+      wsSend('C:3');  // Middle click
+      return;
+    }
+  }
+
+  // ── 2-Finger Tap → Right Click ──────────────────────────
+  if (e.changedTouches.length === 2 && e.touches.length === 0
+      && totalMoveDist < 12 && elapsed < 280) {
+    wsSend('C:2');
+    return;
+  }
+
+  // ── 1-Finger Tap → Left Click ───────────────────────────
+  if (totalMoveDist < 8 && elapsed < 240) {
     if (e.touches.length === 0 && e.changedTouches.length === 1) {
-      // 1-Finger Tap -> Left Click
       wsSend('C:1');
       lastTapTime = now;
     }
-  } else if (e.changedTouches.length === 2 && totalMoveDist < 12 && (now - touchStartTime < 280)) {
-    // 2-Finger Tap -> Right Click
-    wsSend('C:2');
   }
 }, {passive:false});
 
@@ -501,38 +559,205 @@ function btnUp(b) {
 }
 
 // ────────────────── Virtual Keyboard Input ──────────────────
+// Android problem map:
+//   • keydown fires with key='Unidentified' for most keys on GBoard/SwiftKey
+//   • Enter, Backspace, Arrow keys DO fire correctly in keydown
+//   • Ctrl / Meta / Esc are swallowed by Android before reaching WebView
+//   • The 'input' event is the only reliable source for printable chars
+//   • compositionstart/update/end handles CJK and autocorrect word-by-word
+
 var liveInput = document.getElementById('liveInput');
+var kbActive = false;          // true while liveInput has focus
+var composing = false;         // true during IME composition (CJK etc.)
+
+// HID usage codes for every key we handle in keydown
+var KEY_HID = {
+  'Enter':       0x28,
+  'Backspace':   0x2A,
+  'Escape':      0x29,
+  'Tab':         0x2B,
+  'Delete':      0x4C,
+  'ArrowUp':     0x52,
+  'ArrowDown':   0x51,
+  'ArrowLeft':   0x50,
+  'ArrowRight':  0x4F,
+  'Home':        0x4A,
+  'End':         0x4D,
+  'PageUp':      0x4B,
+  'PageDown':    0x4E,
+  'F1':0x3A,'F2':0x3B,'F3':0x3C,'F4':0x3D,'F5':0x3E,'F6':0x3F,
+  'F7':0x40,'F8':0x41,'F9':0x42,'F10':0x43,'F11':0x44,'F12':0x45,
+  ' ':           0x2C,
+  'CapsLock':    0x39,
+  'Insert':      0x49,
+};
+
+// Build modifier bitmask from a KeyboardEvent (HID standard bit order)
+// Bit 0=LCtrl 1=LShift 2=LAlt 3=LMeta  4=RCtrl 5=RShift 6=RAlt 7=RMeta
+function modFromEvent(e) {
+  var m = 0;
+  if (e.ctrlKey)  m |= 0x01;
+  if (e.shiftKey) m |= 0x02;
+  if (e.altKey)   m |= 0x04;
+  if (e.metaKey)  m |= 0x08;
+  return m;
+}
+
+// Convert a printable character to its HID Usage ID (Usage Page 0x07).
+// Letters: 'a'-'z' → 0x04-0x1D  (ASCII_lower - 93)
+// Digits : '1'-'9' → 0x1E-0x26, '0' → 0x27
+// Symbols: mapped explicitly to match a US-QWERTY layout.
+// Returns 0 if unknown (caller should skip sending).
+function charToHid(c) {
+  var lc = c.toLowerCase();
+  var code = lc.charCodeAt(0);
+  // a-z
+  if (code >= 97 && code <= 122) return code - 93; // 'a'=4 … 'z'=29
+  // 1-9
+  if (code >= 49 && code <= 57)  return code - 19; // '1'=0x1E … '9'=0x26
+  // 0
+  if (c === '0') return 0x27;
+  // Symbols (unshifted key face, same HID code for shifted variant)
+  var sym = {
+    '-':0x2D, '=':0x2E,
+    '[':0x2F, ']':0x30, '\\':0x31,
+    ';':0x33, "'":0x34,
+    '`':0x35,
+    ',':0x36, '.':0x37, '/':0x38,
+    // Shifted symbols share the same HID usage as their unshifted counterpart
+    '_':0x2D, '+':0x2E,
+    '{':0x2F, '}':0x30, '|':0x31,
+    ':':0x33, '"':0x34,
+    '~':0x35,
+    '<':0x36, '>':0x37, '?':0x38,
+    '!':0x1E, '@':0x1F, '#':0x20, '$':0x21, '%':0x22,
+    '^':0x23, '&':0x24, '*':0x25, '(':0x26, ')':0x27,
+  };
+  return sym[c] || 0;
+}
+
+// Send a key with modifiers, bypassing activeModifiers panel
+function sendKeyEvent(e) {
+  var key = e.key;
+  var mod = modFromEvent(e);
+
+  // --- Modifier-only presses: nothing to send yet ---
+  if (key === 'Control' || key === 'Shift' || key === 'Alt' ||
+      key === 'Meta' || key === 'OS') return;
+
+  // --- Named special key with optional modifiers ---
+  var hid = KEY_HID[key];
+  if (hid) {
+    wsSend('S:' + hid + (mod ? ',' + mod : ''));
+    return;
+  }
+
+  // --- Modifier+printable char combo (Ctrl+A, Ctrl+`, Alt+F, etc.) ---
+  // Must convert char → HID usage code (NOT ASCII) because H: on the ESP32
+  // calls hidKeyboardCombo(mod, usage) which passes usage directly to HID.
+  if (key.length === 1) {
+    if (mod & ~0x02) {
+      // Has Ctrl, Alt or Meta (pure Shift just changes the char — skip it)
+      var hidCode = charToHid(key);
+      if (hidCode) wsSend('H:' + mod + ',' + hidCode);
+    }
+    // Pure character (no Ctrl/Alt/Meta) — handled by the 'input' event
+    return;
+  }
+}
+
+// ── document-level keydown capture (fires before anything else on the page) ──
+// Grabbing at document level with capture=true means we see the event first
+// and can call stopImmediatePropagation so nothing else (form submit, tab
+// focus change, browser shortcut) can act on it while liveInput is focused.
+document.addEventListener('keydown', function(e) {
+  if (!kbActive) return;      // only intercept while keyboard input is active
+
+  var key = e.key;
+
+  // Always block default browser actions for every key while we are active
+  e.preventDefault();
+  e.stopImmediatePropagation();
+
+  if (composing) return;      // let IME finish; we'll grab text via input event
+
+  // Ctrl+` (backtick) — key='`', ctrlKey=true, often blocked on Android
+  // We still try; if Android killed it this handler won't fire, but on
+  // desktop/PC-keyboard-connected Android devices it will work.
+  sendKeyEvent(e);
+
+}, true);  // <── capture phase
+
+// ── input event: the ONLY reliable event for printable chars on Android ──
+// Android GBoard fires key='Unidentified' in keydown then fires 'input' with
+// the actual character.  We consume it here and clear the box each time.
+liveInput.addEventListener('input', function(e) {
+  if (composing) return; // IME not done yet
+
+  // e.data holds the new character(s) added
+  // e.inputType tells us what happened
+  var t = e.inputType || '';
+
+  if (t === 'deleteContentBackward' || t === 'deleteWordBackward') {
+    wsSend('S:' + KEY_HID['Backspace']);
+  } else if (t === 'deleteContentForward') {
+    wsSend('S:' + KEY_HID['Delete']);
+  } else if (t === 'insertLineBreak' || t === 'insertParagraph') {
+    // Enter key via inputType (Android path)
+    wsSend('S:' + KEY_HID['Enter']);
+  } else if (e.data) {
+    // Normal character(s) — could be multi-char if autocorrect inserts a word
+    for (var i = 0; i < e.data.length; i++) {
+      wsSend('K:' + e.data[i]);
+    }
+  }
+
+  // Always wipe the box so the next event starts fresh
+  // Use setTimeout 0 so the browser finishes its own value update first
+  setTimeout(function() { liveInput.value = ''; }, 0);
+});
+
+// ── IME composition (CJK, autocorrect word replacement) ──
+// During composition the interim text must NOT be sent keystroke-by-keystroke.
+// We wait for compositionend which delivers the final committed string.
+liveInput.addEventListener('compositionstart', function() { composing = true; });
+liveInput.addEventListener('compositionupdate', function() { composing = true; });
+liveInput.addEventListener('compositionend', function(e) {
+  composing = false;
+  var text = e.data || '';
+  for (var i = 0; i < text.length; i++) {
+    wsSend('K:' + text[i]);
+  }
+  setTimeout(function() { liveInput.value = ''; }, 0);
+});
+
+// ── Focus / blur tracking ──
+liveInput.addEventListener('focus', function() {
+  kbActive = true;
+  liveInput.value = '';   // start clean each time keyboard opens
+  liveInput.style.borderColor = '#e94560';
+  liveInput.style.boxShadow = '0 0 0 2px rgba(233,69,96,0.4)';
+});
+liveInput.addEventListener('blur', function() {
+  kbActive = false;
+  liveInput.style.borderColor = '';
+  liveInput.style.boxShadow = '';
+});
+
+// Keep the box empty so the cursor never lands on existing text
+// (prevents Backspace from deleting previously-typed text that wasn't cleared)
+liveInput.addEventListener('keyup', function() {
+  setTimeout(function() { liveInput.value = ''; }, 0);
+});
 
 function focusVirtualKeyboard() {
   switchTab('tab-keyboard');
   setTimeout(function() {
     liveInput.focus();
-  }, 100);
+    // On iOS, a second tap is needed after programmatic focus
+    liveInput.click();
+  }, 120);
 }
-
-liveInput.addEventListener('keydown', function(e) {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    sendSpecial(0x28); // Enter HID
-    liveInput.value = '';
-  } else if (e.key === 'Backspace') {
-    e.preventDefault();
-    sendSpecial(0x2A); // Backspace HID
-  } else if (e.key === 'Escape') {
-    e.preventDefault();
-    sendSpecial(0x29); // Esc HID
-  } else if (e.key === 'Tab') {
-    e.preventDefault();
-    sendSpecial(0x2B); // Tab HID
-  }
-});
-
-liveInput.addEventListener('input', function(e) {
-  if (e.data) {
-    wsSend('K:' + e.data);
-    liveInput.value = '';
-  }
-});
 
 function sendFullText() {
   var txt = document.getElementById('textPayload').value;

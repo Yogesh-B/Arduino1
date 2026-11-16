@@ -15,7 +15,9 @@
  *       - 1-finger tap: left click
  *       - 1-finger double-tap & hold: click-and-drag (select text / move windows)
  *       - 2-finger tap: right click (context menu)
- *       - 2-finger drag: vertical scroll wheel
+ *       - 2-finger drag vertical: vertical scroll wheel
+ *       - 2-finger drag horizontal: horizontal scroll (Shift+Wheel)
+ *       - 3-finger tap: middle click (open link in new tab / close tab)
  *   • Fullscreen Mode:
  *       - Stretches trackpad across full phone screen (100vw x 100vh)
  *       - Floating overlay controls (Exit, Pop-up Keyboard, Thumb Left/Right click)
@@ -46,6 +48,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>        // Captive-portal DNS (resolves every domain → 192.168.4.1)
 
 #include "WebSocketServer.h"
 #include "WebPage.h"
@@ -97,6 +100,7 @@ String mdnsHost;
 
 WebServer       webServer(80);
 WebSocketServer wsServer(81);
+DNSServer       dnsServer;         // UDP port 53 — only started in AP mode
 
 // ─────────────────────────── HID Wrapper Functions ─────────────────────────
 void initUSB() {
@@ -192,6 +196,24 @@ void hidMouseWheel(int8_t delta) {
   }
 #else
   usbMouse.move(0, 0, delta);
+#endif
+}
+
+// Horizontal scroll: Shift+Wheel is the universal cross-platform convention.
+// Windows, macOS, and Linux all translate Shift+WheelUp/Down into horizontal
+// pan (left/right), which works without any driver changes.
+void hidMouseHScroll(int8_t delta) {
+#if USE_ESP_USB_DEVICE
+  if (!usbDevice.ready()) return;
+  usbKeyboard.pressUsage(0x00, 0x02);  // Hold Left Shift (modifier 0x02)
+  delay(5);
+  usbMouse.wheel(delta);
+  delay(5);
+  usbKeyboard.releaseAll();
+#else
+  usbKeyboard.press(KEY_LEFT_SHIFT);
+  usbMouse.move(0, 0, delta);
+  usbKeyboard.release(KEY_LEFT_SHIFT);
 #endif
 }
 
@@ -311,6 +333,34 @@ void handleNotFound() {
   webServer.send(302, "text/plain", "");
 }
 
+// ─────────────────────────── Captive Portal Handlers ───────────────────────
+// Android/Chrome probe: expects HTTP 204 → "WiFi has internet" → routes via WiFi
+void handleGenerate204() {
+  webServer.send(204, "text/plain", "");
+}
+
+// iOS / macOS probe: expects HTML with "Success" in body
+void handleHotspotDetect() {
+  webServer.send(200, "text/html",
+    "<HTML><HEAD><TITLE>Success</TITLE></HEAD>"
+    "<BODY>Success</BODY></HTML>");
+}
+
+// Windows NCSI probe
+void handleMsftNcsi() {
+  webServer.send(200, "text/plain", "Microsoft NCSI");
+}
+
+// Windows Connect Test probe
+void handleConnectTest() {
+  webServer.send(200, "text/plain", "Microsoft Connect Test");
+}
+
+// Firefox probe
+void handleSuccessTxt() {
+  webServer.send(200, "text/plain", "success\n");
+}
+
 // ─────────────────────────── WebSocket Message Handler ─────────────────────
 void handleWebSocketMessage(uint8_t clientId, const String &msg) {
   if (msg.length() < 2) return;
@@ -338,9 +388,13 @@ void handleWebSocketMessage(uint8_t clientId, const String &msg) {
     uint8_t btn = (uint8_t)msg.substring(2).toInt();
     hidMouseRelease(btn);
   } else if (cmd == 'W' && msg.charAt(1) == ':') {
-    // Scroll Wheel: "W:delta"
+    // Scroll Wheel (vertical): "W:delta"
     int delta = msg.substring(2).toInt();
     hidMouseWheel((int8_t)constrain(delta, -127, 127));
+  } else if (cmd == 'X' && msg.charAt(1) == ':') {
+    // Horizontal Scroll (Shift+Wheel): "X:delta"
+    int delta = msg.substring(2).toInt();
+    hidMouseHScroll((int8_t)constrain(delta, -127, 127));
   } else if (cmd == 'K' && msg.charAt(1) == ':') {
     // Single Character: "K:c"
     if (msg.length() >= 3) {
@@ -402,7 +456,18 @@ void setup() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(apSSID.c_str(), apPassword.c_str());
     delay(400);
-    Serial.printf("[WiFi] AP Mode Active! IP: %s\n", WiFi.softAPIP().toString().c_str());
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("[WiFi] AP Mode Active! IP: %s\n", apIP.toString().c_str());
+
+    // ── Captive Portal DNS ───────────────────────────────────────────────────
+    // Wildcard DNS: every domain resolves to the ESP's IP.
+    // This intercepts Android/iOS/Windows connectivity probes so they reach
+    // our HTTP server instead of timing out.  Without this, Android marks the
+    // WiFi as "no internet" and routes ALL traffic (including 192.168.4.1)
+    // through mobile data, making the ESP unreachable even from the same LAN.
+    dnsServer.setTTL(300);
+    dnsServer.start(53, "*", apIP);
+    Serial.println("[DNS] Captive-portal DNS wildcard server started on port 53");
   } else {
     Serial.printf("[WiFi] Connecting to router SSID '%s'...", staSSID.c_str());
     WiFi.mode(WIFI_STA);
@@ -421,7 +486,11 @@ void setup() {
       WiFi.mode(WIFI_AP);
       WiFi.softAP(apSSID.c_str(), apPassword.c_str());
       delay(400);
-      Serial.printf("[WiFi] Fallback AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+      IPAddress apIP = WiFi.softAPIP();
+      Serial.printf("[WiFi] Fallback AP IP: %s\n", apIP.toString().c_str());
+      dnsServer.setTTL(300);
+      dnsServer.start(53, "*", apIP);
+      Serial.println("[DNS] Captive-portal DNS started on fallback AP");
     } else {
       Serial.printf("[WiFi] Connected! Station IP: %s\n", WiFi.localIP().toString().c_str());
     }
@@ -439,6 +508,22 @@ void setup() {
   // 5. Start Web Server
   webServer.on("/",     HTTP_GET,  handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
+
+  // ── Captive-portal probe routes (Android / iOS / Windows / Firefox) ───────
+  // Android & Chrome: GET /generate_204  → 204 No Content  = "has internet"
+  webServer.on("/generate_204",          HTTP_GET, handleGenerate204);
+  webServer.on("/gen_204",               HTTP_GET, handleGenerate204); // older AOSP
+  // iOS / macOS captive portal detect
+  webServer.on("/hotspot-detect.html",   HTTP_GET, handleHotspotDetect);
+  webServer.on("/library/test/success.html", HTTP_GET, handleHotspotDetect);
+  // Windows NCSI
+  webServer.on("/ncsi.txt",              HTTP_GET, handleMsftNcsi);
+  webServer.on("/connecttest.txt",       HTTP_GET, handleConnectTest);
+  webServer.on("/redirect",              HTTP_GET, handleGenerate204); // Windows fwlink
+  webServer.on("/fwlink/",              HTTP_GET, handleGenerate204);
+  // Firefox
+  webServer.on("/success.txt",           HTTP_GET, handleSuccessTxt);
+
   webServer.onNotFound(handleNotFound);
   webServer.begin();
   Serial.println("[Web] HTTP dashboard running on port 80");
@@ -467,6 +552,7 @@ void setup() {
 
 // ─────────────────────────── Loop ──────────────────────────────────────────
 void loop() {
+  if (useAPMode) dnsServer.processNextRequest();  // captive-portal DNS
   webServer.handleClient();
   wsServer.loop();
 
