@@ -12,65 +12,94 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
 <title>ESP32-S3 Air Input</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-  body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;padding:12px 12px 24px}
-  .app-header{display:flex;align-items:center;justify-content:space-between;max-width:540px;margin:8px auto 14px;padding:0 4px}
-  .app-title{font-size:1.25em;font-weight:700;color:#e94560;display:flex;align-items:center;gap:8px}
-  .status-pill{font-size:.75em;padding:4px 10px;border-radius:20px;font-weight:600;display:inline-flex;align-items:center;gap:5px}
+
+  /* ── Full-height page layout ── */
+  html,body{height:100%;height:100dvh;overflow:hidden}
+  body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#1a1a2e;color:#eee;display:flex;flex-direction:column}
+
+  /* Scrollable area only for settings/keyboard tabs */
+  .tab-content{display:none;overflow-y:auto;flex:1;padding:0 10px 12px}
+  .tab-content.active{display:flex;flex-direction:column}
+
+  /* Trackpad tab: fills viewport, no scroll */
+  #tab-trackpad{overflow:hidden;padding:0}
+
+  .app-header{display:flex;align-items:center;justify-content:space-between;max-width:540px;width:100%;margin:0 auto;padding:8px 12px 0;flex-shrink:0}
+  .app-title{font-size:1.1em;font-weight:700;color:#e94560;display:flex;align-items:center;gap:8px}
+  .status-pill{font-size:.72em;padding:3px 8px;border-radius:20px;font-weight:600;display:inline-flex;align-items:center;gap:5px}
   .pill-ok{background:#1b5e20;color:#a5d6a7}
   .pill-warn{background:#e65100;color:#ffe0b2}
   .pill-err{background:#b71c1c;color:#ef9a9a}
-  .tabs{display:flex;gap:6px;max-width:540px;margin:0 auto 14px;background:#0d1b2a;padding:4px;border-radius:8px}
-  .tab-btn{flex:1;padding:10px;background:none;border:none;color:#aaa;border-radius:6px;font-size:.9em;font-weight:600;cursor:pointer;transition:all .15s}
+  .tabs{display:flex;gap:6px;max-width:540px;width:100%;margin:6px auto 0;background:#0d1b2a;padding:4px;border-radius:8px;flex-shrink:0;align-self:center}
+  .tab-btn{flex:1;padding:8px;background:none;border:none;color:#aaa;border-radius:6px;font-size:.88em;font-weight:600;cursor:pointer;transition:all .15s}
   .tab-btn.active{background:#e94560;color:#fff}
-  .card{background:#16213e;border-radius:12px;padding:16px;margin:0 auto 14px;max-width:540px;box-shadow:0 4px 16px rgba(0,0,0,.35)}
-  .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid #0f3460}
-  .card-title{font-size:1em;font-weight:700;color:#00adb5;display:flex;align-items:center;gap:6px}
-  .tool-btn{background:#0f3460;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:.8em;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:background .2s}
+  .card{background:#16213e;border-radius:12px;padding:14px;margin:0 auto 10px;max-width:540px;width:100%;box-shadow:0 4px 16px rgba(0,0,0,.35)}
+  .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #0f3460}
+  .card-title{font-size:.95em;font-weight:700;color:#00adb5;display:flex;align-items:center;gap:6px}
+  .tool-btn{background:#0f3460;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:.78em;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:background .2s}
   .tool-btn:hover{background:#1a4d8f}
   .tool-btn.accent{background:#e94560}
   .tool-btn.accent:hover{background:#c73652}
   .tool-btn.active-jiggle{background:#1b5e20;color:#a5d6a7;border:1px solid #4caf50;box-shadow:0 0 8px rgba(76,175,80,.6)}
-  .speed-select{background:#0f3460;color:#fff;border:none;border-radius:6px;padding:6px 8px;font-size:.8em;outline:none}
+  .speed-select{background:#0f3460;color:#fff;border:none;border-radius:6px;padding:5px 7px;font-size:.78em;outline:none}
 
-  /* ── Trackpad Area ── */
-  #tp-wrapper{position:relative;width:100%;transition:all .2s}
-  #trackpad{width:100%;height:320px;background:#0d1b2a;border:2px dashed #0f3460;border-radius:10px;position:relative;touch-action:none;user-select:none;-webkit-user-select:none;cursor:crosshair;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden}
-  #tp-label{font-size:.85em;color:#556b82;pointer-events:none;text-align:center;line-height:1.6}
-  .touch-dot{position:absolute;width:28px;height:28px;border-radius:50%;background:rgba(233,69,96,.45);border:2px solid #e94560;pointer-events:none;transform:translate(-50%,-50%);transition:transform .05s,opacity .15s;opacity:0}
-  
-  /* ── Mouse Buttons Row ── */
-  .mouse-btn-row{display:flex;gap:8px;margin-top:12px}
-  .m-btn{flex:1;padding:16px 8px;background:#0f3460;border:none;border-radius:8px;color:#fff;font-size:.95em;font-weight:700;cursor:pointer;user-select:none;-webkit-user-select:none;transition:background .1s,transform .05s}
+  /* ── Trackpad card: fills remaining height ── */
+  #tp-wrapper{background:#16213e;border-radius:12px;padding:10px 12px;max-width:540px;width:100%;margin:6px auto 0;display:flex;flex-direction:column;flex:1;min-height:0;box-shadow:0 4px 16px rgba(0,0,0,.35)}
+
+  /* trackpad + scroll strip row: grows to fill */
+  #tp-row{display:flex;gap:8px;flex:1;min-height:0}
+  #trackpad{flex:1;min-height:0;background:#0d1b2a;border:2px dashed #0f3460;border-radius:10px;position:relative;touch-action:none;user-select:none;-webkit-user-select:none;cursor:crosshair;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden}
+  #tp-label{font-size:.78em;color:#556b82;pointer-events:none;text-align:center;line-height:1.5}
+  .touch-dot{position:absolute;width:26px;height:26px;border-radius:50%;background:rgba(233,69,96,.45);border:2px solid #e94560;pointer-events:none;transform:translate(-50%,-50%);transition:transform .05s,opacity .15s;opacity:0}
+
+  /* ── Right-side Scroll Strip ── */
+  #scroll-strip{width:34px;min-height:0;background:#0d1b2a;border:2px solid #0f3460;border-radius:10px;touch-action:none;user-select:none;-webkit-user-select:none;cursor:ns-resize;display:flex;align-items:center;justify-content:center;position:relative;flex-shrink:0}
+  #scroll-strip::before{content:'';position:absolute;top:12px;bottom:12px;left:50%;transform:translateX(-50%);width:3px;background:#1a3a5c;border-radius:2px}
+  #scroll-thumb{position:absolute;width:18px;height:38px;background:#e94560;border-radius:6px;left:50%;transform:translateX(-50%);top:50%;margin-top:-19px;transition:opacity .15s;opacity:.7}
+  #scroll-strip:active #scroll-thumb,#scroll-strip.active #scroll-thumb{opacity:1}
+  #scroll-strip-label{position:absolute;bottom:5px;font-size:.55em;color:#556b82;pointer-events:none;white-space:nowrap}
+
+  /* ── Mouse Button + Keyboard strip at bottom ── */
+  #tp-bottom{flex-shrink:0;display:flex;flex-direction:column;gap:7px;margin-top:8px}
+  .mouse-btn-row{display:flex;gap:8px}
+  .m-btn{flex:1;padding:13px 8px;background:#0f3460;border:none;border-radius:8px;color:#fff;font-size:.9em;font-weight:700;cursor:pointer;user-select:none;-webkit-user-select:none;transition:background .1s,transform .05s}
   .m-btn:active,.m-btn.down{background:#e94560;transform:scale(.97)}
-  .m-btn.mid{flex:.4;font-size:.8em;background:#092540}
+  .m-btn.mid{background:#092540}
+
+  /* Keyboard capture row */
+  #kb-row{display:flex;align-items:center;gap:8px}
+  #liveInput{flex:1;padding:9px 11px;border:1px solid #0f3460;border-radius:8px;background:#0d1b2a;color:#eee;font-size:.9em;outline:none;caret-color:transparent}
+  #liveInput:focus{border-color:#e94560}
+  #kb-open-btn{flex-shrink:0;padding:9px 12px;background:#e94560;border:none;border-radius:8px;color:#fff;font-size:.82em;font-weight:700;cursor:pointer;white-space:nowrap}
 
   /* ── Fullscreen Overlay Mode ── */
-  #tp-wrapper.fullscreen{position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;height:100dvh;z-index:99999;background:#0a0e17;border-radius:0;margin:0;padding:12px;display:flex;flex-direction:column;box-sizing:border-box}
-  #tp-wrapper.fullscreen #trackpad{flex:1;height:auto;border:2px solid #e94560;border-radius:12px}
-  .fs-overlay-top{display:none;align-items:center;justify-content:space-between;margin-bottom:10px;z-index:2}
+  #tp-wrapper.fullscreen{position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;height:100dvh;z-index:99999;background:#0a0e17;border-radius:0;margin:0;padding:10px;max-width:none}
+  #tp-wrapper.fullscreen #tp-row{flex:1}
+  #tp-wrapper.fullscreen #trackpad{border:2px solid #e94560;border-radius:12px}
+  #tp-wrapper.fullscreen #scroll-strip{border-color:#e94560}
+  .fs-overlay-top{display:none;align-items:center;justify-content:space-between;margin-bottom:8px;flex-shrink:0}
   #tp-wrapper.fullscreen .fs-overlay-top{display:flex}
-  .fs-overlay-bottom{display:none;gap:10px;margin-top:10px;z-index:2}
+  .fs-overlay-bottom{display:none;gap:10px;margin-top:8px;flex-shrink:0}
   #tp-wrapper.fullscreen .fs-overlay-bottom{display:flex}
-  .fs-overlay-bottom .m-btn{padding:22px 10px;font-size:1.1em}
+  .fs-overlay-bottom .m-btn{padding:20px 10px;font-size:1.05em}
 
-  /* ── Keyboard & Shortcuts ── */
-  .input-box{width:100%;padding:12px;border:1px solid #0f3460;border-radius:6px;background:#0d1b2a;color:#eee;font-size:1em;outline:none}
+  /* ── Keyboard & Settings tabs (scrollable) ── */
+  .scroll-card-wrap{padding:10px 10px 16px;max-width:540px;width:100%;margin:0 auto}
+  .input-box{width:100%;padding:11px;border:1px solid #0f3460;border-radius:6px;background:#0d1b2a;color:#eee;font-size:1em;outline:none}
   .input-box:focus{border-color:#e94560}
   .key-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(60px,1fr));gap:6px;margin-top:10px}
-  .k-btn{padding:12px 6px;background:#0f3460;border:none;border-radius:6px;color:#fff;font-size:.85em;font-weight:600;cursor:pointer;user-select:none;text-align:center;transition:background .1s,transform .05s}
+  .k-btn{padding:11px 6px;background:#0f3460;border:none;border-radius:6px;color:#fff;font-size:.85em;font-weight:600;cursor:pointer;user-select:none;text-align:center;transition:background .1s,transform .05s}
   .k-btn:active{background:#e94560;transform:scale(.95)}
   .k-btn.active{background:#e94560;box-shadow:0 0 10px rgba(233,69,96,.7)}
   .k-btn.wide{grid-column:span 2}
   .k-btn.action{background:#00adb5;color:#0d1b2a}
-
-  /* ── Forms & Settings ── */
   label{display:block;margin:12px 0 4px;font-size:.85em;color:#aaa}
   .row{display:flex;gap:16px;margin:10px 0}
   .row label{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.95em;color:#ccc}
   .badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:.8em;font-weight:bold}
   .ok{background:#1b5e20;color:#a5d6a7}.err{background:#b71c1c;color:#ef9a9a}
   .sep{border:none;border-top:1px solid #0f3460;margin:14px 0}
-  .save-btn{width:100%;padding:14px;background:#e94560;color:white;border:none;border-radius:8px;font-size:1.05em;font-weight:700;cursor:pointer;margin-top:12px;transition:background .2s}
+  .save-btn{width:100%;padding:13px;background:#e94560;color:white;border:none;border-radius:8px;font-size:1em;font-weight:700;cursor:pointer;margin-top:10px;transition:background .2s}
   .save-btn:hover{background:#c73652}
   .info{font-size:.8em;color:#888;margin-top:6px}
 </style>
@@ -84,18 +113,18 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
 
 <div class="tabs">
   <button class="tab-btn active" onclick="switchTab('tab-trackpad')">🖱️ Trackpad</button>
-  <button class="tab-btn" onclick="switchTab('tab-keyboard')">⌨️ Keyboard</button>
+  <button class="tab-btn" onclick="switchTab('tab-keyboard')">⌨️ Keys</button>
   <button class="tab-btn" onclick="switchTab('tab-settings')">⚙️ Settings</button>
 </div>
 
 <!-- ═════════════════════ TAB 1: TRACKPAD ═════════════════════ -->
-<div id="tab-trackpad" class="tab-content">
-  <div id="tp-wrapper" class="card">
-    <!-- Normal Top Bar -->
+<div id="tab-trackpad" class="tab-content active" style="display:flex;flex-direction:column">
+  <div id="tp-wrapper">
+    <!-- Top Bar -->
     <div class="card-header" id="tp-card-header">
-      <div class="card-title">🎯 Touch Trackpad</div>
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-        <button id="circleBtn" class="tool-btn" onclick="toggleCircleMotion()" title="Keep mouse rounding in a circle of 20px radius">🌀 Circle: OFF</button>
+      <div class="card-title">🎯 Trackpad</div>
+      <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">
+        <button id="circleBtn" class="tool-btn" onclick="toggleCircleMotion()" title="Circle jiggle">🌀 OFF</button>
         <select id="speedSelect" class="speed-select" onchange="setSpeed(this.value)">
           <option value="0.75">0.75x</option>
           <option value="1.0">1.0x</option>
@@ -104,38 +133,51 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
           <option value="2.5">2.5x</option>
           <option value="3.0">3.0x</option>
         </select>
-        <button class="tool-btn accent" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+        <button class="tool-btn accent" onclick="toggleFullscreen()">⛶ FS</button>
       </div>
     </div>
 
     <!-- Fullscreen Floating Header -->
     <div class="fs-overlay-top">
-      <button class="tool-btn accent" onclick="focusVirtualKeyboard()">⌨️ Pop Keyboard</button>
+      <button class="tool-btn accent" onclick="focusVirtualKeyboard()">⌨️ Keyboard</button>
       <button id="circleBtnFs" class="tool-btn" onclick="toggleCircleMotion()">🌀 Circle: OFF</button>
       <button class="tool-btn" onclick="toggleFullscreen()">✕ Exit</button>
     </div>
 
-    <!-- The Touch Surface -->
-    <div id="trackpad">
-      <div class="touch-dot" id="touchDot"></div>
-      <div id="tp-label">
-        <b>Touch &amp; Drag</b>: Move Cursor<br>
-        <b>Tap</b>: Left Click &nbsp;|&nbsp; <b>2-Finger Tap</b>: Right Click<br>
-        <b>2-Finger Drag (↕/↔)</b>: Scroll &nbsp;|&nbsp; <b>Double-Tap Hold</b>: Drag
+    <!-- Touch Surface + Scroll Strip -->
+    <div id="tp-row">
+      <div id="trackpad">
+        <div class="touch-dot" id="touchDot"></div>
+        <div id="tp-label">
+          <b>Touch &amp; Drag</b>: Move &nbsp;|&nbsp; <b>Tap</b>: Click<br>
+          <b>Double-Tap Hold</b>: Drag &nbsp;|&nbsp; <b>2-Finger</b>: Scroll
+        </div>
+      </div>
+      <div id="scroll-strip">
+        <div id="scroll-thumb"></div>
+        <span id="scroll-strip-label">↕</span>
       </div>
     </div>
 
-    <!-- Normal View Mouse Buttons -->
-    <div class="mouse-btn-row" id="tp-buttons-normal">
-      <button class="m-btn" id="btn-left" onpointerdown="btnDown(1)" onpointerup="btnUp(1)">◀ Left Click</button>
-      <button class="m-btn mid" id="btn-mid" onpointerdown="btnDown(3)" onpointerup="btnUp(3)">Middle</button>
-      <button class="m-btn" id="btn-right" onpointerdown="btnDown(2)" onpointerup="btnUp(2)">Right Click ▶</button>
+    <!-- Bottom: Middle + Right Click buttons + Keyboard capture row -->
+    <div id="tp-bottom">
+      <div class="mouse-btn-row">
+        <button class="m-btn mid" id="btn-mid" onpointerdown="btnDown(3)" onpointerup="btnUp(3)">⬤ Middle</button>
+        <button class="m-btn" id="btn-right" onpointerdown="btnDown(2)" onpointerup="btnUp(2)">Right Click ▶</button>
+      </div>
+      <div id="kb-row">
+        <input type="search" inputmode="text" id="liveInput"
+               placeholder="⌨️ Tap here to type on PC"
+               autocomplete="off" autocorrect="off" autocapitalize="off"
+               spellcheck="false" enterkeyhint="send"
+               readonly tabindex="-1">
+        <button id="kb-open-btn" onclick="focusVirtualKeyboard()">⌨️ Open</button>
+      </div>
     </div>
 
-    <!-- Fullscreen Floating Mouse Buttons -->
+    <!-- Fullscreen Bottom Buttons -->
     <div class="fs-overlay-bottom">
-      <button class="m-btn" onpointerdown="btnDown(1)" onpointerup="btnUp(1)">◀ LEFT CLICK</button>
-      <button class="m-btn mid" onpointerdown="btnDown(3)" onpointerup="btnUp(3)">MID</button>
+      <button class="m-btn mid" onpointerdown="btnDown(3)" onpointerup="btnUp(3)">⬤ MIDDLE</button>
       <button class="m-btn" onpointerdown="btnDown(2)" onpointerup="btnUp(2)">RIGHT CLICK ▶</button>
     </div>
   </div>
@@ -143,20 +185,7 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
 
 <!-- ═════════════════════ TAB 2: KEYBOARD ═════════════════════ -->
 <div id="tab-keyboard" class="tab-content" style="display:none">
-  <!-- Native Mobile Keyboard Invoker -->
-  <div class="card">
-    <div class="card-header">
-      <div class="card-title">📱 Mobile Software Keyboard</div>
-      <button class="tool-btn accent" onclick="focusVirtualKeyboard()">⌨️ Open Keyboard</button>
-    </div>
-    <p class="info" style="margin-bottom:8px">Focus the box below — every key (including Enter, Esc, Ctrl combos) goes straight to the PC. Nothing stays in the box.</p>
-    <!-- type=search suppresses Enter→submit; inputmode=text keeps full keyboard -->
-    <input type="search" inputmode="text" id="liveInput" class="input-box"
-           placeholder="▶ Tap here — keyboard captured for PC"
-           autocomplete="off" autocorrect="off" autocapitalize="off"
-           spellcheck="false" enterkeyhint="send"
-           style="caret-color:transparent">
-  </div>
+  <div class="scroll-card-wrap">
 
   <!-- Text Paste & Send -->
   <div class="card">
@@ -203,10 +232,13 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
       <button class="k-btn" onclick="sendCombo(4, 0x2B)">Alt+Tab</button>
     </div>
   </div>
+
+  </div><!-- end scroll-card-wrap -->
 </div>
 
 <!-- ═════════════════════ TAB 3: SETTINGS ═════════════════════ -->
 <div id="tab-settings" class="tab-content" style="display:none">
+  <div class="scroll-card-wrap">
   <div class="card">
     <div class="card-header">
       <div class="card-title">📊 System &amp; Network Status</div>
@@ -243,11 +275,11 @@ static const char MAIN_HTML[] PROGMEM = R"rawliteral(
     <input type="text" name="mdns" class="input-box" value="%MDNS_HOST%" maxlength="32" pattern="[a-zA-Z0-9\-]+" title="Letters, numbers and hyphens only">
     <p class="info" style="margin-top:6px">🌐 Open in browser: <b>http://%MDNS_HOST%.local</b></p>
   </div>
-
   <div style="max-width:540px;margin:0 auto">
     <button type="submit" class="save-btn">💾 Save &amp; Restart</button>
   </div>
   </form>
+  </div><!-- end scroll-card-wrap -->
 </div>
 
 <script>
@@ -312,27 +344,56 @@ function updateCircleUI(active) {
   circleActive = active;
   var b1 = document.getElementById('circleBtn');
   var b2 = document.getElementById('circleBtnFs');
-  var text = active ? '🌀 Circle: ON' : '🌀 Circle: OFF';
   if (b1) {
-    b1.innerText = text;
+    b1.innerText = active ? '🌀 ON' : '🌀 OFF';
     if (active) b1.classList.add('active-jiggle'); else b1.classList.remove('active-jiggle');
   }
   if (b2) {
-    b2.innerText = text;
+    b2.innerText = active ? '🌀 Circle: ON' : '🌀 Circle: OFF';
     if (active) b2.classList.add('active-jiggle'); else b2.classList.remove('active-jiggle');
   }
 }
 
 // ────────────────── Tab Switching ──────────────────
 function switchTab(tabId) {
-  document.querySelectorAll('.tab-content').forEach(function(el) { el.style.display = 'none'; });
+  document.querySelectorAll('.tab-content').forEach(function(el) {
+    el.style.display = 'none';
+    el.classList.remove('active');
+  });
   document.querySelectorAll('.tab-btn').forEach(function(el) { el.classList.remove('active'); });
-  document.getElementById(tabId).style.display = 'block';
+  var tab = document.getElementById(tabId);
+  // Trackpad tab uses flex layout; others scroll as block
+  tab.style.display = (tabId === 'tab-trackpad') ? 'flex' : 'block';
+  tab.classList.add('active');
   var btns = document.querySelectorAll('.tab-btn');
   if (tabId === 'tab-trackpad') btns[0].classList.add('active');
   if (tabId === 'tab-keyboard') btns[1].classList.add('active');
   if (tabId === 'tab-settings') btns[2].classList.add('active');
 }
+
+// ────────────────── visualViewport: shrink trackpad when soft keyboard opens ──
+// Keeps #tp-bottom (middle button + keyboard input) always visible above IME
+(function() {
+  if (!window.visualViewport) return;
+  function onViewport() {
+    var vvH = window.visualViewport.height;
+    var fullH = window.innerHeight;
+    var kbH = Math.max(0, fullH - vvH - window.visualViewport.offsetTop);
+    var tpWrapper = document.getElementById('tp-wrapper');
+    if (!tpWrapper) return;
+    // Shrink tp-wrapper by the keyboard intrusion height so bottom stays visible
+    if (kbH > 50) {
+      tpWrapper.style.height = (vvH
+        - document.querySelector('.app-header').offsetHeight
+        - document.querySelector('.tabs').offsetHeight
+        - 12) + 'px';
+    } else {
+      tpWrapper.style.height = '';
+    }
+  }
+  window.visualViewport.addEventListener('resize', onViewport);
+  window.visualViewport.addEventListener('scroll', onViewport);
+})();
 
 function setSpeed(val) {
   speedMultiplier = parseFloat(val);
@@ -420,8 +481,6 @@ tp.addEventListener('touchstart', function(e) {
     // 2-finger scroll initial position
     lastScrollY = (touches[0].clientY + touches[1].clientY) / 2;
     lastScrollX = (touches[0].clientX + touches[1].clientX) / 2;
-    touchStartTime = now;
-    totalMoveDist = 0;
   }
 }, {passive:false});
 
@@ -485,16 +544,12 @@ tp.addEventListener('touchend', function(e) {
     return;
   }
 
-  // Detect Taps (movement < 8px, duration < 240ms)
+  // Detect 1-finger tap (movement < 8px, duration < 240ms) → Left Click
   if (totalMoveDist < 8 && (now - touchStartTime < 240)) {
     if (e.touches.length === 0 && e.changedTouches.length === 1) {
-      // 1-Finger Tap -> Left Click
       wsSend('C:1');
       lastTapTime = now;
     }
-  } else if (e.changedTouches.length === 2 && totalMoveDist < 12 && (now - touchStartTime < 280)) {
-    // 2-Finger Tap -> Right Click
-    wsSend('C:2');
   }
 }, {passive:false});
 
@@ -504,6 +559,62 @@ tp.addEventListener('touchcancel', function() {
     isDragging = false;
     wsSend('U:1');
   }
+});
+
+// ────────────────── Right-Side Scroll Strip ──────────────────
+var scrollStrip = document.getElementById('scroll-strip');
+var scrollThumb = document.getElementById('scroll-thumb');
+var stripLastY = 0;
+var stripActive = false;
+var stripAccum = 0;          // sub-pixel accumulator
+var STRIP_THRESHOLD = 10;    // px per scroll tick
+
+scrollStrip.addEventListener('touchstart', function(e) {
+  e.preventDefault();
+  if (e.touches.length === 1) {
+    stripLastY = e.touches[0].clientY;
+    stripAccum = 0;
+    stripActive = true;
+    scrollStrip.classList.add('active');
+  }
+}, {passive:false});
+
+scrollStrip.addEventListener('touchmove', function(e) {
+  e.preventDefault();
+  if (!stripActive || e.touches.length !== 1) return;
+  var dy = e.touches[0].clientY - stripLastY;
+  stripLastY = e.touches[0].clientY;
+  stripAccum += dy;
+
+  // Update thumb visual position
+  var rect = scrollStrip.getBoundingClientRect();
+  var clampedY = Math.max(20, Math.min(rect.height - 20,
+    e.touches[0].clientY - rect.top));
+  scrollThumb.style.top = clampedY + 'px';
+  scrollThumb.style.marginTop = '-20px';
+
+  while (Math.abs(stripAccum) >= STRIP_THRESHOLD) {
+    var step = stripAccum > 0 ? 1 : -1;
+    wsSend('W:' + step);
+    stripAccum -= step * STRIP_THRESHOLD;
+  }
+}, {passive:false});
+
+scrollStrip.addEventListener('touchend', function(e) {
+  e.preventDefault();
+  stripActive = false;
+  stripAccum = 0;
+  scrollStrip.classList.remove('active');
+  // Reset thumb to center
+  scrollThumb.style.top = '50%';
+  scrollThumb.style.marginTop = '-20px';
+}, {passive:false});
+
+scrollStrip.addEventListener('touchcancel', function() {
+  stripActive = false;
+  scrollStrip.classList.remove('active');
+  scrollThumb.style.top = '50%';
+  scrollThumb.style.marginTop = '-20px';
 });
 
 // ────────────────── Mouse Buttons ──────────────────
@@ -688,16 +799,51 @@ liveInput.addEventListener('compositionend', function(e) {
 });
 
 // ── Focus / blur tracking ──
+// liveInput starts readonly so accidental taps never pop the keyboard.
+// Only focusVirtualKeyboard() or a deliberate tap on the input itself
+// removes readonly and activates keyboard capture.
+
+function activateKeyboard() {
+  liveInput.removeAttribute('readonly');
+  liveInput.removeAttribute('tabindex');
+  liveInput.value = '';
+  liveInput.focus();
+  // iOS sometimes needs an explicit click to trigger the IME
+  liveInput.click();
+}
+
+function deactivateKeyboard() {
+  liveInput.setAttribute('readonly', '');
+  liveInput.setAttribute('tabindex', '-1');
+}
+
+// Explicit tap on the input field itself → activate keyboard
+liveInput.addEventListener('touchend', function(e) {
+  e.stopPropagation();
+  activateKeyboard();
+}, {passive: true});
+
+// Click (desktop/pointer devices)
+liveInput.addEventListener('mousedown', function(e) {
+  e.stopPropagation();
+  activateKeyboard();
+});
+
 liveInput.addEventListener('focus', function() {
+  // Guard: if still readonly (programmatic focus from somewhere else), bail out
+  if (liveInput.hasAttribute('readonly')) { liveInput.blur(); return; }
   kbActive = true;
-  liveInput.value = '';   // start clean each time keyboard opens
+  liveInput.value = '';
   liveInput.style.borderColor = '#e94560';
   liveInput.style.boxShadow = '0 0 0 2px rgba(233,69,96,0.4)';
 });
+
 liveInput.addEventListener('blur', function() {
   kbActive = false;
   liveInput.style.borderColor = '';
   liveInput.style.boxShadow = '';
+  // Re-arm readonly so next accidental focus won't reopen keyboard
+  deactivateKeyboard();
 });
 
 // Keep the box empty so the cursor never lands on existing text
@@ -707,12 +853,8 @@ liveInput.addEventListener('keyup', function() {
 });
 
 function focusVirtualKeyboard() {
-  switchTab('tab-keyboard');
-  setTimeout(function() {
-    liveInput.focus();
-    // On iOS, a second tap is needed after programmatic focus
-    liveInput.click();
-  }, 120);
+  // Explicit user request via button — activate keyboard capture
+  activateKeyboard();
 }
 
 function sendFullText() {
